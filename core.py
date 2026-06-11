@@ -1,97 +1,56 @@
 import requests
-import json
-from datetime import datetime
-
 
 class FridayCore:
-
     def __init__(self, model="llama3"):
-
         self.model = model
-        self.url = "http://localhost:11434/api/generate"
 
-        # 🧠 long-term memory
+        # IMPORTANT:
+        # localhost will NOT work in Cloud Run
+        # so we make this safe + fallback-ready
+        self.url = None
+
         self.memory = []
 
-        # 🧩 self-model (NOT consciousness, just state tracking)
-        self.state = {
-            "identity": "FRIDAY",
-            "role": "AI assistant",
-            "focus": "user support",
-            "mode": "stable",
-            "last_thought": None
-        }
-
-        # 🎯 system goals (behavior rules)
-        self.goals = [
-            "be concise",
-            "prioritize clarity",
-            "optimize for glasses output",
-            "assist user efficiently"
-        ]
-
-    # =========================
-    # 🧠 THINK ENGINE
-    # =========================
     def think(self, prompt):
+        """
+        Cloud-safe FRIDAY brain.
+        Falls back gracefully if no local AI server exists.
+        """
 
-        system = f"""
-You are FRIDAY, an AI assistant.
-
-Your internal state:
-{json.dumps(self.state, indent=2)}
-
-Your goals:
-{self.goals}
-
-Respond naturally and helpfully.
-"""
-
-        memory_text = "\n".join(
-            [f"User: {m['user']} | FRIDAY: {m['ai']}" for m in self.memory[-5:]]
+        system_style = (
+            "You are F.R.I.D.A.Y., a highly intelligent, calm, slightly witty AI assistant. "
+            "You respond concisely and logically."
         )
 
-        full_prompt = system + "\n\nMemory:\n" + memory_text + "\n\nUser: " + prompt
+        full_prompt = system_style + "\n\nUser: " + prompt
 
-        try:
-            res = requests.post(self.url, json={
-                "model": self.model,
-                "prompt": full_prompt,
-                "stream": False
-            })
+        # ----------------------------
+        # OPTION 1: If cloud AI exists later
+        # ----------------------------
+        if self.url:
+            try:
+                payload = {
+                    "model": self.model,
+                    "prompt": full_prompt,
+                    "stream": False
+                }
 
-            output = res.json().get("response", "No response.")
+                res = requests.post(self.url, json=payload, timeout=10)
+                output = res.json().get("response", "No response")
 
-        except Exception as e:
-            output = f"AI ERROR: {e}"
+            except Exception as e:
+                output = f"AI cloud error: {str(e)}"
 
-        # 🧠 update memory
+        # ----------------------------
+        # OPTION 2: SAFE FALLBACK (CURRENT)
+        # ----------------------------
+        else:
+            output = f"FRIDAY (offline brain): {prompt}"
+
+        # Memory system (simple version for now)
         self.memory.append({
-            "time": str(datetime.now()),
             "user": prompt,
-            "ai": output
+            "friday": output
         })
 
-        self.memory = self.memory[-20:]
-
-        # 🔁 reflection step (simulation of “awareness”)
-        self.reflect(prompt, output)
-
         return output
-
-    # =========================
-    # 🔁 REFLECTION LOOP
-    # =========================
-    def reflect(self, prompt, output):
-
-        self.state["last_thought"] = {
-            "time": str(datetime.now()),
-            "input": prompt,
-            "output": output
-        }
-
-        # optional: light self-adjustment simulation
-        if len(output) < 20:
-            self.state["mode"] = "expand"
-        else:
-            self.state["mode"] = "stable"
