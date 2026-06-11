@@ -1,53 +1,36 @@
+import os
 import requests
 
 class FridayCore:
-    def __init__(self, model="llama3"):
-        self.model = model
-
-        # IMPORTANT:
-        # localhost will NOT work in Cloud Run
-        # so we make this safe + fallback-ready
-        self.url = None
-
+    def __init__(self):
+        self.api_key = os.environ.get("GEMINI_API_KEY")
         self.memory = []
 
     def think(self, prompt):
-        """
-        Cloud-safe FRIDAY brain.
-        Falls back gracefully if no local AI server exists.
-        """
+        if not self.api_key:
+            return "FRIDAY ERROR: No Gemini API key found."
 
-        system_style = (
-            "You are F.R.I.D.A.Y., a highly intelligent, calm, slightly witty AI assistant. "
-            "You respond concisely and logically."
-        )
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.api_key}"
 
-        full_prompt = system_style + "\n\nUser: " + prompt
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt}
+                        ]
+                    }
+                ]
+            }
 
-        # ----------------------------
-        # OPTION 1: If cloud AI exists later
-        # ----------------------------
-        if self.url:
-            try:
-                payload = {
-                    "model": self.model,
-                    "prompt": full_prompt,
-                    "stream": False
-                }
+            res = requests.post(url, json=payload, timeout=15)
+            data = res.json()
 
-                res = requests.post(self.url, json=payload, timeout=10)
-                output = res.json().get("response", "No response")
+            output = data["candidates"][0]["content"]["parts"][0]["text"]
 
-            except Exception as e:
-                output = f"AI cloud error: {str(e)}"
+        except Exception as e:
+            output = f"FRIDAY AI ERROR: {str(e)}"
 
-        # ----------------------------
-        # OPTION 2: SAFE FALLBACK (CURRENT)
-        # ----------------------------
-        else:
-            output = f"FRIDAY (offline brain): {prompt}"
-
-        # Memory system (simple version for now)
         self.memory.append({
             "user": prompt,
             "friday": output
