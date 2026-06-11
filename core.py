@@ -2,47 +2,51 @@ import os
 import requests
 
 class FridayCore:
-   def think(self, prompt):
-    if not self.api_key:
-        return "FRIDAY ERROR: Missing Gemini API key."
+    def __init__(self):
+        self.api_key = os.environ.get("GEMINI_API_KEY")
+        self.memory = []
 
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.api_key}"
+    def think(self, prompt):
+        if not self.api_key:
+            return "FRIDAY ERROR: Missing Gemini API key."
 
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt}
-                    ]
-                }
-            ]
-        }
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.api_key}"
 
-        res = requests.post(url, json=payload, timeout=15)
-        data = res.json()
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt}
+                        ]
+                    }
+                ]
+            }
 
-        # ---------------- SAFE DEBUG CHECK ----------------
-        if "candidates" not in data:
-            return f"FRIDAY API ERROR: {data}"
+            res = requests.post(url, json=payload, timeout=15)
+            data = res.json()
 
-        if not data["candidates"]:
-            return "FRIDAY ERROR: Empty response from Gemini"
+            # SAFE CHECKS
+            if "candidates" not in data:
+                return f"FRIDAY API ERROR: {data}"
 
-        content = data["candidates"][0].get("content", {})
-        parts = content.get("parts", [])
+            if not data["candidates"]:
+                return "FRIDAY ERROR: Empty response from Gemini"
 
-        if not parts:
-            return "FRIDAY ERROR: No response text returned"
+            content = data["candidates"][0].get("content", {})
+            parts = content.get("parts", [])
 
-        output = parts[0].get("text", "No text field found")
+            if not parts:
+                return "FRIDAY ERROR: No response text returned"
 
-    except Exception as e:
-        output = f"FRIDAY AI ERROR: {str(e)}"
+            output = parts[0].get("text", "No text field found")
 
-    self.memory.append({
-        "user": prompt,
-        "friday": output
-    })
+        except Exception as e:
+            output = f"FRIDAY AI ERROR: {str(e)}"
 
-    return output
+        self.memory.append({
+            "user": prompt,
+            "friday": output
+        })
+
+        return output
