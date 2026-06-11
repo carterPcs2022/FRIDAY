@@ -26,7 +26,6 @@ class FridayCore:
             res = requests.post(url, json=payload, timeout=15)
             data = res.json()
 
-            # SAFE CHECKS
             if "candidates" not in data:
                 return f"FRIDAY API ERROR: {data}"
 
@@ -39,7 +38,7 @@ class FridayCore:
             if not parts:
                 return "FRIDAY ERROR: No response text returned"
 
-            output = parts[0].get("text", "No text field found")
+            output = parts[0].get("text", "")
 
         except Exception as e:
             output = f"FRIDAY AI ERROR: {str(e)}"
