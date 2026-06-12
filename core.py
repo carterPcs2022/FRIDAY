@@ -30,48 +30,60 @@ class FridayCore:
 
     def think(self, prompt):
         if not self.api_key:
-            return "FRIDAY ERROR: Missing Gemini API key."
+        return "FRIDAY ERROR: Missing Gemini API key."
 
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={self.api_key}"
+    try:
+        # 🧠 Build full context (personality + memory)
+        full_prompt = (
+            self.system_prompt + "\n\n" +
+            self.build_context() +
+            f"\nUser: {prompt}"
+        )
 
-            full_prompt = (
-                self.system_prompt + "\n\n" +
-                self.build_context() +
-                f"\nUser: {prompt}"
-            )
+        # ⚙️ Stable Gemini endpoint (NO -latest, NO guessing)
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": full_prompt}
-                        ]
-                    }
-                ]
-            }
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": full_prompt}
+                    ]
+                }
+            ]
+        }
 
-            res = requests.post(url, json=payload, timeout=15)
-            data = res.json()
+        res = requests.post(
+            url,
+            params={"key": self.api_key},
+            json=payload,
+            timeout=15
+        )
 
-            if "candidates" not in data:
-                return f"FRIDAY API ERROR: {data}"
+        data = res.json()
 
-            content = data["candidates"][0].get("content", {})
-            parts = content.get("parts", [])
+        # 🧠 Safe response handling (prevents crashes)
+        if "candidates" not in data:
+            return f"FRIDAY API ERROR: {data}"
 
-            if not parts:
-                return "FRIDAY ERROR: No response text returned"
+        if not data["candidates"]:
+            return "FRIDAY ERROR: Empty response from Gemini"
 
-            output = parts[0].get("text", "").strip()
+        content = data["candidates"][0].get("content", {})
+        parts = content.get("parts", [])
 
-        except Exception as e:
-            output = f"FRIDAY AI ERROR: {str(e)}"
+        if not parts:
+            return "FRIDAY ERROR: No response text returned"
 
-        # 🧠 store memory
-        self.memory.append({
-            "user": prompt,
-            "friday": output
-        })
+        output = parts[0].get("text", "").strip()
 
-        return output
+    except Exception as e:
+        output = f"FRIDAY AI ERROR: {str(e)}"
+
+    # 🧠 Memory system
+    self.memory.append({
+        "user": prompt,
+        "friday": output
+    })
+
+    return output
