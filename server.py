@@ -43,38 +43,22 @@ def home():
 # -----------------------------
 @app.route("/command", methods=["POST"])
 def command():
-    global ai
-
     try:
         data = request.json.get("text", "")
 
         if not data:
             return jsonify({"response": "No input received."})
 
-        # Lazy init (prevents boot failure)
-        if ai is None and FridayCore is not None:
-            ai = FridayCore()
-
-        if ai is None:
-            return jsonify({"response": "FRIDAY CORE NOT AVAILABLE"})
+        # ALWAYS create fresh brain (no globals, no confusion)
+        from core import FridayCore
+        ai = FridayCore()
 
         response = ai.think(data)
-
-        print("FRIDAY:", response)
-
-        # Optional voice (non-blocking)
-        if VOICE_ENABLED:
-            try:
-                Thread(target=speak, args=(response,)).start()
-            except Exception:
-                pass
 
         return jsonify({"response": response})
 
     except Exception as e:
         return jsonify({"response": f"Server error: {str(e)}"})
-
-
 # -----------------------------
 # CLOUD RUN ENTRY POINT
 # -----------------------------
