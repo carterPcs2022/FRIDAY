@@ -67,8 +67,8 @@ url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:
 
             output = parts[0].get("text", "").strip()
 
-        except Exception as e:
-            output = f"FRIDAY AI ERROR: {str(e)}"
+except Exception as e:
+    raise RuntimeError(f"CORE IMPORT FAILED: {e}")
 
         self.memory.append({
             "user": prompt,
