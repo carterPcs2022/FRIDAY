@@ -2,50 +2,67 @@ import os
 from flask import Flask, request, jsonify
 from threading import Thread
 
-from core import FridayCore
+# -----------------------------
+# SAFE IMPORT (prevents boot crash)
+# -----------------------------
+try:
+    from core import FridayCore
+except Exception as e:
+    FridayCore = None
+    print("CORE IMPORT FAILED:", e)
 
-# Voice is OPTIONAL in cloud (prevents crash if ElevenLabs breaks)
+# -----------------------------
+# OPTIONAL VOICE (never crashes server)
+# -----------------------------
 try:
     from voice import speak
     VOICE_ENABLED = True
 except Exception:
     VOICE_ENABLED = False
 
+
 app = Flask(__name__)
-ai = FridayCore()
+
+# AI is lazy-loaded (IMPORTANT for Cloud Run stability)
+ai = None
 
 
 # -----------------------------
-# HEALTH CHECK ROUTE
+# HEALTH CHECK
 # -----------------------------
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "FRIDAY ONLINE",
-        "message": "System is running correctly."
+        "core_loaded": FridayCore is not None
     })
 
 
 # -----------------------------
-# MAIN AI ROUTE
+# MAIN COMMAND ROUTE
 # -----------------------------
 @app.route("/command", methods=["POST"])
 def command():
+    global ai
+
     try:
         data = request.json.get("text", "")
 
         if not data:
             return jsonify({"response": "No input received."})
 
-        # Try AI brain safely
-        try:
-            response = ai.think(data)
-        except Exception as e:
-            response = f"Brain error: {str(e)}"
+        # Lazy init (prevents boot failure)
+        if ai is None and FridayCore is not None:
+            ai = FridayCore()
+
+        if ai is None:
+            return jsonify({"response": "FRIDAY CORE NOT AVAILABLE"})
+
+        response = ai.think(data)
 
         print("FRIDAY:", response)
 
-        # Voice runs ONLY if available (prevents cloud crash)
+        # Optional voice (non-blocking)
         if VOICE_ENABLED:
             try:
                 Thread(target=speak, args=(response,)).start()
@@ -55,9 +72,7 @@ def command():
         return jsonify({"response": response})
 
     except Exception as e:
-        return jsonify({
-            "response": f"Server error: {str(e)}"
-        }), 500
+        return jsonify({"response": f"Server error: {str(e)}"})
 
 
 # -----------------------------
