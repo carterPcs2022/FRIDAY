@@ -2,11 +2,10 @@ import os
 import requests
 from collections import deque
 
+
 class FridayCore:
     def __init__(self):
         self.api_key = os.environ.get("GEMINI_API_KEY")
-
-        # 🧠 memory (last 10 interactions)
         self.memory = deque(maxlen=10)
 
         self.system_prompt = (
@@ -34,7 +33,8 @@ class FridayCore:
                 f"\nUser: {prompt}"
             )
 
-url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
+            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
+
             payload = {
                 "contents": [
                     {
