@@ -33,8 +33,7 @@ class FridayCore:
                 f"\nUser: {prompt}"
             )
 
-            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
-
+url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
             payload = {
                 "contents": [
                     {
