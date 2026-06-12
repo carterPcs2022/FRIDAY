@@ -49,10 +49,9 @@ def command():
         if not data:
             return jsonify({"response": "No input received."})
 
-        # ALWAYS create fresh brain (no globals, no confusion)
         from core import FridayCore
-        ai = FridayCore()
 
+        ai = FridayCore()
         response = ai.think(data)
 
         return jsonify({"response": response})
