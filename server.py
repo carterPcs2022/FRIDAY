@@ -1,66 +1,55 @@
 import os
 from flask import Flask, request, jsonify
-from threading import Thread
-
-# -----------------------------
-# SAFE IMPORT (prevents boot crash)
-# -----------------------------
-try:
-    from core import FridayCore
-except Exception as e:
-    FridayCore = None
-    print("CORE IMPORT FAILED:", e)
-
-# -----------------------------
-# OPTIONAL VOICE (never crashes server)
-# -----------------------------
-try:
-    from voice import speak
-    VOICE_ENABLED = True
-except Exception:
-    VOICE_ENABLED = False
-
 
 app = Flask(__name__)
 
-# AI is lazy-loaded (IMPORTANT for Cloud Run stability)
-ai = None
+# -----------------------------
+# CORE IMPORT TEST (SAFE)
+# -----------------------------
+try:
+    from core import FridayCore
+    CORE_OK = True
+    print("CORE IMPORT SUCCESS")
+except Exception as e:
+    FridayCore = None
+    CORE_OK = False
+    print("CORE IMPORT FAILED:", e)
 
 
-# -----------------------------
-# HEALTH CHECK
-# -----------------------------
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "FRIDAY ONLINE",
-        "core_loaded": FridayCore is not None
+        "core_loaded": CORE_OK
     })
 
 
-# -----------------------------
-# MAIN COMMAND ROUTE
-# -----------------------------
+@app.route("/debug-core")
+def debug_core():
+    try:
+        import core
+        return jsonify({
+            "core_file": str(core),
+            "attributes": dir(core)
+        })
+    except Exception as e:
+        return str(e)
+
+
 @app.route("/command", methods=["POST"])
 def command():
-    try:
-        data = request.json.get("text", "")
+    data = request.json.get("text", "")
 
-        if not data:
-            return jsonify({"response": "No input received."})
+    if not data:
+        return jsonify({"response": "No input received."})
 
-        from core import FridayCore
+    if not CORE_OK:
+        return jsonify({"response": "CORE NOT LOADED"})
 
-        ai = FridayCore()
-        response = ai.think(data)
+    ai = FridayCore()
+    return jsonify({"response": ai.think(data)})
 
-        return jsonify({"response": response})
 
-    except Exception as e:
-        return jsonify({"response": f"Server error: {str(e)}"})
-# -----------------------------
-# CLOUD RUN ENTRY POINT
-# -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
