@@ -22,18 +22,19 @@ class FridayCore:
             [f"User: {m['user']}\nFRIDAY: {m['friday']}" for m in self.memory]
         )
 
-def think(self, prompt):
-    if not self.api_key:
-        return "FRIDAY ERROR: Missing Gemini API key."
+    def think(self, prompt):
+        if not self.api_key:
+            return "FRIDAY ERROR: Missing Gemini API key."
 
-    try:
-        full_prompt = (
-            self.system_prompt + "\n\n" +
-            self.build_context() +
-            f"\nUser: {prompt}"
-        )
+        try:
+            full_prompt = (
+                self.system_prompt + "\n\n" +
+                self.build_context() +
+                f"\nUser: {prompt}"
+            )
 
-url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+
             payload = {
                 "contents": [
                     {
@@ -67,8 +68,8 @@ url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:
 
             output = parts[0].get("text", "").strip()
 
-except Exception as e:
-    raise RuntimeError(f"CORE IMPORT FAILED: {e}")
+        except Exception as e:
+            output = f"FRIDAY AI ERROR: {str(e)}"
 
         self.memory.append({
             "user": prompt,
