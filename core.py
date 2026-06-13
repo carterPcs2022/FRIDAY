@@ -22,16 +22,16 @@ class FridayCore:
             [f"User: {m['user']}\nFRIDAY: {m['friday']}" for m in self.memory]
         )
 
-    def think(self, prompt):
-        if not self.api_key:
-            return "FRIDAY ERROR: Missing Gemini API key."
+def think(self, prompt):
+    if not self.api_key:
+        return "FRIDAY ERROR: Missing Gemini API key."
 
-        try:
-            full_prompt = (
-                self.system_prompt + "\n\n" +
-                self.build_context() +
-                f"\nUser: {prompt}"
-            )
+    try:
+        full_prompt = (
+            self.system_prompt + "\n\n" +
+            self.build_context() +
+            f"\nUser: {prompt}"
+        )
 
 url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
             payload = {
