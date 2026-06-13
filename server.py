@@ -1,22 +1,19 @@
-import os
 from flask import Flask, request, jsonify
+import os
 
 app = Flask(__name__)
 
-# -----------------------------
-# CORE IMPORT TEST (SAFE)
-# -----------------------------
+# SAFE IMPORT
 try:
     from core import FridayCore
     CORE_OK = True
-    print("CORE IMPORT SUCCESS")
 except Exception as e:
+    print("CORE LOAD ERROR:", e)
     FridayCore = None
     CORE_OK = False
-    print("CORE IMPORT FAILED:", e)
 
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def home():
     return jsonify({
         "status": "FRIDAY ONLINE",
@@ -24,30 +21,26 @@ def home():
     })
 
 
-@app.route("/debug-core")
-def debug_core():
-    try:
-        import core
-        return jsonify({
-            "core_file": str(core),
-            "attributes": dir(core)
-        })
-    except Exception as e:
-        return str(e)
-
-
 @app.route("/command", methods=["POST"])
 def command():
-    data = request.json.get("text", "")
+    try:
+        if not CORE_OK:
+            return jsonify({"response": "CORE NOT AVAILABLE"})
 
-    if not data:
-        return jsonify({"response": "No input received."})
+        data = request.json.get("text", "")
 
-    if not CORE_OK:
-        return jsonify({"response": "CORE NOT LOADED"})
+        ai = FridayCore()
+        result = ai.think(data)
 
-    ai = FridayCore()
-    return jsonify({"response": ai.think(data)})
+        return jsonify({"response": result})
+
+    except Exception as e:
+        return jsonify({"response": f"SERVER ERROR: {str(e)}"})
+
+
+@app.route("/health")
+def health():
+    return "OK", 200
 
 
 if __name__ == "__main__":
