@@ -6,7 +6,8 @@ import datetime
 import logging
 import threading
 from collections import deque
-from flask import Flask, request, jsonify
+from pathlib import Path
+from flask import Flask, request, jsonify, send_file
 
 try:
     from dotenv import load_dotenv
@@ -17,6 +18,7 @@ except ImportError:
 app = Flask(__name__)
 BOOT_TIME = time.time()
 EXCHANGE_LOG = deque(maxlen=10)
+BASE_DIR = Path(__file__).resolve().parent
 
 logging.basicConfig(level=logging.INFO, format='[FRIDAY] %(message)s')
 
@@ -35,6 +37,15 @@ except Exception as e:
     emotional_intel = None
     CORE_STATUS = f"fallback ({e})"
     logging.warning(f"Core failed: {e}")
+
+# ── Voice ────────────────────────────────────────────────────────────────────
+try:
+    from services.friday_voice import speak as friday_speak
+    VOICE_OK = True
+except Exception as e:
+    friday_speak = lambda *a, **k: None
+    VOICE_OK = False
+    logging.warning(f"Voice failed: {e}")
 
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
@@ -83,6 +94,78 @@ def _notify_jarvis_down():
 
 
 threading.Thread(target=_monitor_jarvis, daemon=True).start()
+
+# ── Proactive emotional check-ins ────────────────────────────────────────────
+# core/emotional_intel.py's should_check_in() was defined but explicitly
+# documented as unwired ("FRIDAY has no way to message first, only respond").
+# This is that channel. Note get_emotional_trend()'s `days` parameter isn't
+# actually implemented yet (see its docstring) — it returns the trend over
+# the most recent 20 logged entries regardless of the value passed, not a
+# true "last N days" window. That's fine at current log volume; noted here
+# so it isn't mistaken for real date-filtering later.
+
+_CHECKIN_INTERVAL = 4 * 3600
+_LAST_CHECKIN_EMOTION = None
+
+
+def _push(title: str, message: str, priority: int = 0):
+    pushover_user = os.environ.get("PUSHOVER_USER_KEY", "")
+    pushover_token = os.environ.get("PUSHOVER_APP_TOKEN", "")
+    if not (pushover_user and pushover_token):
+        return
+    try:
+        import requests as req
+        req.post("https://api.pushover.net/1/messages.json", data={
+            "token": pushover_token, "user": pushover_user,
+            "title": title, "message": message, "priority": priority,
+        }, timeout=5)
+    except Exception:
+        pass
+
+
+def _proactive_checkin():
+    global _LAST_CHECKIN_EMOTION
+    if not (friday_brain and emotional_intel):
+        return
+    try:
+        trend = get_emotional_trend()
+        if not trend:
+            return
+
+        dominant = max(trend, key=trend.get)
+        count = trend[dominant]
+
+        # Don't re-send the same check-in every 4 hours if nothing's
+        # changed since the last one — only fire on a fresh reading.
+        if dominant == _LAST_CHECKIN_EMOTION:
+            return
+
+        if dominant in ("stressed", "sad", "frustrated") and count >= 3:
+            result = friday_brain.think(
+                f"The user has been {dominant} recently ({count} times in their "
+                f"recent messages). As FRIDAY, proactively check in with one "
+                f"warm, brief message. Not therapy. Just human. Under 20 words."
+            )
+            message = result.get("response", "")
+            if not message:
+                return
+
+            _LAST_CHECKIN_EMOTION = dominant
+            _log("SYSTEM", message, "proactive")
+            _push("FRIDAY", message)
+            if VOICE_OK:
+                friday_speak(message, mode="support")
+    except Exception as e:
+        logging.warning(f"Proactive check-in failed: {e}")
+
+
+def _schedule_checkins():
+    while True:
+        time.sleep(_CHECKIN_INTERVAL)
+        _proactive_checkin()
+
+
+threading.Thread(target=_schedule_checkins, daemon=True).start()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -223,10 +306,13 @@ def command():
                 save_turn(prompt, clean)
                 _log(prompt, clean, "friday-coverage" if COVERAGE_MODE else "friday")
 
+                audio_file = friday_speak(clean, mode=friday_brain.voice_mode) if VOICE_OK else None
+
                 return jsonify({
                     "response": clean, "mode": "friday", "model": result.get("model", ""),
                     "ms": result.get("ms", 0), "emotion": emotion_data.get("emotion", "neutral"),
                     "covering": COVERAGE_MODE,
+                    "has_audio": bool(audio_file), "audio_file": audio_file,
                 })
             except Exception as e:
                 logging.error(f"Brain error: {e}")
@@ -243,6 +329,42 @@ def command():
 def chat():
     """Alias for /command."""
     return command()
+
+
+@app.route("/friday/ask", methods=["POST"])
+def friday_ask():
+    """Thin alias for iOS Shortcuts — accepts {"message": ...} instead of
+    {"prompt": ...} so a Shortcut can be wired up without reshaping its
+    dictated-text payload."""
+    data = request.get_json(silent=True) or {}
+    message = data.get("message", "").strip()
+    if not message:
+        return jsonify({"response": "Didn't catch that, boss."})
+    with app.test_request_context("/command", method="POST", json={"prompt": message}):
+        return command()
+
+
+@app.route("/friday/voice/audio")
+def friday_voice_audio():
+    """Serve a generated voice clip. Every generation has a unique
+    filename already (see services/friday_voice.py), and this endpoint
+    also sends no-cache headers as a second layer against any client or
+    proxy that caches by URL regardless."""
+    filename = request.args.get("file", "")
+    if not filename:
+        return jsonify({"error": "file required"}), 400
+
+    path = BASE_DIR / "static" / filename
+    if ".." in filename or not path.resolve().is_relative_to(BASE_DIR / "static"):
+        return jsonify({"error": "invalid file"}), 400
+    if not path.exists():
+        return jsonify({"error": "not found"}), 404
+
+    response = send_file(str(path), mimetype="audio/mpeg")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 # ── JARVIS takeover ────────────────────────────────────────────────────────────
@@ -593,9 +715,19 @@ async function send() {
     });
     const d = await r.json();
     addMsg('friday', 'FRIDAY', d.response || '...');
+    if (d.has_audio && d.audio_file) {
+      playAudio(d.audio_file);
+    }
   } catch(e) {
     addMsg('friday', 'FRIDAY', 'Connection issue, boss.');
   }
+}
+
+let _currentAudio = null;
+function playAudio(file) {
+  if (_currentAudio) { _currentAudio.pause(); _currentAudio = null; }
+  _currentAudio = new Audio(`${BASE}/friday/voice/audio?file=${encodeURIComponent(file)}&t=${Date.now()}`);
+  _currentAudio.play().catch(e => console.log('Audio:', e));
 }
 
 function addMsg(type, label, text) {

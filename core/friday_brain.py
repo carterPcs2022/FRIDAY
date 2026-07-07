@@ -178,7 +178,12 @@ class FridayBrain:
                 timeout=15,
             )
             if r.status_code == 429:
-                time.sleep(10)
+                # Fail fast and let think() fall through to Anthropic
+                # immediately instead of blocking the request for 10s first
+                # (same fix as JARVIS's core/llm/openai.py — a reactive
+                # sleep-after-429 just delays the fallback that's already
+                # about to happen).
+                print("[FRIDAY] Groq rate limited — falling back immediately")
                 return None
             r.raise_for_status()
             self._call_times.append(time.time())
