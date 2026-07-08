@@ -105,6 +105,14 @@ except Exception as e:
     VERONICA_OK = False
     logging.warning(f"Veronica failed: {e}")
 
+try:
+    from core.friday_capabilities import CAPABILITY_MAP
+    CAPABILITIES_OK = True
+except Exception as e:
+    CAPABILITY_MAP = {}
+    CAPABILITIES_OK = False
+    logging.warning(f"Capabilities failed: {e}")
+
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
 JARVIS_TOKEN = os.environ.get("JARVIS_API_TOKEN", "")
@@ -397,6 +405,26 @@ def command():
             _log(prompt, response, "emergency")
             return jsonify({"response": response, "mode": "emergency", "range": "dark"})
 
+        # MCU capabilities — checked before the JARVIS proxy since these are
+        # specifically FRIDAY's own named abilities, not generic chat that
+        # should default to JARVIS when he's reachable.
+        if CAPABILITIES_OK:
+            p_lower = prompt.lower()
+            for trigger, (handler, response_key) in CAPABILITY_MAP.items():
+                if trigger in p_lower:
+                    try:
+                        result = handler(prompt)
+                        response = result.get(response_key) or "Done, boss."
+                        audio = friday_speak(response) if VOICE_OK else None
+                        _log(prompt, response, trigger)
+                        return jsonify({
+                            "response": response, "mode": trigger,
+                            "has_audio": bool(audio), "audio_file": audio,
+                        })
+                    except Exception as e:
+                        logging.warning(f"Capability '{trigger}' failed: {e}")
+                    break
+
         # Proxy to JARVIS if online and not in coverage mode
         if JARVIS_ONLINE and not COVERAGE_MODE:
             try:
@@ -649,6 +677,15 @@ def veronica_contain(component):
     if not VERONICA_OK:
         return jsonify({"error": "veronica unavailable"}), 503
     return jsonify(veronica.contain_failing_component(component))
+
+
+# ── MCU capabilities ───────────────────────────────────────────────────────────
+
+@app.route("/friday/capabilities")
+def list_capabilities():
+    if not CAPABILITIES_OK:
+        return jsonify({"error": "capabilities unavailable"}), 503
+    return jsonify({"triggers": list(CAPABILITY_MAP.keys())})
 
 
 # ── Budget ─────────────────────────────────────────────────────────────────────
