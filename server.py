@@ -113,6 +113,38 @@ except Exception as e:
     CAPABILITIES_OK = False
     logging.warning(f"Capabilities failed: {e}")
 
+try:
+    from services.friday_health import friday_health
+    HEALTH_OK = True
+except Exception as e:
+    friday_health = None
+    HEALTH_OK = False
+    logging.warning(f"Health monitor failed: {e}")
+
+try:
+    from services.friday_contacts import friday_contacts
+    CONTACTS_OK = True
+except Exception as e:
+    friday_contacts = None
+    CONTACTS_OK = False
+    logging.warning(f"Contacts failed: {e}")
+
+try:
+    from services.team_coordinator import team
+    TEAM_OK = True
+except Exception as e:
+    team = None
+    TEAM_OK = False
+    logging.warning(f"Team coordinator failed: {e}")
+
+try:
+    from services.friday_security import friday_security
+    SECURITY_OK = True
+except Exception as e:
+    friday_security = None
+    SECURITY_OK = False
+    logging.warning(f"Security failed: {e}")
+
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
 JARVIS_TOKEN = os.environ.get("JARVIS_API_TOKEN", "")
@@ -307,6 +339,23 @@ if VERONICA_OK:
     _start_thread(_veronica_startup, "Veronica startup")
     _start_thread(_veronica_monitor_loop, "Veronica monitor")
 
+
+def _sleep_adjustment():
+    time.sleep(60)
+    if not HEALTH_OK:
+        return
+    try:
+        friday_health.adjust_friday_for_health()
+        brief = friday_health.sleep_brief()
+        if brief and VOICE_OK:
+            friday_speak(brief)
+    except Exception as e:
+        logging.warning(f"Sleep adjustment failed: {e}")
+
+
+if HEALTH_OK:
+    _start_thread(_sleep_adjustment, "sleep adjustment")
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _log(user: str, response: str, mode: str):
@@ -330,6 +379,18 @@ def emergency(prompt: str) -> str:
     if "date" in p:
         return datetime.datetime.now().strftime("%A, %B %d")
     return "I'm here, boss. Systems are limited right now."
+
+
+def get_weather_brief() -> str:
+    """wttr.in's plaintext format — free, no API key, no account."""
+    try:
+        import httpx
+        r = httpx.get("https://wttr.in/?format=3", timeout=5)
+        if r.status_code == 200:
+            return r.text.strip()
+    except Exception:
+        pass
+    return ""
 
 
 def overall_status() -> str:
@@ -369,13 +430,29 @@ def state():
     except Exception:
         pass
 
+    # This process's own resource usage — not the user's device. psutil
+    # running inside this server reports the server it's running on
+    # (Render), never a locally-connected Mac/iPhone; labeling it
+    # anything else would be actively misleading.
+    cpu_pct = ram_pct = None
+    try:
+        import psutil
+        cpu_pct = psutil.cpu_percent(interval=None)
+        ram_pct = psutil.virtual_memory().percent
+    except Exception:
+        pass
+
+    security = friday_security.get_threat_summary() if SECURITY_OK else {}
+    uptime = int(time.time() - BOOT_TIME)
+
     return jsonify({
         "status": overall_status(), "core": CORE_STATUS,
         "jarvis_online": JARVIS_ONLINE, "coverage_mode": COVERAGE_MODE,
         "range_level": friday_protocols.range_level.value if PROTOCOLS_OK else "unknown",
         "training": friday_trainer.status() if TRAINING_OK else {},
         "budget": budget_info, "emotional_trend": emotional_trend,
-        "uptime_seconds": int(time.time() - BOOT_TIME),
+        "cpu_pct": cpu_pct, "ram_pct": ram_pct, "security": security,
+        "uptime_seconds": uptime, "uptime": uptime,
         "log": list(reversed(EXCHANGE_LOG)),
         "voice_mode": friday_brain.voice_mode if friday_brain else "normal",
     })
@@ -398,6 +475,11 @@ def command():
 
         if not prompt:
             return jsonify({"response": "Say something, boss."})
+
+        if SECURITY_OK:
+            screen = friday_security.screen_request(friday_security.client_ip(request), prompt)
+            if screen.get("blocked"):
+                return jsonify({"response": "Request blocked.", "blocked": True}), 403
 
         # Dark mode — zero external connectivity, local-only responses
         if PROTOCOLS_OK and friday_protocols.range_level == RangeLevel.DARK:
@@ -688,6 +770,91 @@ def list_capabilities():
     return jsonify({"triggers": list(CAPABILITY_MAP.keys())})
 
 
+# ── Health (Apple Watch) ───────────────────────────────────────────────────────
+
+@app.route("/friday/health/log", methods=["POST"])
+def health_log():
+    if not HEALTH_OK:
+        return jsonify({"error": "health monitor unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    entry = friday_health.log_from_watch(
+        heart_rate=data.get("heart_rate", 0), hrv=data.get("hrv", 0),
+        blood_oxygen=data.get("blood_oxygen", 0), steps=data.get("steps", 0),
+        sleep_hours=data.get("sleep_hours", 0), sleep_quality=data.get("sleep_quality", 0),
+    )
+    return jsonify(entry)
+
+
+# ── Contacts ───────────────────────────────────────────────────────────────────
+
+@app.route("/friday/contacts", methods=["GET"])
+def contacts_list():
+    if not CONTACTS_OK:
+        return jsonify({"error": "contacts unavailable"}), 503
+    return jsonify(friday_contacts.get_all())
+
+
+@app.route("/friday/contacts/add", methods=["POST"])
+def contacts_add():
+    if not CONTACTS_OK:
+        return jsonify({"error": "contacts unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    return jsonify(friday_contacts.add_contact(name, data.get("relationship", "neutral"), data.get("notes", "")))
+
+
+@app.route("/friday/contacts/<name>")
+def contacts_intel(name):
+    if not CONTACTS_OK:
+        return jsonify({"error": "contacts unavailable"}), 503
+    return jsonify(friday_contacts.get_intel(name))
+
+
+# ── Team coordination ──────────────────────────────────────────────────────────
+
+@app.route("/friday/team", methods=["GET"])
+def team_list():
+    if not TEAM_OK:
+        return jsonify({"error": "team coordinator unavailable"}), 503
+    return jsonify(team.get_all())
+
+
+@app.route("/friday/team/update", methods=["POST"])
+def team_update():
+    if not TEAM_OK:
+        return jsonify({"error": "team coordinator unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    return jsonify(team.update_member(name, data.get("status", ""), data.get("task", ""), data.get("location", "")))
+
+
+@app.route("/friday/team/brief")
+def team_brief_route():
+    if not TEAM_OK:
+        return jsonify({"error": "team coordinator unavailable"}), 503
+    return jsonify({"brief": team.team_brief()})
+
+
+# ── Security ───────────────────────────────────────────────────────────────────
+
+@app.route("/friday/security/status")
+def security_status():
+    if not SECURITY_OK:
+        return jsonify({"error": "security unavailable"}), 503
+    return jsonify(friday_security.get_threat_summary())
+
+
+# ── Weather ────────────────────────────────────────────────────────────────────
+
+@app.route("/friday/weather")
+def weather_route():
+    return jsonify({"weather": get_weather_brief()})
+
+
 # ── Budget ─────────────────────────────────────────────────────────────────────
 
 @app.route("/budget")
@@ -711,404 +878,957 @@ FRIDAY_HUD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FRIDAY · HUD</title>
+<title>F.R.I.D.A.Y V2</title>
 <style>
 :root {
-  --bg:      #040d08;
-  --panel:   rgba(0,255,128,0.03);
-  --border:  rgba(0,255,128,0.15);
-  --accent:  #00ff80;
-  --accent2: #00ffcc;
-  --warn:    #ffaa00;
-  --danger:  #ff4444;
-  --text:    #ccffe0;
-  --muted:   #3a6650;
-  --grid:    rgba(0,255,128,0.04);
+  --bg:     #010d06;
+  --panel:  rgba(0,255,128,0.03);
+  --border: rgba(0,255,128,0.15);
+  --accent: #00ff80;
+  --a2:     #00ffcc;
+  --warn:   #ffaa00;
+  --danger: #ff4444;
+  --text:   #ccffe0;
+  --muted:  #2a5a40;
+  --grid:   rgba(0,255,128,0.025);
 }
-* { box-sizing: border-box; margin: 0; padding: 0; }
+* { box-sizing:border-box; margin:0; padding:0; }
 body {
-  background:
-    repeating-linear-gradient(0deg,var(--grid) 0,var(--grid) 1px,
-    transparent 1px,transparent 4px), var(--bg);
+  background: var(--bg);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 48px 48px;
   color: var(--text);
   font-family: 'Courier New', monospace;
-  min-height: 100vh;
-  padding: 20px;
+  height: 100vh;
+  overflow: hidden;
 }
-.wrap { max-width: 900px; margin: 0 auto; }
-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 16px;
-  margin-bottom: 20px;
-  flex-wrap: wrap;
-  gap: 10px;
+body::after {
+  content:'';
+  position:fixed; inset:0;
+  background: repeating-linear-gradient(
+    0deg, transparent, transparent 3px,
+    rgba(0,0,0,0.015) 3px, rgba(0,0,0,0.015) 4px
+  );
+  pointer-events:none; z-index:9999;
 }
-.logo {
-  font-size: 28px;
-  font-weight: 900;
-  letter-spacing: 10px;
-  color: var(--accent);
-  text-shadow: 0 0 20px rgba(0,255,128,0.4);
+.corner {
+  position:fixed; width:20px; height:20px;
+  z-index:9998; pointer-events:none;
 }
-.logo-sub {
-  font-size: 10px;
-  letter-spacing: 3px;
-  color: var(--muted);
-  margin-top: 3px;
-}
-.status-area {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
-}
-.dot {
-  display: inline-block;
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 8px var(--accent);
-  animation: pulse 2.5s ease-in-out infinite;
-}
-.dot.warn   { background: var(--warn);   box-shadow: 0 0 8px var(--warn);   animation-duration: 1s; }
-.dot.danger { background: var(--danger); box-shadow: 0 0 8px var(--danger); animation-duration: 0.5s; }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-.status-pill {
-  display: flex; align-items: center; gap: 8px;
-  font-size: 12px; letter-spacing: 2px;
-  color: var(--accent);
-}
-#clock { font-size: 11px; color: var(--muted); letter-spacing: 2px; }
-main {
+.c-tl { top:8px; left:8px;
+  border-top:2px solid rgba(0,255,128,0.3);
+  border-left:2px solid rgba(0,255,128,0.3); }
+.c-tr { top:8px; right:8px;
+  border-top:2px solid rgba(0,255,128,0.3);
+  border-right:2px solid rgba(0,255,128,0.3); }
+.c-bl { bottom:8px; left:8px;
+  border-bottom:2px solid rgba(0,255,128,0.3);
+  border-left:2px solid rgba(0,255,128,0.3); }
+.c-br { bottom:8px; right:8px;
+  border-bottom:2px solid rgba(0,255,128,0.3);
+  border-right:2px solid rgba(0,255,128,0.3); }
+
+.layout {
   display: grid;
-  grid-template-columns: 260px 1fr;
-  gap: 16px;
+  grid-template-rows: 52px 1fr 42px;
+  grid-template-columns: 240px 1fr 280px;
+  height: 100vh;
+  position: relative; z-index:1;
 }
-@media(max-width:700px){ main { grid-template-columns: 1fr; } }
-.panel {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 16px;
+
+header {
+  grid-column: 1/-1;
+  display: flex; align-items:center; padding: 0 18px;
+  gap: 18px;
+  background: rgba(1,13,6,0.98);
+  border-bottom: 1px solid var(--border);
   position: relative;
 }
+header::after {
+  content:''; position:absolute;
+  bottom:0; left:0; right:0; height:1px;
+  background: linear-gradient(90deg,
+    transparent, var(--accent), var(--a2),
+    var(--accent), transparent);
+  opacity:0.4;
+}
+.logo-ring {
+  width:36px; height:36px; border-radius:50%;
+  border:2px solid var(--accent);
+  display:flex; align-items:center; justify-content:center;
+  box-shadow: 0 0 14px rgba(0,255,128,0.3),
+              inset 0 0 14px rgba(0,255,128,0.08);
+}
+.logo-ring-inner {
+  width:20px; height:20px; border-radius:50%;
+  background: radial-gradient(circle,
+    rgba(0,255,128,0.5) 0%, transparent 70%);
+  animation: ring-pulse 3s ease-in-out infinite;
+}
+@keyframes ring-pulse {
+  0%,100% { opacity:0.5; transform:scale(0.9); }
+  50%      { opacity:1;   transform:scale(1.1); }
+}
+.logo { font-size:20px; font-weight:900; letter-spacing:8px;
+  color:var(--accent);
+  text-shadow:0 0 16px rgba(0,255,128,0.4); }
+.logo-sub { font-size:8px; letter-spacing:3px;
+  color:var(--muted); margin-top:2px; }
+.header-stats {
+  flex:1; display:flex; align-items:center;
+  justify-content:center; gap:20px;
+}
+.h-stat { display:flex; flex-direction:column;
+  align-items:center; gap:2px; }
+.h-stat-val { font-size:12px; color:var(--text);
+  letter-spacing:1px; }
+.h-stat-lbl { font-size:8px; letter-spacing:2px;
+  color:var(--muted); }
+.hdiv { width:1px; height:24px; background:var(--border); }
+.header-right { display:flex; align-items:center;
+  gap:10px; margin-left:auto; }
+.status-pill {
+  display:flex; align-items:center; gap:6px;
+  padding:3px 10px; border:1px solid var(--border);
+  border-radius:2px; font-size:9px; letter-spacing:2px;
+}
+.s-dot { width:6px; height:6px; border-radius:50%;
+  background:var(--accent); box-shadow:0 0 6px var(--accent);
+  animation:sdot 2.5s ease-in-out infinite; }
+@keyframes sdot {0%,100%{opacity:1}50%{opacity:0.3}}
+.s-dot.w { background:var(--warn); box-shadow:0 0 6px var(--warn); }
+.mode-badge {
+  font-size:9px; letter-spacing:2px; color:var(--a2);
+  padding:3px 8px; border:1px solid rgba(0,255,204,0.2);
+  border-radius:2px; }
+.time-disp { font-size:13px; letter-spacing:2px;
+  color:var(--muted); }
+.ambient-btn {
+  padding:3px 10px; border:1px solid var(--border);
+  border-radius:2px; background:transparent;
+  color:var(--muted); font-family:inherit;
+  font-size:9px; letter-spacing:2px; cursor:pointer; }
+.ambient-btn.on {
+  border-color:var(--accent); color:var(--accent);
+  background:rgba(0,255,128,0.06); }
+
+.panel {
+  background:var(--panel); border:1px solid var(--border);
+  border-radius:2px; position:relative;
+}
+.panel::before,
+.panel::after {
+  content:''; position:absolute;
+  width:8px; height:8px;
+}
 .panel::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 1px;
-  background: linear-gradient(90deg,transparent,var(--accent),transparent);
-  opacity: 0.5;
+  top:-1px; left:-1px;
+  border-top:2px solid var(--accent);
+  border-left:2px solid var(--accent);
+}
+.panel::after {
+  bottom:-1px; right:-1px;
+  border-bottom:2px solid var(--accent);
+  border-right:2px solid var(--accent);
+}
+.panel-glow::after {
+  content:''; position:absolute;
+  top:0; left:10%; right:10%; height:1px;
+  background:linear-gradient(90deg,
+    transparent, var(--accent), transparent);
+  opacity:0.4;
 }
 .panel-title {
-  font-size: 9px;
-  letter-spacing: 4px;
-  color: var(--muted);
-  text-transform: uppercase;
-  margin-bottom: 14px;
+  font-size:8px; letter-spacing:4px; color:var(--muted);
+  padding:8px 12px 5px;
+  border-bottom:1px solid rgba(0,255,128,0.06);
+  display:flex; justify-content:space-between;
 }
+
+.left-col {
+  display:flex; flex-direction:column; gap:7px;
+  padding:8px 8px 8px 10px; overflow-y:auto;
+  scrollbar-width:none;
+  border-right:1px solid rgba(0,255,128,0.06);
+}
+.left-col::-webkit-scrollbar { display:none; }
+
+.diag-item {
+  padding:5px 12px;
+  border-bottom:1px solid rgba(0,255,128,0.04);
+}
+.diag-item:last-child { border-bottom:none; }
+.diag-hdr { display:flex; justify-content:space-between;
+  margin-bottom:5px; font-size:9px; }
+.diag-lbl { color:var(--muted); letter-spacing:1px; }
+.diag-val { color:var(--text); font-weight:700; }
+.diag-val.w { color:var(--warn); }
+.diag-val.d { color:var(--danger); }
+.bar { height:2px; background:rgba(0,255,128,0.08);
+  border-radius:1px; overflow:hidden; }
+.bar-fill {
+  height:100%; border-radius:1px;
+  background:linear-gradient(90deg,
+    rgba(0,200,80,0.8), var(--accent));
+  box-shadow:0 0 5px rgba(0,255,128,0.4);
+  transition:width 1s ease;
+}
+.bar-fill.w {
+  background:linear-gradient(90deg,#cc5500,var(--warn)); }
+.bar-fill.d {
+  background:linear-gradient(90deg,#990000,var(--danger)); }
+
 .stat-row {
-  display: flex;
-  justify-content: space-between;
-  padding: 6px 0;
-  border-top: 1px solid rgba(0,255,128,0.06);
-  font-size: 11px;
-  color: var(--muted);
+  display:flex; justify-content:space-between;
+  padding:4px 12px; font-size:10px;
+  border-bottom:1px solid rgba(0,255,128,0.04);
 }
-.stat-row span:last-child { color: var(--text); }
-.emotion-badge {
-  display: inline-block;
-  padding: 3px 10px;
-  border: 1px solid var(--border);
-  border-radius: 2px;
-  font-size: 10px;
-  letter-spacing: 2px;
-  color: var(--accent);
-  margin-bottom: 10px;
+.stat-row:last-child { border-bottom:none; }
+.stat-lbl { color:var(--muted); }
+.stat-val { color:var(--text); }
+.stat-val.green  { color:var(--accent); }
+.stat-val.warn   { color:var(--warn); }
+.stat-val.danger { color:var(--danger); }
+
+.sentinel-num {
+  font-size:34px; font-weight:900; line-height:1;
+  color:var(--accent);
+  text-shadow:0 0 16px rgba(0,255,128,0.4);
+  padding:6px 12px 2px;
 }
-.coverage-banner {
-  background: rgba(255,170,0,0.08);
-  border: 1px solid rgba(255,170,0,0.3);
-  border-radius: 3px;
-  padding: 8px 12px;
-  font-size: 11px;
-  letter-spacing: 1px;
-  color: var(--warn);
-  margin-bottom: 14px;
-  display: none;
+.sentinel-num.w { color:var(--warn);
+  text-shadow:0 0 16px rgba(255,170,0,0.4); }
+.sentinel-num.d { color:var(--danger);
+  text-shadow:0 0 16px rgba(255,68,68,0.4); }
+
+.center-col {
+  display:flex; flex-direction:column;
+  padding:8px; gap:7px; min-height:0;
 }
-.coverage-banner.active { display: block; }
-.chat-area {
-  grid-column: 2;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+.ctrl-bar { display:flex; gap:5px; flex-shrink:0; }
+.ctrl-btn {
+  padding:4px 12px; border:1px solid var(--border);
+  border-radius:2px; background:transparent;
+  color:var(--muted); font-family:inherit;
+  font-size:9px; letter-spacing:2px; cursor:pointer;
 }
-.messages {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 14px;
-  min-height: 300px;
-  max-height: 400px;
-  overflow-y: auto;
+.ctrl-btn:hover { border-color:var(--accent); color:var(--accent); }
+.ctrl-btn.ml { margin-left:auto; }
+
+.msgs {
+  flex:1; overflow-y:auto; padding:3px 1px;
+  display:flex; flex-direction:column; gap:1px;
+  min-height:0;
 }
-.msg { padding: 8px 0; border-top: 1px solid rgba(0,255,128,0.06); }
-.msg:first-child { border-top: none; }
-.msg-label { font-size: 9px; letter-spacing: 3px; color: var(--muted); margin-bottom: 4px; }
-.msg-user .msg-label { color: var(--accent2); }
-.msg-friday .msg-label { color: var(--accent); }
-.msg-system { color: var(--muted); font-size: 11px; text-align: center; padding: 8px 0; }
-.msg-text { font-size: 13px; line-height: 1.6; }
-.msg-user .msg-text { color: var(--accent2); }
-.input-row {
-  display: flex;
-  gap: 8px;
+.msgs::-webkit-scrollbar { width:3px; }
+.msgs::-webkit-scrollbar-thumb { background:var(--muted); }
+.msg { padding:8px 12px;
+  border-left:2px solid transparent;
+  animation:msg-in 0.2s ease; }
+@keyframes msg-in {
+  from{opacity:0;transform:translateY(3px)}
+  to{opacity:1;transform:translateY(0)} }
+.msg-you { border-left-color:var(--a2);
+  background:rgba(0,255,204,0.02); }
+.msg-fri { border-left-color:var(--accent);
+  background:rgba(0,255,128,0.02); }
+.msg-sys { border-left-color:var(--muted);
+  background:transparent; }
+.msg-who { font-size:8px; letter-spacing:3px;
+  margin-bottom:4px; }
+.msg-you .msg-who  { color:var(--a2); }
+.msg-fri .msg-who  { color:var(--accent); }
+.msg-sys .msg-who  { color:var(--muted); }
+.msg-txt { font-size:12px; line-height:1.65; }
+.msg-you .msg-txt  { color:var(--a2); }
+.msg-fri .msg-txt  { color:var(--text); }
+.msg-sys .msg-txt  { color:var(--muted); font-style:italic; font-size:10px; }
+.msg-meta { display:flex; gap:8px; margin-top:4px; }
+.msg-model { font-size:8px; color:var(--muted);
+  padding:1px 5px; border:1px solid var(--border);
+  border-radius:1px; letter-spacing:1px; }
+.msg-ms { font-size:8px; color:var(--muted); }
+.think { display:flex; gap:6px; align-items:center;
+  padding:8px 12px; font-size:9px; letter-spacing:2px;
+  color:var(--muted); border-left:2px solid var(--accent); }
+.tdot { width:4px; height:4px; border-radius:50%;
+  background:var(--accent);
+  animation:sdot 0.8s ease-in-out infinite; }
+.tdot:nth-child(2){animation-delay:0.2s}
+.tdot:nth-child(3){animation-delay:0.4s}
+
+.input-row { display:flex; gap:7px; flex-shrink:0; }
+.inp {
+  flex:1; background:rgba(0,255,128,0.02);
+  border:1px solid var(--border); border-radius:2px;
+  color:var(--text); padding:9px 14px;
+  font-family:inherit; font-size:12px; outline:none;
+  transition:border-color 0.2s, box-shadow 0.2s;
 }
-.chat-input {
-  flex: 1;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  color: var(--text);
-  padding: 10px 14px;
-  font-family: inherit;
-  font-size: 13px;
-  outline: none;
+.inp:focus {
+  border-color:var(--accent);
+  box-shadow:0 0 0 1px rgba(0,255,128,0.12),
+             inset 0 0 16px rgba(0,255,128,0.03);
 }
-.chat-input:focus { border-color: var(--accent); }
-.chat-input::placeholder { color: var(--muted); }
-.btn {
-  background: transparent;
-  border: 1px solid var(--accent);
-  color: var(--accent);
-  padding: 10px 16px;
-  border-radius: 3px;
-  cursor: pointer;
-  font-family: inherit;
-  font-size: 11px;
-  letter-spacing: 2px;
+.inp::placeholder { color:var(--muted); }
+.send-btn {
+  padding:0 16px; background:rgba(0,255,128,0.06);
+  border:1px solid var(--accent); border-radius:2px;
+  color:var(--accent); font-family:inherit;
+  font-size:9px; letter-spacing:3px; cursor:pointer;
 }
-.btn:hover { background: rgba(0,255,128,0.08); }
-.log-area {
-  grid-column: 1 / -1;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 14px;
-  max-height: 180px;
-  overflow-y: auto;
+.send-btn:hover { background:rgba(0,255,128,0.12); }
+.mic-btn {
+  width:40px; background:transparent;
+  border:1px solid var(--border); border-radius:2px;
+  color:var(--muted); font-size:14px; cursor:pointer;
 }
-.log-entry {
-  display: flex;
-  gap: 12px;
-  padding: 6px 0;
-  border-top: 1px solid rgba(0,255,128,0.05);
-  font-size: 11px;
+.mic-btn.on { border-color:var(--a2); color:var(--a2); }
+
+.right-col {
+  display:flex; flex-direction:column; gap:7px;
+  padding:8px 10px 8px 8px; overflow-y:auto;
+  scrollbar-width:none;
+  border-left:1px solid rgba(0,255,128,0.06);
 }
-.log-entry:first-child { border-top: none; }
-.log-ts { color: var(--muted); white-space: nowrap; }
-.log-mode { padding: 1px 6px; border: 1px solid var(--border); border-radius: 2px; font-size: 9px; letter-spacing: 1px; }
-.log-mode.friday { color: var(--accent); }
-.log-mode.jarvis { color: #00b4ff; }
-.log-mode.coverage { color: var(--warn); }
-.log-mode.emergency { color: var(--danger); }
-.log-text { color: var(--text); flex: 1; }
-footer { margin-top: 14px; text-align: center; font-size: 9px; letter-spacing: 3px; color: var(--muted); }
+.right-col::-webkit-scrollbar { display:none; }
+
+.voice-name { font-size:13px; font-weight:700;
+  letter-spacing:2px; color:var(--accent); margin-bottom:5px; }
+.voice-track { height:2px;
+  background:rgba(0,255,128,0.08); border-radius:1px;
+  overflow:hidden; margin-bottom:4px; }
+.voice-fill {
+  height:100%;
+  background:linear-gradient(90deg, rgba(0,200,80,0.8), var(--a2));
+  transition:width 1s ease; }
+.voice-chars { display:flex; justify-content:space-between;
+  font-size:8px; color:var(--muted); margin-bottom:8px; }
+.voice-btns { display:flex; gap:5px; }
+.vbtn {
+  flex:1; padding:4px 0; border:1px solid var(--border);
+  border-radius:2px; background:transparent;
+  color:var(--muted); font-family:inherit;
+  font-size:8px; letter-spacing:1px; cursor:pointer; }
+.vbtn.on { border-color:var(--accent); color:var(--accent); }
+.mute-btn {
+  padding:4px 10px; border:1px solid var(--border);
+  border-radius:2px; background:transparent;
+  color:var(--muted); font-family:inherit;
+  font-size:8px; letter-spacing:2px; cursor:pointer; }
+.mute-btn.on { border-color:var(--warn); color:var(--warn); }
+
+.alert-item {
+  display:flex; gap:7px; align-items:flex-start;
+  padding:5px 0; border-bottom:1px solid rgba(0,255,128,0.04);
+  font-size:10px;
+}
+.alert-item:last-child { border-bottom:none; }
+.adot { width:5px; height:5px; border-radius:50%;
+  margin-top:3px; flex-shrink:0; }
+.adot.d { background:var(--danger); box-shadow:0 0 4px var(--danger); }
+.adot.w { background:var(--warn);   box-shadow:0 0 4px var(--warn); }
+.adot.i { background:var(--accent); box-shadow:0 0 4px var(--accent); }
+.alert-txt { color:var(--text); line-height:1.4; }
+
+.con-text {
+  padding:8px 12px 10px; font-size:10px;
+  line-height:1.8; color:var(--muted); font-style:italic;
+  border-left:2px solid rgba(0,255,128,0.15);
+  margin:0 12px 8px; background:rgba(0,255,128,0.015);
+}
+
+.ver-status {
+  padding:8px 12px 10px;
+}
+.ver-item {
+  display:flex; justify-content:space-between;
+  padding:3px 0; font-size:10px;
+  border-bottom:1px solid rgba(0,255,128,0.04);
+}
+.ver-item:last-child { border-bottom:none; }
+.ver-nominal { color:var(--accent); }
+.ver-warn    { color:var(--warn); }
+.ver-danger  { color:var(--danger); }
+
+footer {
+  grid-column:1/-1; display:flex; align-items:center;
+  padding:0 14px; gap:5px;
+  background:rgba(1,13,6,0.98);
+  border-top:1px solid var(--border);
+}
+.scene-btn {
+  padding:3px 10px; border:1px solid rgba(0,255,128,0.1);
+  border-radius:1px; background:transparent;
+  color:var(--muted); font-family:inherit;
+  font-size:8px; letter-spacing:2px; cursor:pointer;
+  text-decoration:none; display:flex; align-items:center;
+}
+.scene-btn:hover {
+  border-color:var(--accent); color:var(--accent); }
+.f-right { margin-left:auto; display:flex;
+  align-items:center; gap:14px;
+  font-size:8px; letter-spacing:2px; }
+.f-status { display:flex; align-items:center; gap:4px;
+  color:var(--muted); }
+.f-dot { width:5px; height:5px; border-radius:50%; }
+.f-dot.g { background:var(--accent); box-shadow:0 0 4px var(--accent); }
+.f-dot.y { background:var(--warn);   box-shadow:0 0 4px var(--warn); }
+.f-dot.r { background:var(--danger); box-shadow:0 0 4px var(--danger); }
+
+.cov-banner {
+  background:rgba(255,170,0,0.06);
+  border:1px solid rgba(255,170,0,0.25);
+  border-radius:2px; padding:5px 10px;
+  font-size:9px; letter-spacing:2px; color:var(--warn);
+  display:none;
+}
+.cov-banner.on { display:block; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div>
-      <div class="logo">FRIDAY</div>
-      <div class="logo-sub">FEMALE REPLACEMENT INTELLIGENT DIGITAL ASSISTANT YOUTH · V2.0</div>
-    </div>
-    <div class="status-area">
-      <div class="status-pill">
-        <span class="dot" id="status-dot"></span>
-        <span id="status-text">CONNECTING</span>
-      </div>
-      <div id="clock">--:--:--</div>
-    </div>
-  </header>
 
-  <main>
-    <!-- Left: Stats -->
-    <div class="panel">
-      <div class="panel-title">SYSTEM STATUS</div>
-      <div class="coverage-banner" id="coverage-banner">
-        ⚡ COVERAGE MODE — JARVIS OFFLINE
+<div class="corner c-tl"></div>
+<div class="corner c-tr"></div>
+<div class="corner c-bl"></div>
+<div class="corner c-br"></div>
+
+<div class="layout">
+
+<header>
+  <div class="logo-ring">
+    <div class="logo-ring-inner"></div>
+  </div>
+  <div>
+    <div class="logo">F.R.I.D.A.Y</div>
+    <div class="logo-sub" id="mark-lbl">V2 — LOADING</div>
+  </div>
+  <div class="header-stats">
+    <div class="h-stat">
+      <div class="h-stat-val" id="h-cpu">—%</div>
+      <div class="h-stat-lbl">SYSTEMS</div>
+    </div>
+    <div class="hdiv"></div>
+    <div class="h-stat">
+      <div class="h-stat-val" id="h-ram">—%</div>
+      <div class="h-stat-lbl">MEMORY</div>
+    </div>
+    <div class="hdiv"></div>
+    <div class="h-stat">
+      <div class="h-stat-val" id="h-up">—</div>
+      <div class="h-stat-lbl">UPTIME</div>
+    </div>
+    <div class="hdiv"></div>
+    <div class="h-stat">
+      <div class="h-stat-val" id="h-jar">—</div>
+      <div class="h-stat-lbl">JARVIS</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="status-pill">
+      <div class="s-dot" id="s-dot"></div>
+      <span id="s-txt">CONNECTING</span>
+    </div>
+    <div class="mode-badge" id="mode-badge">NORMAL</div>
+    <div class="time-disp" id="clock">--:--:--</div>
+    <button class="ambient-btn" id="amb-btn"
+            onclick="toggleAmbient()">⚡ AMBIENT</button>
+  </div>
+</header>
+
+<div class="left-col">
+
+  <div class="panel panel-glow">
+    <div class="panel-title">DIAGNOSTICS <span>F.R.I.D.A.Y</span></div>
+    <div style="padding:6px 0">
+      <div class="diag-item">
+        <div class="diag-hdr">
+          <span class="diag-lbl">CPU</span>
+          <span class="diag-val" id="cpu-v">—%</span>
+        </div>
+        <div class="bar">
+          <div class="bar-fill" id="cpu-b" style="width:0%"></div>
+        </div>
       </div>
-      <div class="emotion-badge" id="emotion-badge">NEUTRAL</div>
-      <div class="stat-row"><span>JARVIS</span><span id="jarvis-status">—</span></div>
-      <div class="stat-row"><span>BRAIN</span><span id="brain-status">—</span></div>
-      <div class="stat-row"><span>VOICE MODE</span><span id="voice-mode">—</span></div>
-      <div class="stat-row"><span>UPTIME</span><span id="uptime">—</span></div>
-      <div class="stat-row"><span>API CALLS</span><span id="api-calls">—</span></div>
-      <div class="stat-row"><span>TOKENS</span><span id="api-tokens">—</span></div>
-      <div style="margin-top:14px">
-        <div class="panel-title">EMOTIONAL TREND</div>
-        <div id="emotion-trend" style="font-size:11px;color:var(--muted)">No data yet</div>
+      <div class="diag-item">
+        <div class="diag-hdr">
+          <span class="diag-lbl">MEMORY</span>
+          <span class="diag-val" id="ram-v">—%</span>
+        </div>
+        <div class="bar">
+          <div class="bar-fill" id="ram-b" style="width:0%"></div>
+        </div>
       </div>
-      <div style="margin-top:14px;display:flex;gap:6px;flex-wrap:wrap">
-        <button class="btn" style="padding:5px 10px;font-size:9px" onclick="setMode('normal')">NORMAL</button>
-        <button class="btn" style="padding:5px 10px;font-size:9px" onclick="setMode('focused')">FOCUSED</button>
-        <button class="btn" style="padding:5px 10px;font-size:9px" onclick="setMode('brief')">BRIEF</button>
+      <div class="diag-item">
+        <div class="diag-hdr">
+          <span class="diag-lbl">UPTIME</span>
+          <span class="diag-val green" id="up-v">—</span>
+        </div>
+      </div>
+      <div class="diag-item">
+        <div class="diag-hdr">
+          <span class="diag-lbl">API CALLS</span>
+          <span class="diag-val" id="api-v">—</span>
+        </div>
       </div>
     </div>
+  </div>
 
-    <!-- Right: Chat -->
-    <div class="chat-area">
-      <div class="messages" id="messages">
-        <div class="msg-system">FRIDAY V2 — Say something, boss.</div>
+  <div class="panel">
+    <div class="panel-title">SECURITY</div>
+    <div class="sentinel-num" id="threat-num">0</div>
+    <div style="padding:0 0 6px">
+      <div class="stat-row">
+        <span class="stat-lbl">THREATS</span>
+        <span class="stat-val danger" id="st-threats">0</span>
       </div>
-      <div class="input-row">
-        <input class="chat-input" id="input"
-               placeholder="Talk to FRIDAY..."
-               onkeydown="if(event.key==='Enter'){send()}">
-        <button class="btn" onclick="send()">SEND</button>
+      <div class="stat-row">
+        <span class="stat-lbl">BLOCKED IPS</span>
+        <span class="stat-val danger" id="st-blocked">0</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-lbl">VERONICA</span>
+        <span class="stat-val green" id="st-veronica">ACTIVE</span>
       </div>
     </div>
+  </div>
 
-    <!-- Exchange log -->
-    <div class="log-area">
-      <div class="panel-title">EXCHANGE LOG</div>
-      <div id="log"></div>
+  <div class="panel">
+    <div class="panel-title">JARVIS LINK</div>
+    <div style="padding:6px 0">
+      <div class="stat-row">
+        <span class="stat-lbl">STATUS</span>
+        <span class="stat-val" id="j-status">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-lbl">COVERAGE</span>
+        <span class="stat-val" id="j-cover">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-lbl">LATENCY</span>
+        <span class="stat-val green" id="j-lat">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-lbl">SYNC</span>
+        <span class="stat-val" id="j-sync">—</span>
+      </div>
     </div>
-  </main>
+  </div>
 
-  <footer>FRIDAY V2 · AUTO-REFRESH 5S</footer>
+  <div class="panel">
+    <div class="panel-title">VERONICA</div>
+    <div class="ver-status" id="ver-status">
+      <div class="no-data" style="font-size:10px;color:var(--muted)">
+        Loading...
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">EMOTIONAL TREND</div>
+    <div style="padding:8px 12px" id="emotion-trend">
+      <div style="font-size:10px;color:var(--muted)">No data</div>
+    </div>
+  </div>
+
+</div>
+
+<div class="center-col">
+  <div class="cov-banner" id="cov-banner">
+    ⚡ COVERAGE MODE — JARVIS OFFLINE — FRIDAY IN CONTROL
+  </div>
+  <div class="ctrl-bar">
+    <button class="ctrl-btn" onclick="sendQ('FRIDAY run a morning brief')">MORNING BRIEF</button>
+    <button class="ctrl-btn" onclick="sendQ('FRIDAY device diagnostics')">DIAGNOSTICS</button>
+    <button class="ctrl-btn ml" onclick="clearMsgs()">CLEAR</button>
+  </div>
+  <div class="msgs" id="msgs">
+    <div class="msg msg-sys">
+      <div class="msg-who">SYSTEM</div>
+      <div class="msg-txt">F.R.I.D.A.Y online. Ready when you are, boss.</div>
+    </div>
+  </div>
+  <div class="input-row">
+    <button class="mic-btn" id="mic-btn" onclick="toggleMic()">🎤</button>
+    <input class="inp" id="inp"
+           placeholder="Talk to FRIDAY..."
+           onkeydown="if(event.key==='Enter')send()">
+    <button class="send-btn" onclick="send()">SEND</button>
+  </div>
+</div>
+
+<div class="right-col">
+
+  <div class="panel">
+    <div class="panel-title">
+      VOICE ENGINE
+      <button class="mute-btn" id="mute-btn"
+              onclick="toggleMute()">MUTE</button>
+    </div>
+    <div style="padding:8px 12px 10px">
+      <div class="voice-name">ELEVENLABS</div>
+      <div class="voice-btns">
+        <button class="vbtn on" id="vb-el">ELEVEN</button>
+        <button class="vbtn" id="vb-edge">EDGE</button>
+        <button class="vbtn" id="vb-off">OFFLINE</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">LIVE ALERTS</div>
+    <div id="alerts" style="padding:6px 0">
+      <div style="padding:6px 12px;font-size:10px;
+                  color:var(--muted)">No alerts.</div>
+    </div>
+  </div>
+
+  <div class="panel" style="flex:1;min-height:0;display:flex;flex-direction:column">
+    <div class="panel-title">RECENT EXCHANGES</div>
+    <div class="con-text" id="con-feed"
+         style="flex:1;overflow-y:auto">
+      No exchanges yet.
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  <button class="scene-btn" onclick="setVoiceMode('normal')">NORMAL</button>
+  <button class="scene-btn" onclick="setVoiceMode('night')">NIGHT</button>
+  <button class="scene-btn" onclick="setVoiceMode('focused')">FOCUS</button>
+  <button class="scene-btn" onclick="setVoiceMode('support')">SUPPORT</button>
+  <a href="/friday/veronica/selftest" class="scene-btn"
+     target="_blank">VERONICA</a>
+  <a href="/friday/protocols" class="scene-btn"
+     target="_blank">PROTOCOLS</a>
+
+  <div class="f-right">
+    <div class="f-status">
+      <div class="f-dot g" id="f-friday"></div>
+      <span>FRIDAY</span>
+    </div>
+    <div class="f-status">
+      <div class="f-dot" id="f-jarvis"></div>
+      <span>JARVIS</span>
+    </div>
+    <div class="f-status">
+      <div class="f-dot g" id="f-ver"></div>
+      <span>VERONICA</span>
+    </div>
+    <div class="f-status" style="color:var(--muted)">
+      COVERAGE: <span id="f-cover">OFF</span>
+    </div>
+  </div>
+</footer>
+
 </div>
 
 <script>
-// Same origin as the page that served this HUD — no hardcoded port. Avoids
-// the class of bug JARVIS's mobile HUD had (forcing a fixed port regardless
-// of what's actually serving the page breaks it behind any proxy/CDN).
+// Same origin as the page that served this HUD — no hardcoded port. A
+// fixed fallback port here would misroute behind Render's proxy (same
+// bug class the previous HUD iteration fixed; not reintroducing it).
 const BASE = `${location.protocol}//${location.host}`;
+let muted = false, ambient = false, recording = false;
+let currentAudio = null, ambientCtx = null;
 
 function tick() {
-  document.getElementById('clock').textContent =
-    new Date().toLocaleTimeString([], {hour12:false});
+  const t = new Date().toLocaleTimeString('en-US',{hour12:false});
+  document.getElementById('clock').textContent = t;
 }
-setInterval(tick, 1000); tick();
+setInterval(tick,1000); tick();
 
 async function send() {
-  const inp  = document.getElementById('input');
+  const inp  = document.getElementById('inp');
   const text = inp.value.trim();
   if (!text) return;
   inp.value = '';
-  addMsg('user', 'YOU', text);
-
+  addMsg('you','YOU',text);
+  addFeed('YOU', text);
+  showThink();
   try {
-    const r = await fetch(`${BASE}/command`, {
-      method:  'POST',
-      headers: {'Content-Type': 'application/json'},
-      body:    JSON.stringify({prompt: text}),
+    const r = await fetch(`${BASE}/command`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({prompt:text}),
     });
     const d = await r.json();
-    addMsg('friday', 'FRIDAY', d.response || '...');
-    if (d.has_audio && d.audio_file) {
+    hideThink();
+    addMsg('fri','FRIDAY',d.response||'...',{
+      model: d.model||'',
+      ms:    d.ms||0,
+    });
+    addFeed('FRIDAY', d.response || '...');
+    if (!muted && d.has_audio && d.audio_file) {
       playAudio(d.audio_file);
     }
+    if (d.emotion && d.emotion !== 'neutral') {
+      addAlert(
+        `Emotional state: ${d.emotion}`,
+        'i'
+      );
+    }
   } catch(e) {
-    addMsg('friday', 'FRIDAY', 'Connection issue, boss.');
+    hideThink();
+    addMsg('sys','SYSTEM','Connection error, boss.');
   }
 }
 
-let _currentAudio = null;
-function playAudio(file) {
-  if (_currentAudio) { _currentAudio.pause(); _currentAudio = null; }
-  _currentAudio = new Audio(`${BASE}/friday/voice/audio?file=${encodeURIComponent(file)}&t=${Date.now()}`);
-  _currentAudio.play().catch(e => console.log('Audio:', e));
+function sendQ(q) {
+  document.getElementById('inp').value = q;
+  send();
 }
 
-function addMsg(type, label, text) {
-  const m  = document.getElementById('messages');
+function addFeed(who, text) {
+  const feed = document.getElementById('con-feed');
+  const line = document.createElement('div');
+  line.style.marginBottom = '6px';
+  line.textContent = `${who}: ${text}`.slice(0, 160);
+  feed.insertBefore(line, feed.firstChild);
+  while (feed.children.length > 8) feed.removeChild(feed.lastChild);
+}
+
+function addMsg(type,label,text,meta={}) {
+  const msgs = document.getElementById('msgs');
+  hideThink();
   const el = document.createElement('div');
   el.className = `msg msg-${type}`;
-  el.innerHTML = `<div class="msg-label">${label}</div>
-                  <div class="msg-text">${text}</div>`;
-  m.appendChild(el);
-  m.scrollTop = m.scrollHeight;
+  const clean = text
+    .replace(/\[Confidence:\s*\d+%\]/gi,'')
+    .replace(/_FYI:.*?_/gi,'')
+    .replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>')
+    .replace(/\*(.*?)\*/g,'<em>$1</em>');
+  let metaHtml = '';
+  if (meta.model) {
+    metaHtml = `<div class="msg-meta">
+      <span class="msg-model">${meta.model.toUpperCase().slice(0,20)}</span>
+      ${meta.ms ? `<span class="msg-ms">${meta.ms}ms</span>` : ''}
+    </div>`;
+  }
+  el.innerHTML = `<div class="msg-who">${label}</div>
+                  <div class="msg-txt">${clean}</div>
+                  ${metaHtml}`;
+  msgs.appendChild(el);
+  msgs.scrollTop = msgs.scrollHeight;
 }
 
-async function poll() {
+let thinkEl = null;
+function showThink() {
+  const msgs = document.getElementById('msgs');
+  thinkEl = document.createElement('div');
+  thinkEl.className = 'think';
+  thinkEl.innerHTML =
+    '<div class="tdot"></div><div class="tdot"></div>' +
+    '<div class="tdot"></div><span>FRIDAY IS THINKING...</span>';
+  msgs.appendChild(thinkEl);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+function hideThink() {
+  if (thinkEl) { thinkEl.remove(); thinkEl = null; }
+}
+
+function clearMsgs() {
+  document.getElementById('msgs').innerHTML =
+    '<div class="msg msg-sys"><div class="msg-who">SYSTEM</div>' +
+    '<div class="msg-txt">Chat cleared.</div></div>';
+}
+
+function addAlert(text, type='i') {
+  const al = document.getElementById('alerts');
+  const nd = al.querySelector('.no-alerts');
+  if (nd) nd.remove();
+  const el = document.createElement('div');
+  el.className = 'alert-item';
+  el.innerHTML = `<div class="adot ${type}"></div>
+                  <div class="alert-txt">${text.slice(0,100)}</div>`;
+  al.prepend(el);
+  while (al.children.length > 5) al.removeChild(al.lastChild);
+}
+
+function playAudio(file) {
+  if (muted) return;
+  if (currentAudio) { currentAudio.pause(); currentAudio=null; }
+  const url = `${BASE}/friday/voice/audio?file=${file}&t=${Date.now()}`;
+  currentAudio = new Audio(url);
+  currentAudio.play().catch(()=>{});
+}
+
+function toggleMute() {
+  muted = !muted;
+  const b = document.getElementById('mute-btn');
+  b.textContent = muted ? 'UNMUTE' : 'MUTE';
+  b.className   = muted ? 'mute-btn on' : 'mute-btn';
+  if (muted && currentAudio) currentAudio.pause();
+}
+
+function toggleMic() {
+  recording = !recording;
+  document.getElementById('mic-btn').className =
+    recording ? 'mic-btn on' : 'mic-btn';
+}
+
+function toggleAmbient() {
+  ambient = !ambient;
+  document.getElementById('amb-btn').className =
+    ambient ? 'ambient-btn on' : 'ambient-btn';
+  if (ambient) startAmbient();
+  else stopAmbient();
+}
+
+function startAmbient() {
+  ambientCtx = new (window.AudioContext||window.webkitAudioContext)();
+  const o1 = ambientCtx.createOscillator();
+  const g1 = ambientCtx.createGain();
+  o1.frequency.value = 55; o1.type = 'sine';
+  g1.gain.value = 0.035;
+  o1.connect(g1); g1.connect(ambientCtx.destination); o1.start();
+  const o2 = ambientCtx.createOscillator();
+  const g2 = ambientCtx.createGain();
+  o2.frequency.value = 110; o2.type = 'sine';
+  g2.gain.value = 0.015;
+  o2.connect(g2); g2.connect(ambientCtx.destination); o2.start();
+}
+
+function stopAmbient() {
+  if (ambientCtx) { ambientCtx.close(); ambientCtx=null; }
+}
+
+async function setVoiceMode(mode) {
+  await fetch(`${BASE}/mode`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({mode}),
+  });
+}
+
+async function pollState() {
   try {
     const r = await fetch(`${BASE}/state`);
     const d = await r.json();
 
-    const online = d.status === 'ONLINE';
-    document.getElementById('status-dot').className =
-      'dot' + (online ? '' : ' warn');
-    document.getElementById('status-text').textContent =
-      d.status || 'UNKNOWN';
-
-    document.getElementById('jarvis-status').textContent =
-      d.jarvis_online ? '🟢 ONLINE' : '🔴 OFFLINE';
-    document.getElementById('brain-status').textContent =
-      d.core || '—';
-    document.getElementById('voice-mode').textContent =
-      (d.voice_mode || 'normal').toUpperCase();
-
-    const up = d.uptime_seconds || 0;
-    const h  = Math.floor(up/3600);
-    const m  = Math.floor((up%3600)/60);
-    document.getElementById('uptime').textContent =
-      h ? `${h}h ${m}m` : `${m}m`;
-
-    const b = d.budget || {};
-    document.getElementById('api-calls').textContent =
-      `${b.calls||0} / ${b.calls_limit||150}`;
-    document.getElementById('api-tokens').textContent =
-      `${(b.output_tokens||0).toLocaleString()} / ${(b.output_tokens_limit||30000).toLocaleString()}`;
-
-    const banner = document.getElementById('coverage-banner');
-    banner.className = 'coverage-banner' + (d.coverage_mode ? ' active' : '');
-
-    const trend = d.emotional_trend || {};
-    const trendEl = document.getElementById('emotion-trend');
-    if (Object.keys(trend).length) {
-      trendEl.textContent = Object.entries(trend)
-        .sort((a,b)=>b[1]-a[1])
-        .slice(0,3)
-        .map(([e,c])=>`${e}: ${c}`)
-        .join(' · ');
+    const dot = document.getElementById('s-dot');
+    const txt = document.getElementById('s-txt');
+    if (d.status === 'ONLINE') {
+      dot.className = 's-dot';
+      txt.textContent = 'FRIDAY ONLINE';
+    } else {
+      dot.className = 's-dot w';
+      txt.textContent = d.status || 'DEGRADED';
     }
 
-    const log    = d.log || [];
-    const logEl  = document.getElementById('log');
-    logEl.innerHTML = '';
-    log.forEach(e => {
-      const el   = document.createElement('div');
-      el.className = 'log-entry';
-      el.innerHTML = `
-        <span class="log-ts">${e.ts}</span>
-        <span class="log-mode ${e.mode}">${e.mode}</span>
-        <span class="log-text">${e.user?.slice(0,60)} → ${e.response?.slice(0,80)}</span>
-      `;
-      logEl.appendChild(el);
-    });
+    const b = d.budget || {};
+    const cpuTxt = (d.cpu_pct != null) ? `${Math.round(d.cpu_pct)}%` : '—';
+    const ramTxt = (d.ram_pct != null) ? `${Math.round(d.ram_pct)}%` : '—';
+    document.getElementById('h-cpu').textContent = cpuTxt;
+    document.getElementById('h-ram').textContent = ramTxt;
+    document.getElementById('cpu-v').textContent = cpuTxt;
+    document.getElementById('ram-v').textContent = ramTxt;
+    document.getElementById('cpu-b').style.width = (d.cpu_pct || 0) + '%';
+    document.getElementById('ram-b').style.width = (d.ram_pct || 0) + '%';
+
+    const up = d.uptime || 0;
+    const h  = Math.floor(up/3600);
+    const m  = Math.floor((up%3600)/60);
+    const upStr = h ? `${h}h ${m}m` : `${m}m`;
+    document.getElementById('h-up').textContent  = upStr;
+    document.getElementById('up-v').textContent  = upStr;
+
+    document.getElementById('h-jar').textContent =
+      d.jarvis_online ? 'ONLINE' : 'OFFLINE';
+    document.getElementById('j-status').textContent =
+      d.jarvis_online ? '🟢 ONLINE' : '🔴 OFFLINE';
+    document.getElementById('j-cover').textContent =
+      d.coverage_mode ? '⚡ ACTIVE' : 'STANDBY';
+
+    document.getElementById('cov-banner').className =
+      d.coverage_mode ? 'cov-banner on' : 'cov-banner';
+
+    document.getElementById('f-jarvis').className =
+      d.jarvis_online ? 'f-dot g' : 'f-dot y';
+    document.getElementById('f-cover').textContent =
+      d.coverage_mode ? 'ACTIVE' : 'OFF';
+
+    document.getElementById('api-v').textContent =
+      `${b.calls||0}/${b.calls_limit||300}`;
+
+    const trend = d.emotional_trend || {};
+    if (Object.keys(trend).length) {
+      document.getElementById('emotion-trend').innerHTML =
+        Object.entries(trend)
+          .sort((a,b)=>b[1]-a[1])
+          .slice(0,4)
+          .map(([e,c])=>`
+            <div style="display:flex;justify-content:space-between;
+              padding:3px 0;font-size:10px;
+              border-top:1px solid rgba(0,255,128,0.04)">
+              <span style="color:var(--muted)">${e}</span>
+              <span style="color:var(--accent)">${c}</span>
+            </div>`
+          ).join('');
+    }
+
+    if (d.voice_mode) {
+      document.getElementById('mode-badge').textContent =
+        d.voice_mode.toUpperCase();
+    }
+
+    const sec = d.security || {};
+    document.getElementById('st-threats').textContent =
+      sec.threats || 0;
+    document.getElementById('st-blocked').textContent =
+      sec.blocked_ips || 0;
+    const tNum = document.getElementById('threat-num');
+    const threats = sec.threats || 0;
+    tNum.textContent  = threats;
+    tNum.className    = threats > 20 ? 'sentinel-num d' :
+                        threats > 5  ? 'sentinel-num w' :
+                        'sentinel-num';
 
   } catch(e) {
-    document.getElementById('status-dot').className = 'dot danger';
-    document.getElementById('status-text').textContent = 'UNREACHABLE';
+    document.getElementById('s-dot').className = 's-dot w';
   }
 }
 
-async function setMode(mode) {
-  await fetch(`${BASE}/mode`, {
-    method:  'POST',
-    headers: {'Content-Type': 'application/json'},
-    body:    JSON.stringify({mode}),
-  });
+async function pollVeronica() {
+  try {
+    const r = await fetch(`${BASE}/friday/veronica/status`);
+    const d = await r.json();
+    const el = document.getElementById('ver-status');
+    const backed = d.components_backed_up || 0;
+    const repairs = d.repairs_performed || 0;
+    el.innerHTML = `
+      <div class="ver-item">
+        <span class="stat-lbl">BACKED UP</span>
+        <span class="ver-nominal">${backed} COMPONENTS</span>
+      </div>
+      <div class="ver-item">
+        <span class="stat-lbl">REPAIRS</span>
+        <span class="ver-nominal">${repairs}</span>
+      </div>
+      <div class="ver-item">
+        <span class="stat-lbl">STATUS</span>
+        <span class="ver-nominal">MONITORING</span>
+      </div>`;
+  } catch(e) {
+    document.getElementById('ver-status').innerHTML =
+      '<div style="font-size:10px;color:var(--muted);padding:8px 12px">Offline</div>';
+  }
 }
 
-poll();
-setInterval(poll, 5000);
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey && e.key==='/') {
+    document.getElementById('inp').focus();
+    e.preventDefault();
+  }
+});
+
+pollState();
+pollVeronica();
+setInterval(pollState, 5000);
+setInterval(pollVeronica, 30000);
+document.getElementById('inp').focus();
 </script>
 </body>
 </html>
