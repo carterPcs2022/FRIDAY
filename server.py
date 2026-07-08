@@ -66,6 +66,14 @@ except Exception as e:
     PROTOCOLS_OK = False
     logging.warning(f"Protocols failed: {e}")
 
+try:
+    from core.veronica import veronica
+    VERONICA_OK = True
+except Exception as e:
+    veronica = None
+    VERONICA_OK = False
+    logging.warning(f"Veronica failed: {e}")
+
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
 JARVIS_TOKEN = os.environ.get("JARVIS_API_TOKEN", "")
@@ -221,6 +229,32 @@ def _training_sync_loop():
 
 if TRAINING_OK:
     threading.Thread(target=_training_sync_loop, daemon=True).start()
+
+# ── Veronica (self-repair monitor) ────────────────────────────────────────────
+
+def _veronica_startup():
+    time.sleep(30)
+    try:
+        result = veronica.save_baselines()
+        test = veronica.self_test()
+        status = test.get("all_systems", "UNKNOWN")
+        logging.info(f"Veronica online — {result['saved']} component(s) backed up, self-test: {status}")
+    except Exception as e:
+        logging.warning(f"Veronica startup failed: {e}")
+
+
+def _veronica_monitor_loop():
+    while True:
+        time.sleep(300)
+        try:
+            veronica.monitor()
+        except Exception as e:
+            logging.warning(f"Veronica monitor failed: {e}")
+
+
+if VERONICA_OK:
+    threading.Thread(target=_veronica_startup, daemon=True).start()
+    threading.Thread(target=_veronica_monitor_loop, daemon=True).start()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -526,6 +560,55 @@ def recall():
         return jsonify({"error": "key required"}), 400
     value = friday_recall(key)
     return jsonify({"key": key, "value": value})
+
+
+# ── Veronica (self-repair monitor) ────────────────────────────────────────────
+
+@app.route("/friday/veronica/status")
+def veronica_status():
+    if not VERONICA_OK:
+        return jsonify({"error": "veronica unavailable"}), 503
+    return jsonify(veronica.get_status())
+
+
+@app.route("/friday/veronica/selftest")
+def veronica_selftest():
+    if not VERONICA_OK:
+        return jsonify({"error": "veronica unavailable"}), 503
+    return jsonify(veronica.self_test())
+
+
+@app.route("/friday/veronica/monitor", methods=["POST"])
+def veronica_monitor():
+    if not VERONICA_OK:
+        return jsonify({"error": "veronica unavailable"}), 503
+    return jsonify(veronica.monitor())
+
+
+@app.route("/friday/veronica/baselines", methods=["POST"])
+def veronica_baselines():
+    if not VERONICA_OK:
+        return jsonify({"error": "veronica unavailable"}), 503
+    return jsonify(veronica.save_baselines())
+
+
+@app.route("/friday/veronica/repair/<component>", methods=["POST"])
+def veronica_repair(component):
+    """Restore a component from its saved backup. Returns
+    repaired=False with no backup available — never improvises a
+    replacement."""
+    if not VERONICA_OK:
+        return jsonify({"error": "veronica unavailable"}), 503
+    return jsonify(veronica.deploy_replacement(component, "manual"))
+
+
+@app.route("/friday/veronica/contain/<component>", methods=["POST"])
+def veronica_contain(component):
+    """Manual-only: swap a component for a harmless no-op stub, backing
+    up the original first."""
+    if not VERONICA_OK:
+        return jsonify({"error": "veronica unavailable"}), 503
+    return jsonify(veronica.contain_failing_component(component))
 
 
 # ── Budget ─────────────────────────────────────────────────────────────────────

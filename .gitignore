@@ -4,3 +4,5 @@ __pycache__/
 memory/
 static/
 budget.json
+logs/
+veronica_backups/

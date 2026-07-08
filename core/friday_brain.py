@@ -25,7 +25,13 @@ MODELS = {
     "smart": "llama-3.3-70b-versatile",
     "nuanced": "claude-haiku-4-5-20251001",
     "deep": "claude-sonnet-5",
+    "maximum": "claude-opus-4-8",
 }
+
+MAXIMUM_TRIGGERS = [
+    "maximum intelligence", "your best", "think hard",
+    "most important", "critical decision",
+]
 
 from config.friday_personality import FRIDAY_PERSONALITY, FRIDAY_VOICE_MODES
 
@@ -44,6 +50,9 @@ class FridayBrain:
         matching more than deliberation."""
         q = query.lower().strip()
         words = len(query.split())
+
+        if any(t in q for t in MAXIMUM_TRIGGERS):
+            return "maximum"
 
         INSTANT = ["what time", "what's the time", "hey friday", "you there",
                   "hello", "hi", "thanks", "thank you", "good morning",
@@ -95,7 +104,9 @@ class FridayBrain:
         messages = self._build_messages(query, context)
 
         result = None
-        if tier == "nuanced" and ANTHROPIC_KEY:
+        if tier == "maximum" and ANTHROPIC_KEY:
+            result = self._call_anthropic(messages, system, MODELS["maximum"])
+        elif tier == "nuanced" and ANTHROPIC_KEY:
             result = self._call_anthropic(messages, system, MODELS["nuanced"])
         elif tier == "deep" and ANTHROPIC_KEY:
             result = self._call_anthropic(messages, system, MODELS["deep"])
