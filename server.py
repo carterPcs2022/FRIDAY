@@ -1,13 +1,30 @@
 """FRIDAY V2 — complete server. Flask + emotional intelligence + JARVIS
 monitoring + green HUD + voice-mode control."""
-import os
 import time
+from flask import Flask, jsonify
+
+# app + /health come before anything else that could fail to import or
+# block — Railway's healthcheck needs a fast 200 from this path to keep
+# the deploy alive at all, and gunicorn can't serve *any* route until
+# this module finishes importing top to bottom. A single broken import
+# further down (or in a nested core/ module) previously meant the whole
+# app never came up, independent of how fast /health's own handler is.
+app = Flask(__name__)
+BOOT_TIME = time.time()
+
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+
+import os
 import datetime
 import logging
 import threading
 from collections import deque
 from pathlib import Path
-from flask import Flask, request, jsonify, send_file
+from flask import request, send_file
 
 try:
     from dotenv import load_dotenv
@@ -15,29 +32,43 @@ try:
 except ImportError:
     pass
 
-app = Flask(__name__)
-BOOT_TIME = time.time()
 EXCHANGE_LOG = deque(maxlen=10)
 BASE_DIR = Path(__file__).resolve().parent
 
 logging.basicConfig(level=logging.INFO, format='[FRIDAY] %(message)s')
 
-# ── Core loading ─────────────────────────────────────────────────────────────
+# ── Core loading — each guarded individually so one failing module can't
+# take the others (or the app) down with it ──────────────────────────────────
 try:
     from core.friday_brain import friday_brain
+    BRAIN_OK = True
+except Exception as e:
+    friday_brain = None
+    BRAIN_OK = False
+    logging.warning(f"Brain failed: {e}")
+
+try:
     from core.emotional_intel import emotional_intel
+    EMOTIONAL_OK = True
+except Exception as e:
+    emotional_intel = None
+    EMOTIONAL_OK = False
+    logging.warning(f"Emotional intelligence failed: {e}")
+
+try:
     from core.friday_memory import (
         save_turn, get_recent_turns, get_context_for,
         save_fact, log_emotion, get_emotional_trend, get_profile,
         get_mood_history, friday_remember, friday_recall,
     )
-    CORE_STATUS = "online"
-    logging.info("Brain and emotional intelligence online")
+    MEMORY_OK = True
 except Exception as e:
-    friday_brain = None
-    emotional_intel = None
-    CORE_STATUS = f"fallback ({e})"
-    logging.warning(f"Core failed: {e}")
+    MEMORY_OK = False
+    logging.warning(f"Memory failed: {e}")
+
+CORE_STATUS = "online" if (BRAIN_OK and EMOTIONAL_OK and MEMORY_OK) else "degraded"
+if CORE_STATUS == "online":
+    logging.info("Brain and emotional intelligence online")
 
 # ── Voice ────────────────────────────────────────────────────────────────────
 try:
@@ -87,6 +118,7 @@ def _monitor_jarvis():
     second independent poller would double the /health traffic and risk
     the two ever disagreeing about whether JARVIS is actually up."""
     global JARVIS_ONLINE, COVERAGE_MODE
+    time.sleep(15)  # let this process's own /health start answering first
     while True:
         try:
             import requests as req
@@ -291,11 +323,8 @@ def overall_status() -> str:
 
 
 # ── Health & status ───────────────────────────────────────────────────────────
-
-@app.route("/health")
-def health():
-    return "OK", 200
-
+# /health itself is registered at the very top of this file, before any of
+# the imports below it that could fail.
 
 @app.route("/")
 def home():
