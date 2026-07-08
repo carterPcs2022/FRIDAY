@@ -161,7 +161,18 @@ def _notify_jarvis_down():
             pass
 
 
-threading.Thread(target=_monitor_jarvis, daemon=True).start()
+def _start_thread(target, name: str):
+    """A thread failing to spawn at all (e.g. a container thread/process
+    ulimit some environments enforce more strictly than local dev does)
+    must not be able to crash the whole module import — that would keep
+    gunicorn from ever binding the port, taking /health down with it."""
+    try:
+        threading.Thread(target=target, daemon=True).start()
+    except Exception as e:
+        logging.warning(f"Failed to start {name} thread: {e}")
+
+
+_start_thread(_monitor_jarvis, "JARVIS monitor")
 
 # ── Proactive emotional check-ins ────────────────────────────────────────────
 # core/emotional_intel.py's should_check_in() was defined but explicitly
@@ -233,7 +244,7 @@ def _schedule_checkins():
         _proactive_checkin()
 
 
-threading.Thread(target=_schedule_checkins, daemon=True).start()
+_start_thread(_schedule_checkins, "check-in scheduler")
 
 # ── JARVIS training sync ──────────────────────────────────────────────────────
 # A plain sleep loop rather than pulling in the `schedule` package for one
@@ -260,7 +271,7 @@ def _training_sync_loop():
 
 
 if TRAINING_OK:
-    threading.Thread(target=_training_sync_loop, daemon=True).start()
+    _start_thread(_training_sync_loop, "training sync")
 
 # ── Veronica (self-repair monitor) ────────────────────────────────────────────
 
@@ -285,8 +296,8 @@ def _veronica_monitor_loop():
 
 
 if VERONICA_OK:
-    threading.Thread(target=_veronica_startup, daemon=True).start()
-    threading.Thread(target=_veronica_monitor_loop, daemon=True).start()
+    _start_thread(_veronica_startup, "Veronica startup")
+    _start_thread(_veronica_monitor_loop, "Veronica monitor")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
