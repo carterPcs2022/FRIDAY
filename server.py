@@ -47,6 +47,24 @@ except Exception as e:
     VOICE_OK = False
     logging.warning(f"Voice failed: {e}")
 
+# ── Training (learns from JARVIS) + range protocols ──────────────────────────
+try:
+    from core.friday_training import friday_trainer
+    TRAINING_OK = True
+except Exception as e:
+    friday_trainer = None
+    TRAINING_OK = False
+    logging.warning(f"Training failed: {e}")
+
+try:
+    from core.friday_protocols import friday_protocols, RangeLevel
+    PROTOCOLS_OK = True
+except Exception as e:
+    friday_protocols = None
+    RangeLevel = None
+    PROTOCOLS_OK = False
+    logging.warning(f"Protocols failed: {e}")
+
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
 JARVIS_TOKEN = os.environ.get("JARVIS_API_TOKEN", "")
@@ -55,6 +73,10 @@ COVERAGE_MODE = False
 
 
 def _monitor_jarvis():
+    """Single JARVIS health poll drives both the existing coverage-mode
+    flag and (if available) friday_protocols' richer range level — a
+    second independent poller would double the /health traffic and risk
+    the two ever disagreeing about whether JARVIS is actually up."""
     global JARVIS_ONLINE, COVERAGE_MODE
     while True:
         try:
@@ -62,19 +84,24 @@ def _monitor_jarvis():
             r = req.get(f"{JARVIS_URL}/health", timeout=3)
             was_online = JARVIS_ONLINE
             JARVIS_ONLINE = r.status_code == 200
-
-            if was_online and not JARVIS_ONLINE:
-                COVERAGE_MODE = True
-                logging.warning("JARVIS offline — FRIDAY assuming control")
-                _log("SYSTEM", "JARVIS offline. FRIDAY is covering.", "coverage")
-                _notify_jarvis_down()
-            elif not was_online and JARVIS_ONLINE:
-                COVERAGE_MODE = False
-                logging.info("JARVIS back online — standing down")
-                _log("SYSTEM", "JARVIS back online.", "handoff")
         except Exception:
+            was_online = JARVIS_ONLINE
             JARVIS_ONLINE = False
-            COVERAGE_MODE = True
+
+        if PROTOCOLS_OK:
+            friday_protocols.check_range(JARVIS_ONLINE)
+            COVERAGE_MODE = friday_protocols.range_level != RangeLevel.FULL
+        else:
+            COVERAGE_MODE = not JARVIS_ONLINE
+
+        if was_online and not JARVIS_ONLINE:
+            logging.warning("JARVIS offline — FRIDAY assuming control")
+            _log("SYSTEM", "JARVIS offline. FRIDAY is covering.", "coverage")
+            _notify_jarvis_down()
+        elif not was_online and JARVIS_ONLINE:
+            logging.info("JARVIS back online — standing down")
+            _log("SYSTEM", "JARVIS back online.", "handoff")
+
         time.sleep(30)
 
 
@@ -167,6 +194,27 @@ def _schedule_checkins():
 
 threading.Thread(target=_schedule_checkins, daemon=True).start()
 
+# ── JARVIS training sync ──────────────────────────────────────────────────────
+# A plain sleep loop rather than pulling in the `schedule` package for one
+# daily job — this codebase already uses this exact pattern for the JARVIS
+# monitor and check-in threads above.
+_DAILY_SYNC_INTERVAL = 24 * 3600
+
+
+def _training_sync_loop():
+    time.sleep(60)  # let the server finish booting first
+    while True:
+        try:
+            if TRAINING_OK:
+                friday_trainer.sync_from_jarvis()
+        except Exception as e:
+            logging.warning(f"JARVIS training sync failed: {e}")
+        time.sleep(_DAILY_SYNC_INTERVAL)
+
+
+if TRAINING_OK:
+    threading.Thread(target=_training_sync_loop, daemon=True).start()
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _log(user: str, response: str, mode: str):
@@ -235,6 +283,8 @@ def state():
     return jsonify({
         "status": overall_status(), "core": CORE_STATUS,
         "jarvis_online": JARVIS_ONLINE, "coverage_mode": COVERAGE_MODE,
+        "range_level": friday_protocols.range_level.value if PROTOCOLS_OK else "unknown",
+        "training": friday_trainer.status() if TRAINING_OK else {},
         "budget": budget_info, "emotional_trend": emotional_trend,
         "uptime_seconds": int(time.time() - BOOT_TIME),
         "log": list(reversed(EXCHANGE_LOG)),
@@ -259,6 +309,12 @@ def command():
 
         if not prompt:
             return jsonify({"response": "Say something, boss."})
+
+        # Dark mode — zero external connectivity, local-only responses
+        if PROTOCOLS_OK and friday_protocols.range_level == RangeLevel.DARK:
+            response = friday_protocols.emergency_response(prompt)
+            _log(prompt, response, "emergency")
+            return jsonify({"response": response, "mode": "emergency", "range": "dark"})
 
         # Proxy to JARVIS if online and not in coverage mode
         if JARVIS_ONLINE and not COVERAGE_MODE:
@@ -285,6 +341,10 @@ def command():
                         log_emotion(emotion_data["emotion"], emotion_data["intensity"], prompt)
 
                 context = get_context_for(prompt)
+                if TRAINING_OK:
+                    knowledge = friday_trainer.get_context_brief(prompt)
+                    if knowledge:
+                        context = "\n".join(filter(None, [knowledge, context]))
 
                 if COVERAGE_MODE:
                     friday_brain.set_voice_mode("coverage")
@@ -390,6 +450,46 @@ def set_mode():
     if friday_brain:
         friday_brain.set_voice_mode(mode)
     return jsonify({"mode": mode, "status": "set"})
+
+
+# ── Range protocols ────────────────────────────────────────────────────────────
+
+@app.route("/friday/protocols")
+def list_protocols():
+    if not PROTOCOLS_OK:
+        return jsonify({"error": "protocols unavailable"}), 503
+    from core.friday_protocols import FRIDAY_PROTOCOLS
+    return jsonify({"protocols": FRIDAY_PROTOCOLS, "current_range": friday_protocols.range_level.value})
+
+
+@app.route("/friday/protocols/<int:n>", methods=["POST"])
+def run_protocol(n):
+    if not PROTOCOLS_OK:
+        return jsonify({"error": "protocols unavailable"}), 503
+    return jsonify(friday_protocols.run_protocol(n))
+
+
+@app.route("/friday/range")
+def range_status():
+    if not PROTOCOLS_OK:
+        return jsonify({"error": "protocols unavailable"}), 503
+    return jsonify(friday_protocols.get_range_report())
+
+
+# ── JARVIS training ────────────────────────────────────────────────────────────
+
+@app.route("/friday/training/sync", methods=["POST"])
+def training_sync():
+    if not TRAINING_OK:
+        return jsonify({"error": "training unavailable"}), 503
+    return jsonify(friday_trainer.sync_from_jarvis())
+
+
+@app.route("/friday/training/status")
+def training_status():
+    if not TRAINING_OK:
+        return jsonify({"error": "training unavailable"}), 503
+    return jsonify(friday_trainer.status())
 
 
 # ── Budget ─────────────────────────────────────────────────────────────────────

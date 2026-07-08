@@ -17,7 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
 # Sarah — warm, conversational. Distinct from JARVIS's deep/formal voice.
-FRIDAY_VOICE_ID = os.getenv("FRIDAY_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+FRIDAY_VOICE_ID = os.getenv("FRIDAY_VOICE_ID", "eQ3MKh19cr7ApgSW5Ob0")
 ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 
 VOICE_SETTINGS = {
