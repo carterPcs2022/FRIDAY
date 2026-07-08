@@ -15,6 +15,7 @@ duplicate that traffic and risk the two ever disagreeing about whether
 JARVIS is actually reachable. Groq/Anthropic reachability is still
 checked here since nothing else in this codebase already does that.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,18 @@ import httpx
 from core.friday_brain import GROQ_API_KEY, ANTHROPIC_KEY
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Same handful of files JARVIS watches for Protocol 11, scoped to what
+# FRIDAY actually has.
+_WATCHED_FILES = ["server.py", "core/friday_brain.py", "core/emotional_intel.py", "core/friday_memory.py"]
+_BASELINE_FILE = BASE_DIR / "memory" / "friday_baseline.json"
+
+
+def _hash_file(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return None
 
 
 class RangeLevel(Enum):
@@ -80,6 +93,18 @@ FRIDAY_PROTOCOLS = {
         "description": "Summarize what happened while disconnected",
         "trigger": "Manual only — call after a DARK/MINIMAL period ends",
         "actions": ["Summarize recent conversation", "Speak a brief welcome-back"],
+    },
+    8: {
+        "name": "INTEGRITY CHECK",
+        "description": "Verify FRIDAY's own core files haven't changed unexpectedly",
+        "trigger": "Manual, or scheduled alongside the daily JARVIS sync",
+        "actions": ["Hash watched files", "Compare against baseline", "Auto-heal baseline on a multi-file deploy"],
+    },
+    9: {
+        "name": "BUDGET ALERT",
+        "description": "Warn when the daily Anthropic call/token budget is running low",
+        "trigger": "Manual, or checked opportunistically from /command",
+        "actions": ["Check budget_2.status()", "Speak + push a warning past 80% used"],
     },
 }
 
@@ -172,6 +197,10 @@ class FridayProtocols:
             self._protocol_out_of_range()
         elif number == 7:
             self._protocol_emergency_brief()
+        elif number == 8:
+            return {**self._protocol_integrity_check(), "executed": number, "name": protocol["name"]}
+        elif number == 9:
+            return {**self._protocol_budget_alert(), "executed": number, "name": protocol["name"]}
 
         self._log_event({"type": "protocol_run", "protocol": number, "name": protocol["name"]})
         return {"executed": number, "name": protocol["name"]}
@@ -247,6 +276,65 @@ class FridayProtocols:
             speak(brief.get("response", "Welcome back, boss."))
         except Exception:
             pass
+
+    def _protocol_integrity_check(self) -> dict:
+        """Hash FRIDAY's own watched files and compare against a saved
+        baseline. Same auto-heal reasoning as JARVIS's Protocol 11 (which
+        had a real bug: with no auto-heal, every restart after a
+        legitimate deploy re-flagged the same already-shipped changes as
+        tampering forever) — more than half the watched files changing
+        together reads as a deploy, not an attack, so the baseline
+        rebuilds silently instead of alerting on it every time."""
+        current = {f: _hash_file(BASE_DIR / f) for f in _WATCHED_FILES}
+
+        baseline = {}
+        if _BASELINE_FILE.exists():
+            try:
+                baseline = json.loads(_BASELINE_FILE.read_text())
+            except Exception:
+                baseline = {}
+
+        if not baseline:
+            _BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _BASELINE_FILE.write_text(json.dumps({"ts": datetime.now().isoformat(), "hashes": current}))
+            return {"status": "baseline_created", "checked": len(current)}
+
+        stored = baseline.get("hashes", {})
+        changed = [f for f, h in current.items() if stored.get(f) and h and stored[f] != h]
+
+        if len(changed) > len(_WATCHED_FILES) // 2:
+            _BASELINE_FILE.write_text(json.dumps({"ts": datetime.now().isoformat(), "hashes": current}))
+            print(f"[FRIDAY Protocol 8] Deployment detected — {len(changed)} file(s) changed together, baseline rebuilt")
+            return {"status": "baseline_rebuilt", "checked": len(current), "modified": []}
+
+        if changed:
+            print(f"[FRIDAY Protocol 8] ⚠ {len(changed)} file(s) changed offline: {changed}")
+
+        return {"status": "clean" if not changed else "MODIFIED", "checked": len(current), "modified": changed}
+
+    def _protocol_budget_alert(self) -> dict:
+        """Warn once the daily Anthropic budget (budget_2.py) is mostly
+        used — not a hard block, just a heads-up before it runs out."""
+        try:
+            import budget_2 as budget
+            status = budget.status()
+        except Exception as e:
+            return {"error": str(e)}
+
+        calls_pct = status["calls"] / max(status["calls_limit"], 1)
+        tokens_pct = status["output_tokens"] / max(status["output_tokens_limit"], 1)
+        pct = max(calls_pct, tokens_pct)
+
+        if pct >= 0.8:
+            message = f"Boss, running low on API calls today — {pct:.0%} of budget used."
+            try:
+                from services.friday_voice import speak
+                speak(message)
+            except Exception:
+                pass
+            return {"status": "alert", "pct_used": round(pct, 2), **status}
+
+        return {"status": "ok", "pct_used": round(pct, 2), **status}
 
     def emergency_response(self, query: str) -> str:
         """Zero-connectivity response — local lookup only."""

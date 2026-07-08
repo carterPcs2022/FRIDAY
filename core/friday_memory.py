@@ -13,6 +13,10 @@ FACTS_FILE = MEMORY_DIR / "facts.json"
 CONVO_FILE = MEMORY_DIR / "conversations.json"
 EMOTIONAL_FILE = MEMORY_DIR / "emotional_log.json"
 PROFILE_FILE = MEMORY_DIR / "profile.json"
+PERSONAL_FILE = MEMORY_DIR / "friday_personal.json"
+
+
+_DICT_FILES = (PROFILE_FILE, PERSONAL_FILE)
 
 
 def _load(path: Path):
@@ -21,8 +25,8 @@ def _load(path: Path):
             with open(path) as f:
                 return json.load(f)
         except Exception:
-            return [] if path != PROFILE_FILE else {}
-    return [] if path != PROFILE_FILE else {}
+            return {} if path in _DICT_FILES else []
+    return {} if path in _DICT_FILES else []
 
 
 def _save(path: Path, data):
@@ -109,6 +113,29 @@ def get_emotional_trend(days: int = 7) -> dict:
     return dict(Counter(emotions))
 
 
+def get_mood_history(days: int = 7) -> dict:
+    """Real date-windowed version of get_emotional_trend() — every logged
+    entry already has an ISO timestamp (see log_emotion()), so this
+    actually filters by day rather than just taking the most recent 20
+    entries regardless of when they happened."""
+    from datetime import timedelta
+    log = _load(EMOTIONAL_FILE)
+    if not isinstance(log, list) or not log:
+        return {"dominant": "neutral", "avg_intensity": 0, "counts": {}, "entries": 0}
+
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    recent = [e for e in log if e.get("ts", "") >= cutoff]
+    emotions = Counter(e["emotion"] for e in recent)
+    avg_intensity = sum(e.get("intensity", 0) for e in recent) / max(len(recent), 1)
+
+    return {
+        "dominant": emotions.most_common(1)[0][0] if emotions else "neutral",
+        "avg_intensity": round(avg_intensity, 1),
+        "counts": dict(emotions),
+        "entries": len(recent),
+    }
+
+
 # ── Profile ──────────────────────────────────────────────────────────────────
 
 def get_profile() -> dict:
@@ -119,3 +146,24 @@ def update_profile(key: str, value):
     profile = get_profile()
     profile[key] = value
     _save(PROFILE_FILE, profile)
+
+
+# ── Personal memory ──────────────────────────────────────────────────────────
+# Keyed lookup, distinct from get_facts()'s flat list — for the kind of
+# thing you'd want back by name ("what's my usual coffee order") rather
+# than surfaced by keyword-scan relevance.
+
+def friday_remember(key: str, value: str):
+    data = _load(PERSONAL_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    data[key] = {"value": value, "ts": datetime.now().isoformat()}
+    _save(PERSONAL_FILE, data)
+
+
+def friday_recall(key: str) -> str | None:
+    data = _load(PERSONAL_FILE)
+    if not isinstance(data, dict):
+        return None
+    entry = data.get(key)
+    return entry.get("value") if entry else None

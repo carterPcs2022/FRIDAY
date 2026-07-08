@@ -29,6 +29,7 @@ try:
     from core.friday_memory import (
         save_turn, get_recent_turns, get_context_for,
         save_fact, log_emotion, get_emotional_trend, get_profile,
+        get_mood_history, friday_remember, friday_recall,
     )
     CORE_STATUS = "online"
     logging.info("Brain and emotional intelligence online")
@@ -209,6 +210,12 @@ def _training_sync_loop():
                 friday_trainer.sync_from_jarvis()
         except Exception as e:
             logging.warning(f"JARVIS training sync failed: {e}")
+        try:
+            if PROTOCOLS_OK:
+                friday_protocols.run_protocol(8)  # integrity check
+                friday_protocols.run_protocol(9)  # budget alert
+        except Exception as e:
+            logging.warning(f"Daily protocol check failed: {e}")
         time.sleep(_DAILY_SYNC_INTERVAL)
 
 
@@ -490,6 +497,35 @@ def training_status():
     if not TRAINING_OK:
         return jsonify({"error": "training unavailable"}), 503
     return jsonify(friday_trainer.status())
+
+
+# ── Mood history + personal memory ────────────────────────────────────────────
+
+@app.route("/friday/mood")
+def mood_history():
+    if not CORE_STATUS == "online":
+        return jsonify({"error": "memory unavailable"}), 503
+    days = request.args.get("days", 7, type=int)
+    return jsonify(get_mood_history(days))
+
+
+@app.route("/friday/remember", methods=["POST"])
+def remember():
+    data = request.get_json(silent=True) or {}
+    key, value = data.get("key", "").strip(), data.get("value", "").strip()
+    if not key or not value:
+        return jsonify({"error": "key and value required"}), 400
+    friday_remember(key, value)
+    return jsonify({"status": "remembered", "key": key})
+
+
+@app.route("/friday/recall")
+def recall():
+    key = request.args.get("key", "").strip()
+    if not key:
+        return jsonify({"error": "key required"}), 400
+    value = friday_recall(key)
+    return jsonify({"key": key, "value": value})
 
 
 # ── Budget ─────────────────────────────────────────────────────────────────────
