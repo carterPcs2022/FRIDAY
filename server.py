@@ -1616,7 +1616,7 @@ body {
 
   <div class="top-bar">
     <div class="friday-logo">
-      <div class="logo-orb"></div>
+      <canvas id="friday-arc" width="32" height="32" style="border-radius:50%;display:block"></canvas>
       <div class="logo-text-wrap">
         <div class="logo-name">F.R.I.D.A.Y</div>
         <div class="logo-version">HOLOGRAPHIC INTERFACE</div>
@@ -1889,6 +1889,86 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closeAll();
   if (e.ctrlKey && e.key === '/') { document.getElementById('chat-inp').focus(); e.preventDefault(); }
 });
+
+// FRIDAY arc reactor (blue tinted)
+(function() {
+  const c   = document.getElementById('friday-arc');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  const W = 32, H = 32, CX = 16, CY = 16;
+  let t = 0;
+
+  function drawFriday() {
+    ctx.clearRect(0, 0, W, H);
+    const glow = 0.5 + Math.sin(t * 2) * 0.3;
+
+    // Blue tinted for FRIDAY
+    ctx.beginPath();
+    ctx.arc(CX, CY, 14, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(72,202,228,${glow * 0.8})`;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.rotate(t * 0.5);
+    for (let i = 0; i < 6; i++) {
+      const a1 = (i/6)*Math.PI*2;
+      const a2 = a1 + Math.PI/6*0.7;
+      ctx.beginPath();
+      ctx.arc(0, 0, 10, a1, a2);
+      ctx.strokeStyle = `rgba(0,180,216,${glow*0.7})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.rotate(-t * 0.8);
+    for (let i = 0; i < 4; i++) {
+      const a1 = (i/4)*Math.PI*2;
+      const a2 = a1 + Math.PI/4*0.6;
+      ctx.beginPath();
+      ctx.arc(0, 0, 7, a1, a2);
+      ctx.strokeStyle = `rgba(0,150,199,${glow*0.6})`;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // Blue triangle core
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.rotate(t * 0.1);
+    ctx.beginPath();
+    for (let i = 0; i < 3; i++) {
+      const angle = (i/3)*Math.PI*2 - Math.PI/6;
+      const x = Math.cos(angle)*5;
+      const y = Math.sin(angle)*5;
+      if (i===0) ctx.moveTo(x,y);
+      else ctx.lineTo(x,y);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = `rgba(144,224,239,${glow*0.9})`;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+
+    // Blue center glow
+    const cg = ctx.createRadialGradient(CX,CY,0,CX,CY,4);
+    cg.addColorStop(0, `rgba(200,240,255,${glow})`);
+    cg.addColorStop(1, 'rgba(0,168,255,0)');
+    ctx.beginPath();
+    ctx.arc(CX, CY, 4, 0, Math.PI*2);
+    ctx.fillStyle = cg;
+    ctx.fill();
+
+    t += 0.015;
+    requestAnimationFrame(drawFriday);
+  }
+  drawFriday();
+})();
 </script>
 </body>
 </html>
