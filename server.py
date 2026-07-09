@@ -37,6 +37,22 @@ BASE_DIR = Path(__file__).resolve().parent
 
 logging.basicConfig(level=logging.INFO, format='[FRIDAY] %(message)s')
 
+
+def _ensure_memory():
+    """Render's filesystem is ephemeral — a fresh deploy or cold start can
+    land on a box with none of these directories. Most modules already
+    mkdir(parents=True, exist_ok=True) their own path on first write, so
+    this is mostly belt-and-suspenders for anything that assumes the
+    directory is already there before its first write."""
+    for name in ("memory", "logs", "static", "veronica_backups", "logs/backups"):
+        try:
+            (BASE_DIR / name).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logging.warning(f"Failed to ensure directory '{name}': {e}")
+
+
+_ensure_memory()
+
 # ── Core loading — each guarded individually so one failing module can't
 # take the others (or the app) down with it ──────────────────────────────────
 try:
@@ -182,6 +198,10 @@ def _monitor_jarvis():
         elif not was_online and JARVIS_ONLINE:
             logging.info("JARVIS back online — standing down")
             _log("SYSTEM", "JARVIS back online.", "handoff")
+            if friday_brain:
+                friday_brain.set_voice_mode("normal")
+            if VOICE_OK:
+                friday_speak("JARVIS is back online. Handing over, boss.", mode="normal")
 
         time.sleep(30)
 
@@ -213,6 +233,41 @@ def _start_thread(target, name: str):
 
 
 _start_thread(_monitor_jarvis, "JARVIS monitor")
+
+# ── Morning brief auto-trigger ───────────────────────────────────────────────
+# Fires the same request the HUD's MORNING BRIEF button sends ("FRIDAY run a
+# morning brief") once a day at 8am local server time, so it happens even if
+# nobody opens the HUD. A sleep-loop rather than the `schedule` package —
+# one less dependency for something this simple.
+
+_MORNING_BRIEF_HOUR = 8
+_last_morning_brief_date = None
+
+
+def _morning_brief_loop():
+    global _last_morning_brief_date
+    time.sleep(30)  # let the rest of the module finish defining (_push, _log, etc.)
+    while True:
+        try:
+            now = datetime.datetime.now()
+            today = now.date().isoformat()
+            if now.hour == _MORNING_BRIEF_HOUR and _last_morning_brief_date != today:
+                _last_morning_brief_date = today
+                if friday_brain:
+                    result = friday_brain.think("FRIDAY run a morning brief")
+                    response = safe(result.get("response", ""))
+                    if response:
+                        save_turn("FRIDAY run a morning brief", response)
+                        _log("FRIDAY run a morning brief", response, "morning-brief")
+                        _push("Morning Brief", response)
+                        if VOICE_OK:
+                            friday_speak(response, mode=friday_brain.voice_mode)
+        except Exception as e:
+            logging.warning(f"Morning brief failed: {e}")
+        time.sleep(1800)  # check twice an hour — plenty for an hour-granularity trigger
+
+
+_start_thread(_morning_brief_loop, "morning brief")
 
 # ── Proactive emotional check-ins ────────────────────────────────────────────
 # core/emotional_intel.py's should_check_in() was defined but explicitly
@@ -881,16 +936,16 @@ FRIDAY_HUD_HTML = """<!DOCTYPE html>
 <title>F.R.I.D.A.Y V2</title>
 <style>
 :root {
-  --bg:     #010d06;
-  --panel:  rgba(0,255,128,0.03);
-  --border: rgba(0,255,128,0.15);
-  --accent: #00ff80;
-  --a2:     #00ffcc;
+  --bg:     #000d1a;
+  --panel:  rgba(0,168,255,0.03);
+  --border: rgba(0,168,255,0.15);
+  --accent: #00a8ff;
+  --a2:     #33ccff;
   --warn:   #ffaa00;
   --danger: #ff4444;
-  --text:   #ccffe0;
-  --muted:  #2a5a40;
-  --grid:   rgba(0,255,128,0.025);
+  --text:   #cce8ff;
+  --muted:  #1a4a6a;
+  --grid:   rgba(0,168,255,0.025);
 }
 * { box-sizing:border-box; margin:0; padding:0; }
 body {
@@ -918,17 +973,17 @@ body::after {
   z-index:9998; pointer-events:none;
 }
 .c-tl { top:8px; left:8px;
-  border-top:2px solid rgba(0,255,128,0.3);
-  border-left:2px solid rgba(0,255,128,0.3); }
+  border-top:2px solid rgba(0,168,255,0.3);
+  border-left:2px solid rgba(0,168,255,0.3); }
 .c-tr { top:8px; right:8px;
-  border-top:2px solid rgba(0,255,128,0.3);
-  border-right:2px solid rgba(0,255,128,0.3); }
+  border-top:2px solid rgba(0,168,255,0.3);
+  border-right:2px solid rgba(0,168,255,0.3); }
 .c-bl { bottom:8px; left:8px;
-  border-bottom:2px solid rgba(0,255,128,0.3);
-  border-left:2px solid rgba(0,255,128,0.3); }
+  border-bottom:2px solid rgba(0,168,255,0.3);
+  border-left:2px solid rgba(0,168,255,0.3); }
 .c-br { bottom:8px; right:8px;
-  border-bottom:2px solid rgba(0,255,128,0.3);
-  border-right:2px solid rgba(0,255,128,0.3); }
+  border-bottom:2px solid rgba(0,168,255,0.3);
+  border-right:2px solid rgba(0,168,255,0.3); }
 
 .layout {
   display: grid;
@@ -958,13 +1013,13 @@ header::after {
   width:36px; height:36px; border-radius:50%;
   border:2px solid var(--accent);
   display:flex; align-items:center; justify-content:center;
-  box-shadow: 0 0 14px rgba(0,255,128,0.3),
-              inset 0 0 14px rgba(0,255,128,0.08);
+  box-shadow: 0 0 14px rgba(0,168,255,0.3),
+              inset 0 0 14px rgba(0,168,255,0.08);
 }
 .logo-ring-inner {
   width:20px; height:20px; border-radius:50%;
   background: radial-gradient(circle,
-    rgba(0,255,128,0.5) 0%, transparent 70%);
+    rgba(0,168,255,0.5) 0%, transparent 70%);
   animation: ring-pulse 3s ease-in-out infinite;
 }
 @keyframes ring-pulse {
@@ -973,7 +1028,7 @@ header::after {
 }
 .logo { font-size:20px; font-weight:900; letter-spacing:8px;
   color:var(--accent);
-  text-shadow:0 0 16px rgba(0,255,128,0.4); }
+  text-shadow:0 0 16px rgba(0,168,255,0.4); }
 .logo-sub { font-size:8px; letter-spacing:3px;
   color:var(--muted); margin-top:2px; }
 .header-stats {
@@ -1001,7 +1056,7 @@ header::after {
 .s-dot.w { background:var(--warn); box-shadow:0 0 6px var(--warn); }
 .mode-badge {
   font-size:9px; letter-spacing:2px; color:var(--a2);
-  padding:3px 8px; border:1px solid rgba(0,255,204,0.2);
+  padding:3px 8px; border:1px solid rgba(51,204,255,0.2);
   border-radius:2px; }
 .time-disp { font-size:13px; letter-spacing:2px;
   color:var(--muted); }
@@ -1012,7 +1067,7 @@ header::after {
   font-size:9px; letter-spacing:2px; cursor:pointer; }
 .ambient-btn.on {
   border-color:var(--accent); color:var(--accent);
-  background:rgba(0,255,128,0.06); }
+  background:rgba(0,168,255,0.06); }
 
 .panel {
   background:var(--panel); border:1px solid var(--border);
@@ -1043,7 +1098,7 @@ header::after {
 .panel-title {
   font-size:8px; letter-spacing:4px; color:var(--muted);
   padding:8px 12px 5px;
-  border-bottom:1px solid rgba(0,255,128,0.06);
+  border-bottom:1px solid rgba(0,168,255,0.06);
   display:flex; justify-content:space-between;
 }
 
@@ -1051,13 +1106,13 @@ header::after {
   display:flex; flex-direction:column; gap:7px;
   padding:8px 8px 8px 10px; overflow-y:auto;
   scrollbar-width:none;
-  border-right:1px solid rgba(0,255,128,0.06);
+  border-right:1px solid rgba(0,168,255,0.06);
 }
 .left-col::-webkit-scrollbar { display:none; }
 
 .diag-item {
   padding:5px 12px;
-  border-bottom:1px solid rgba(0,255,128,0.04);
+  border-bottom:1px solid rgba(0,168,255,0.04);
 }
 .diag-item:last-child { border-bottom:none; }
 .diag-hdr { display:flex; justify-content:space-between;
@@ -1066,13 +1121,13 @@ header::after {
 .diag-val { color:var(--text); font-weight:700; }
 .diag-val.w { color:var(--warn); }
 .diag-val.d { color:var(--danger); }
-.bar { height:2px; background:rgba(0,255,128,0.08);
+.bar { height:2px; background:rgba(0,168,255,0.08);
   border-radius:1px; overflow:hidden; }
 .bar-fill {
   height:100%; border-radius:1px;
   background:linear-gradient(90deg,
-    rgba(0,200,80,0.8), var(--accent));
-  box-shadow:0 0 5px rgba(0,255,128,0.4);
+    rgba(0,100,200,0.8), var(--accent));
+  box-shadow:0 0 5px rgba(0,168,255,0.4);
   transition:width 1s ease;
 }
 .bar-fill.w {
@@ -1083,7 +1138,7 @@ header::after {
 .stat-row {
   display:flex; justify-content:space-between;
   padding:4px 12px; font-size:10px;
-  border-bottom:1px solid rgba(0,255,128,0.04);
+  border-bottom:1px solid rgba(0,168,255,0.04);
 }
 .stat-row:last-child { border-bottom:none; }
 .stat-lbl { color:var(--muted); }
@@ -1095,7 +1150,7 @@ header::after {
 .sentinel-num {
   font-size:34px; font-weight:900; line-height:1;
   color:var(--accent);
-  text-shadow:0 0 16px rgba(0,255,128,0.4);
+  text-shadow:0 0 16px rgba(0,168,255,0.4);
   padding:6px 12px 2px;
 }
 .sentinel-num.w { color:var(--warn);
@@ -1131,9 +1186,9 @@ header::after {
   from{opacity:0;transform:translateY(3px)}
   to{opacity:1;transform:translateY(0)} }
 .msg-you { border-left-color:var(--a2);
-  background:rgba(0,255,204,0.02); }
+  background:rgba(51,204,255,0.02); }
 .msg-fri { border-left-color:var(--accent);
-  background:rgba(0,255,128,0.02); }
+  background:rgba(0,168,255,0.02); }
 .msg-sys { border-left-color:var(--muted);
   background:transparent; }
 .msg-who { font-size:8px; letter-spacing:3px;
@@ -1161,7 +1216,7 @@ header::after {
 
 .input-row { display:flex; gap:7px; flex-shrink:0; }
 .inp {
-  flex:1; background:rgba(0,255,128,0.02);
+  flex:1; background:rgba(0,168,255,0.02);
   border:1px solid var(--border); border-radius:2px;
   color:var(--text); padding:9px 14px;
   font-family:inherit; font-size:12px; outline:none;
@@ -1169,17 +1224,17 @@ header::after {
 }
 .inp:focus {
   border-color:var(--accent);
-  box-shadow:0 0 0 1px rgba(0,255,128,0.12),
-             inset 0 0 16px rgba(0,255,128,0.03);
+  box-shadow:0 0 0 1px rgba(0,168,255,0.12),
+             inset 0 0 16px rgba(0,168,255,0.03);
 }
 .inp::placeholder { color:var(--muted); }
 .send-btn {
-  padding:0 16px; background:rgba(0,255,128,0.06);
+  padding:0 16px; background:rgba(0,168,255,0.06);
   border:1px solid var(--accent); border-radius:2px;
   color:var(--accent); font-family:inherit;
   font-size:9px; letter-spacing:3px; cursor:pointer;
 }
-.send-btn:hover { background:rgba(0,255,128,0.12); }
+.send-btn:hover { background:rgba(0,168,255,0.12); }
 .mic-btn {
   width:40px; background:transparent;
   border:1px solid var(--border); border-radius:2px;
@@ -1191,18 +1246,18 @@ header::after {
   display:flex; flex-direction:column; gap:7px;
   padding:8px 10px 8px 8px; overflow-y:auto;
   scrollbar-width:none;
-  border-left:1px solid rgba(0,255,128,0.06);
+  border-left:1px solid rgba(0,168,255,0.06);
 }
 .right-col::-webkit-scrollbar { display:none; }
 
 .voice-name { font-size:13px; font-weight:700;
   letter-spacing:2px; color:var(--accent); margin-bottom:5px; }
 .voice-track { height:2px;
-  background:rgba(0,255,128,0.08); border-radius:1px;
+  background:rgba(0,168,255,0.08); border-radius:1px;
   overflow:hidden; margin-bottom:4px; }
 .voice-fill {
   height:100%;
-  background:linear-gradient(90deg, rgba(0,200,80,0.8), var(--a2));
+  background:linear-gradient(90deg, rgba(0,100,200,0.8), var(--a2));
   transition:width 1s ease; }
 .voice-chars { display:flex; justify-content:space-between;
   font-size:8px; color:var(--muted); margin-bottom:8px; }
@@ -1222,7 +1277,7 @@ header::after {
 
 .alert-item {
   display:flex; gap:7px; align-items:flex-start;
-  padding:5px 0; border-bottom:1px solid rgba(0,255,128,0.04);
+  padding:5px 0; border-bottom:1px solid rgba(0,168,255,0.04);
   font-size:10px;
 }
 .alert-item:last-child { border-bottom:none; }
@@ -1236,8 +1291,8 @@ header::after {
 .con-text {
   padding:8px 12px 10px; font-size:10px;
   line-height:1.8; color:var(--muted); font-style:italic;
-  border-left:2px solid rgba(0,255,128,0.15);
-  margin:0 12px 8px; background:rgba(0,255,128,0.015);
+  border-left:2px solid rgba(0,168,255,0.15);
+  margin:0 12px 8px; background:rgba(0,168,255,0.015);
 }
 
 .ver-status {
@@ -1246,7 +1301,7 @@ header::after {
 .ver-item {
   display:flex; justify-content:space-between;
   padding:3px 0; font-size:10px;
-  border-bottom:1px solid rgba(0,255,128,0.04);
+  border-bottom:1px solid rgba(0,168,255,0.04);
 }
 .ver-item:last-child { border-bottom:none; }
 .ver-nominal { color:var(--accent); }
@@ -1260,7 +1315,7 @@ footer {
   border-top:1px solid var(--border);
 }
 .scene-btn {
-  padding:3px 10px; border:1px solid rgba(0,255,128,0.1);
+  padding:3px 10px; border:1px solid rgba(0,168,255,0.1);
   border-radius:1px; background:transparent;
   color:var(--muted); font-family:inherit;
   font-size:8px; letter-spacing:2px; cursor:pointer;
@@ -1762,7 +1817,7 @@ async function pollState() {
           .map(([e,c])=>`
             <div style="display:flex;justify-content:space-between;
               padding:3px 0;font-size:10px;
-              border-top:1px solid rgba(0,255,128,0.04)">
+              border-top:1px solid rgba(0,168,255,0.04)">
               <span style="color:var(--muted)">${e}</span>
               <span style="color:var(--accent)">${c}</span>
             </div>`

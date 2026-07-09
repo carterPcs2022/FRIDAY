@@ -162,6 +162,12 @@ class FridayBrain:
             return "Morning, boss. Ready when you are."
         if "good night" in q:
             return "Night, boss. I'll keep watch."
+        # FRIDAY has no calendar integration of her own — without this
+        # guard a calendar question just goes to the LLM, which has no
+        # way to know that and may invent plausible-sounding events.
+        if any(t in q for t in ["my calendar", "on my schedule", "any meetings",
+                                "any events", "what's on my agenda"]):
+            return "Your calendar isn't connected yet, boss."
 
         return None
 
@@ -216,7 +222,7 @@ class FridayBrain:
             from anthropic import Anthropic
             client = Anthropic(api_key=ANTHROPIC_KEY)
             r = client.messages.create(model=model, max_tokens=256, system=system, messages=messages)
-            budget.record_call(r.usage.output_tokens)
+            budget.record_call(r.usage.output_tokens, model)
             return {"content": r.content[0].text, "model": model, "provider": "anthropic"}
         except Exception as e:
             print(f"[FRIDAY] Anthropic error: {e}")

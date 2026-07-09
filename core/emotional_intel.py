@@ -67,13 +67,13 @@ class EmotionalIntelligence:
         return {
             "emotion": primary, "intensity": intensity,
             "response_guidance": guidance.get("prefix", ""),
-            "system_note": system_note, "should_acknowledge": intensity >= 4,
+            "system_note": system_note, "should_acknowledge": intensity >= 5,
         }
 
     def generate_emotional_response_prefix(self, emotion: str, intensity: int) -> str:
         """Optional prefix FRIDAY adds when acknowledging emotion. Brief.
         Human. Not therapy."""
-        if intensity < 4:
+        if intensity < 5:
             return ""
 
         prefixes = {
