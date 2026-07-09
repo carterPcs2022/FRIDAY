@@ -154,6 +154,42 @@ except Exception as e:
     logging.warning(f"Team coordinator failed: {e}")
 
 try:
+    from services.second_brain import second_brain
+except Exception as e:
+    second_brain = None
+    logging.warning(f"Second brain failed: {e}")
+
+try:
+    from services.friday_news import news_anchor
+except Exception as e:
+    news_anchor = None
+    logging.warning(f"News anchor failed: {e}")
+
+try:
+    from services.friday_relationships import relationships
+except Exception as e:
+    relationships = None
+    logging.warning(f"Relationships failed: {e}")
+
+try:
+    from services.friday_code import friday_code
+except Exception as e:
+    friday_code = None
+    logging.warning(f"Code intel failed: {e}")
+
+try:
+    from services.friday_translate import translator
+except Exception as e:
+    translator = None
+    logging.warning(f"Translator failed: {e}")
+
+try:
+    from services.voice_memory import voice_memory
+except Exception as e:
+    voice_memory = None
+    logging.warning(f"Voice memory failed: {e}")
+
+try:
     from services.friday_security import friday_security
     SECURITY_OK = True
 except Exception as e:
@@ -235,13 +271,54 @@ def _start_thread(target, name: str):
 _start_thread(_monitor_jarvis, "JARVIS monitor")
 
 # ── Morning brief auto-trigger ───────────────────────────────────────────────
-# Fires the same request the HUD's MORNING BRIEF button sends ("FRIDAY run a
-# morning brief") once a day at 8am local server time, so it happens even if
-# nobody opens the HUD. A sleep-loop rather than the `schedule` package —
-# one less dependency for something this simple.
+# Fires once a day at 8am local server time, so it happens even if nobody
+# opens the HUD. A sleep-loop rather than the `schedule` package — one
+# less dependency for something this simple.
+#
+# Combines news_anchor / relationships / second_brain in parallel — this
+# is the "Protocol 20 MORNING" behavior from the spec, but there is no
+# Protocol 20 (or 35 protocols at all) in core/friday_protocols.py; only
+# 1-9 exist. Rather than fabricate a protocol number that isn't real, the
+# combined-brief behavior is wired into this existing daily trigger.
 
 _MORNING_BRIEF_HOUR = 8
 _last_morning_brief_date = None
+
+
+def _combined_morning_brief() -> str:
+    import concurrent.futures
+
+    parts = {}
+
+    def _news():
+        if news_anchor:
+            parts["news"] = news_anchor.morning_brief()
+
+    def _people():
+        if relationships:
+            parts["relationships"] = relationships.relationship_brief()
+
+    def _brain():
+        if second_brain:
+            parts["brain"] = second_brain.daily_digest()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(f) for f in (_news, _people, _brain)]
+        concurrent.futures.wait(futures, timeout=25)
+
+    combined = "\n".join(f"- {v}" for v in parts.values() if v)
+    if not combined:
+        return ""
+    if not friday_brain:
+        return combined
+
+    result = friday_brain.think(
+        f"Combine these into one morning brief for the boss:\n{combined}\n\n"
+        f"News, relationships needing attention, and anything relevant from "
+        f"stored knowledge. One flowing brief, not separate sections. "
+        f"Under 80 words. FRIDAY style."
+    )
+    return result["response"]
 
 
 def _morning_brief_loop():
@@ -253,15 +330,16 @@ def _morning_brief_loop():
             today = now.date().isoformat()
             if now.hour == _MORNING_BRIEF_HOUR and _last_morning_brief_date != today:
                 _last_morning_brief_date = today
-                if friday_brain:
+                response = safe(_combined_morning_brief())
+                if not response and friday_brain:
                     result = friday_brain.think("FRIDAY run a morning brief")
                     response = safe(result.get("response", ""))
-                    if response:
-                        save_turn("FRIDAY run a morning brief", response)
-                        _log("FRIDAY run a morning brief", response, "morning-brief")
-                        _push("Morning Brief", response)
-                        if VOICE_OK:
-                            friday_speak(response, mode=friday_brain.voice_mode)
+                if response:
+                    save_turn("FRIDAY run a morning brief", response)
+                    _log("FRIDAY run a morning brief", response, "morning-brief")
+                    _push("Morning Brief", response)
+                    if VOICE_OK and friday_brain:
+                        friday_speak(response, mode=friday_brain.voice_mode)
         except Exception as e:
             logging.warning(f"Morning brief failed: {e}")
         time.sleep(1800)  # check twice an hour — plenty for an hour-granularity trigger
@@ -536,6 +614,18 @@ def command():
             if screen.get("blocked"):
                 return jsonify({"response": "Request blocked.", "blocked": True}), 403
 
+        # Learn from every request up front (not gated behind any one
+        # response branch) so it applies regardless of which handler below
+        # ends up serving it.
+        try:
+            if voice_memory:
+                voice_memory.analyze_and_learn(prompt)
+                best_mode = voice_memory.get_current_best_mode()
+                if friday_brain and not COVERAGE_MODE:
+                    friday_brain.set_voice_mode(best_mode)
+        except Exception:
+            pass
+
         # Dark mode — zero external connectivity, local-only responses
         if PROTOCOLS_OK and friday_protocols.range_level == RangeLevel.DARK:
             response = friday_protocols.emergency_response(prompt)
@@ -561,6 +651,45 @@ def command():
                     except Exception as e:
                         logging.warning(f"Capability '{trigger}' failed: {e}")
                     break
+
+        # Second-brain / news / relationships / code intents — same tier as
+        # CAPABILITY_MAP above: FRIDAY's own named abilities, checked before
+        # the JARVIS proxy for the same reason.
+        p_lower = prompt.lower()
+
+        if ("news" in p_lower or "what's happening" in p_lower) and news_anchor:
+            response = news_anchor.morning_brief()
+            _log(prompt, response, "news")
+            return jsonify({"response": response, "mode": "news"})
+
+        if "translate" in p_lower and translator:
+            text = p_lower.replace("translate", "").replace("friday", "").strip()
+            result = translator.translate(text)
+            _log(prompt, result["translation"], "translate")
+            return jsonify({"response": result["translation"], "mode": "translate"})
+
+        if ("review this code" in p_lower or "fix this code" in p_lower) and friday_code:
+            result = friday_code.quick_review(prompt)
+            _log(prompt, result["review"], "code")
+            return jsonify({"response": result["review"], "mode": "code"})
+
+        if ("remember this" in p_lower or "store this" in p_lower) and second_brain:
+            result = second_brain.ingest(prompt)
+            response = f"Stored: {result['summary']}" if result["summary"] else "Stored, boss."
+            _log(prompt, response, "brain")
+            return jsonify({"response": response, "mode": "brain"})
+
+        # "people brief on " — deliberately avoids the substring "intel on":
+        # CAPABILITY_MAP already has an "intel on" trigger (government_intel(),
+        # checked above this block) that matches as a substring anywhere in
+        # the prompt, so any phrase containing "intel on" — even prefixed —
+        # would still be unreachable.
+        if "people brief on " in p_lower and relationships:
+            name = p_lower.split("people brief on ")[-1].strip()
+            result = relationships.get_intel(name)
+            response = result.get("brief") or f"No intel on {name} yet, boss."
+            _log(prompt, response, "intel")
+            return jsonify({"response": response, "mode": "intel"})
 
         # Proxy to JARVIS if online and not in coverage mode
         if JARVIS_ONLINE and not COVERAGE_MODE:
@@ -908,6 +1037,93 @@ def security_status():
 @app.route("/friday/weather")
 def weather_route():
     return jsonify({"weather": get_weather_brief()})
+
+
+# ── Second Brain / News / Relationships / Code / Translate / Voice Memory ───────
+
+@app.route("/friday/brain/ingest", methods=["POST"])
+def brain_ingest():
+    data = request.get_json(silent=True) or {}
+    if not second_brain:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(second_brain.ingest(data.get("content", ""), data.get("source", "")))
+
+
+@app.route("/friday/brain/recall")
+def brain_recall():
+    if not second_brain:
+        return jsonify({"results": []})
+    return jsonify({"results": second_brain.recall(request.args.get("q", ""))})
+
+
+@app.route("/friday/brain/digest")
+def brain_digest():
+    if not second_brain:
+        return jsonify({"digest": ""})
+    return jsonify({"digest": second_brain.daily_digest()})
+
+
+@app.route("/friday/news/morning")
+def news_morning():
+    if not news_anchor:
+        return jsonify({"brief": ""})
+    return jsonify({"brief": news_anchor.morning_brief()})
+
+
+@app.route("/friday/news/breaking")
+def news_breaking():
+    if not news_anchor:
+        return jsonify({"news": ""})
+    return jsonify({"news": news_anchor.breaking_news(request.args.get("topic", "AI"))})
+
+
+@app.route("/friday/people/log", methods=["POST"])
+def people_log():
+    data = request.get_json(silent=True) or {}
+    if not relationships:
+        return jsonify({"error": "unavailable"}), 503
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    return jsonify(relationships.log_contact(name, data.get("notes", "")))
+
+
+@app.route("/friday/people/attention")
+def people_attention():
+    if not relationships:
+        return jsonify({"people": []})
+    return jsonify({"people": relationships.who_needs_attention()})
+
+
+@app.route("/friday/translate", methods=["POST"])
+def translate_endpoint():
+    data = request.get_json(silent=True) or {}
+    if not translator:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(translator.translate(data.get("text", ""), data.get("target", "English")))
+
+
+@app.route("/friday/code/review", methods=["POST"])
+def code_review():
+    data = request.get_json(silent=True) or {}
+    if not friday_code:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(friday_code.quick_review(data.get("code", ""), data.get("language", "")))
+
+
+@app.route("/friday/code/fix", methods=["POST"])
+def code_fix():
+    data = request.get_json(silent=True) or {}
+    if not friday_code:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(friday_code.fix(data.get("code", ""), data.get("error", "")))
+
+
+@app.route("/friday/voice/weekly")
+def voice_weekly():
+    if not voice_memory:
+        return jsonify({"report": ""})
+    return jsonify({"report": voice_memory.weekly_report()})
 
 
 # ── Military-grade systems (OODA, EMCON, scenario/Sokovia) ──────────────────────

@@ -1,0 +1,91 @@
+"""services/second_brain.py — stores ingested content with an
+LLM-extracted summary/insights, recallable by keyword later."""
+import json
+import re
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+BRAIN_FILE = Path("memory/second_brain.json")
+
+
+class SecondBrain:
+
+    def __init__(self):
+        self._entries = self._load()
+
+    def ingest(self, content: str, source: str = "", tags: list | None = None) -> dict:
+        from core.friday_brain import friday_brain
+
+        tags = tags or []
+        extraction = friday_brain.think(
+            f"Extract from this content:\n{content[:3000]}\n\n"
+            f"1. Key insights (3-5 points)\n"
+            f"2. Action items\n"
+            f"3. Key concepts\n"
+            f"4. One sentence summary\n\n"
+            f"Reply as JSON: {{insights, actions, concepts, summary}}",
+        )["response"]
+
+        try:
+            clean = re.sub(r"```json|```", "", extraction).strip()
+            data = json.loads(clean)
+        except Exception:
+            data = {"summary": extraction[:200], "insights": []}
+
+        entry_id = hashlib.md5(content[:100].encode()).hexdigest()[:12]
+        entry = {
+            "id": entry_id, "content": content[:500], "source": source, "tags": tags,
+            "summary": data.get("summary", ""), "insights": data.get("insights", []),
+            "actions": data.get("actions", []), "concepts": data.get("concepts", []),
+            "ts": datetime.now().isoformat(),
+        }
+
+        self._entries[entry_id] = entry
+        self._save()
+        return {"id": entry_id, "summary": entry["summary"], "stored": True}
+
+    def recall(self, query: str, limit: int = 5) -> list:
+        q_words = set(query.lower().split())
+        scored = []
+        for entry in self._entries.values():
+            score = 0
+            text = (entry.get("summary", "") + " " + " ".join(entry.get("concepts", []))).lower()
+            for word in q_words:
+                if len(word) > 3 and word in text:
+                    score += 1
+            if score > 0:
+                scored.append((score, entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [e for _, e in scored[:limit]]
+
+    def daily_digest(self) -> str:
+        from core.friday_brain import friday_brain
+
+        recent = list(self._entries.values())[-10:]
+        if not recent:
+            return ""
+        result = friday_brain.think(
+            f"Daily digest from stored knowledge:\n"
+            + "\n".join(f"- {e.get('summary', '')}" for e in recent)
+            + "\n\nMost relevant today? Under 60 words. FRIDAY style."
+        )
+        return result["response"]
+
+    def stats(self) -> dict:
+        return {"entries": len(self._entries)}
+
+    def _load(self) -> dict:
+        if BRAIN_FILE.exists():
+            try:
+                return json.loads(BRAIN_FILE.read_text())
+            except Exception:
+                return {}
+        return {}
+
+    def _save(self):
+        BRAIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        BRAIN_FILE.write_text(json.dumps(self._entries, indent=2))
+
+
+second_brain = SecondBrain()
