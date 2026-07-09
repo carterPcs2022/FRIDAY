@@ -12,11 +12,21 @@ Model cascade:
 import os
 import time
 import re
+import httpx
 from datetime import datetime
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GROQ_BASE = "https://api.groq.com/openai/v1"
+
+# Module-level pooled client, reused across every _call_groq() instead of
+# a fresh httpx.post() (and its own TCP+TLS handshake) per call — saves
+# 200-500ms per request via keep-alive connection reuse.
+_GROQ_CLIENT = httpx.Client(
+    base_url=GROQ_BASE,
+    timeout=httpx.Timeout(connect=1.0, read=8.0, write=5.0, pool=5.0),
+    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5, keepalive_expiry=30),
+)
 
 # Real, currently-available model IDs — verified against provider docs, not
 # guessed. claude-sonnet-4-6 doesn't exist; claude-sonnet-5 is current.
@@ -183,16 +193,14 @@ class FridayBrain:
             time.sleep(5)
 
         try:
-            import httpx
             msgs = [{"role": "system", "content": system}] + messages
-            r = httpx.post(
-                f"{GROQ_BASE}/chat/completions",
+            r = _GROQ_CLIENT.post(
+                "/chat/completions",
                 json={
                     "model": model, "messages": msgs, "max_tokens": 512,
                     "temperature": FRIDAY_VOICE_MODES.get(self.voice_mode, {}).get("temperature", 0.8),
                 },
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                timeout=15,
             )
             if r.status_code == 429:
                 # Fail fast and let think() fall through to Anthropic
