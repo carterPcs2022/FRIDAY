@@ -910,6 +910,65 @@ def weather_route():
     return jsonify({"weather": get_weather_brief()})
 
 
+# ── Military-grade systems (OODA, EMCON, scenario/Sokovia) ──────────────────────
+# On-demand/opt-in only, same as JARVIS's /stark equivalents — none of
+# these are auto-triggered by regular chat.
+
+@app.route("/friday/ooda", methods=["POST"])
+def friday_ooda():
+    data = request.get_json(silent=True) or {}
+    from core.ooda import ooda
+    return jsonify(ooda.run(data.get("situation", ""), data.get("context", "")))
+
+
+@app.route("/friday/ooda/rapid", methods=["POST"])
+def friday_ooda_rapid():
+    data = request.get_json(silent=True) or {}
+    from core.ooda import ooda
+    return jsonify({"result": ooda.rapid_ooda(data.get("situation", ""))})
+
+
+@app.route("/friday/emcon")
+def friday_emcon_status():
+    from services.emcon import emcon
+    return jsonify(emcon.status())
+
+
+@app.route("/friday/emcon/activate", methods=["POST"])
+def friday_emcon_activate():
+    data = request.get_json(silent=True) or {}
+    from services.emcon import emcon
+    return jsonify(emcon.activate(data.get("level", 2), data.get("reason", "")))
+
+
+@app.route("/friday/emcon/deactivate", methods=["POST"])
+def friday_emcon_deactivate():
+    from services.emcon import emcon
+    return jsonify(emcon.deactivate())
+
+
+@app.route("/friday/scenarios/futures", methods=["POST"])
+def friday_scenarios_futures():
+    data = request.get_json(silent=True) or {}
+    from core.scenario_engine import scenario_engine
+    return jsonify(scenario_engine.analyze_futures(data.get("situation", ""), data.get("n_scenarios", 6)))
+
+
+@app.route("/friday/sokovia/evacuation", methods=["POST"])
+def friday_sokovia_evacuation():
+    data = request.get_json(silent=True) or {}
+    from core.sokovia import sokovia
+    return jsonify(sokovia.evacuation_analysis(data.get("situation", ""), data.get("location", ""),
+                                               data.get("population", 0)))
+
+
+@app.route("/friday/sokovia/safe-action", methods=["POST"])
+def friday_sokovia_safe_action():
+    data = request.get_json(silent=True) or {}
+    from core.sokovia import sokovia
+    return jsonify(sokovia.calculate_safe_action(data.get("action", ""), data.get("constraints", [])))
+
+
 # ── Budget ─────────────────────────────────────────────────────────────────────
 
 @app.route("/budget")
