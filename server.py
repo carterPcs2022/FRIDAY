@@ -191,6 +191,12 @@ except Exception as e:
     logging.warning(f"Voice memory failed: {e}")
 
 try:
+    from services.friday_gmail import friday_gmail
+except Exception as e:
+    friday_gmail = None
+    logging.warning(f"Gmail failed: {e}")
+
+try:
     from services.friday_security import friday_security
     SECURITY_OK = True
 except Exception as e:
@@ -303,8 +309,15 @@ def _combined_morning_brief() -> str:
         if second_brain:
             parts["brain"] = second_brain.daily_digest()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(f) for f in (_news, _people, _brain)]
+    urgent_emails = []
+
+    def _email():
+        nonlocal urgent_emails
+        if friday_gmail:
+            urgent_emails = friday_gmail.get_urgent()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(f) for f in (_news, _people, _brain, _email)]
         concurrent.futures.wait(futures, timeout=25)
 
     combined = "\n".join(f"- {v}" for v in parts.values() if v)
@@ -312,13 +325,15 @@ def _combined_morning_brief() -> str:
     from core.friday_memory import get_notes
     pending_tasks = [t for t in get_tasks() if not t.get("done")]
     recent_notes = get_notes(3)
+    email_note = f"{len(urgent_emails)} urgent emails need attention." if urgent_emails else ""
 
     extra = (
         f"Pending tasks: {len(pending_tasks)}\n"
         f"Recent notes: {[n['content'][:50] for n in recent_notes]}\n"
+        f"{email_note}\n"
     )
 
-    if not combined and not pending_tasks and not recent_notes:
+    if not combined and not pending_tasks and not recent_notes and not urgent_emails:
         return ""
     if not friday_brain:
         return combined
@@ -423,6 +438,13 @@ CALLER_TRIGGERS = [
 # use case.
 CALL_TRIGGERS = [
     "call ", "dial ", "call up ", "give a call", "reach out to ",
+]
+
+EMAIL_TRIGGERS = [
+    "check my email", "what emails",
+    "inbox", "any emails", "email summary",
+    "what did i miss", "unread emails",
+    "check mail",
 ]
 
 NOTE_TRIGGERS = [
@@ -914,6 +936,12 @@ def command():
                 "response": response, "action": "call",
                 "contact": name, "mode": "call_initiation",
             })
+
+        # ── Email ─────────────────────────────────────────────────────────────
+        if any(t in p_lower for t in EMAIL_TRIGGERS) and friday_gmail:
+            summary = friday_gmail.summarize_inbox()
+            _log(prompt, summary, "email")
+            return jsonify({"response": summary, "mode": "email"})
 
         # ── Note that ─────────────────────────────────────────────────────────
         if any(t in p_lower for t in NOTE_TRIGGERS):
@@ -1544,6 +1572,22 @@ def log_call():
         response = result["response"] or response
 
     return jsonify({"response": response, "logged": True})
+
+
+# ── Email ────────────────────────────────────────────────────────────────────
+
+@app.route("/friday/email/summary")
+def email_summary():
+    if not friday_gmail:
+        return jsonify({"summary": "Gmail not configured"})
+    return jsonify({"summary": friday_gmail.summarize_inbox()})
+
+
+@app.route("/friday/email/urgent")
+def email_urgent():
+    if not friday_gmail:
+        return jsonify({"urgent": []})
+    return jsonify({"urgent": friday_gmail.get_urgent()})
 
 
 # ── Military-grade systems (OODA, EMCON, scenario/Sokovia) ──────────────────────

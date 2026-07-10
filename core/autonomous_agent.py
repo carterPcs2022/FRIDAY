@@ -33,6 +33,7 @@ class AutonomousAgent:
             ("hydration", self._hydration_check, 1800),
             ("movement", self._movement_reminder, 5400),
             ("bill_check", self._bill_check, 3600),
+            ("email_check", self._email_check, 3600),
         ]
 
         for name, fn, interval in monitors:
@@ -261,6 +262,19 @@ class AutonomousAgent:
                         f"Boss, {bill['name']} is due soon. ${bill.get('amount', 0):.0f}",
                         priority="normal"
                     )
+        except Exception:
+            pass
+
+    # ── Urgent email check ───────────────────────────────────────────────────
+    def _email_check(self):
+        try:
+            from services.friday_gmail import friday_gmail
+            if not friday_gmail:
+                return
+            urgent = friday_gmail.get_urgent()
+            if urgent:
+                subjects = ", ".join(e["subject"][:30] for e in urgent[:2])
+                self._alert(f"Boss, urgent email: {subjects}", priority="normal")
         except Exception:
             pass
 
