@@ -1,7 +1,7 @@
 """FRIDAY V2 — complete server. Flask + emotional intelligence + JARVIS
 monitoring + green HUD + voice-mode control."""
 import time
-from flask import Flask, jsonify
+from flask import Flask, jsonify, redirect
 
 # app + /health come before anything else that could fail to import or
 # block — Railway's healthcheck needs a fast 200 from this path to keep
@@ -197,6 +197,24 @@ except Exception as e:
     logging.warning(f"Gmail failed: {e}")
 
 try:
+    from services.friday_spotify import friday_spotify
+except Exception as e:
+    friday_spotify = None
+    logging.warning(f"Spotify failed: {e}")
+
+try:
+    from services.friday_habits import habits
+except Exception as e:
+    habits = None
+    logging.warning(f"Habits failed: {e}")
+
+try:
+    from services.friday_journal import journal
+except Exception as e:
+    journal = None
+    logging.warning(f"Journal failed: {e}")
+
+try:
     from services.friday_security import friday_security
     SECURITY_OK = True
 except Exception as e:
@@ -291,6 +309,11 @@ _start_thread(_monitor_jarvis, "JARVIS monitor")
 _MORNING_BRIEF_HOUR = 8
 _last_morning_brief_date = None
 
+# Read by core/autonomous_agent.py's _alert() (imported at call time, not
+# module load, to avoid a circular import) to hold non-urgent alerts
+# during an active focus session.
+_FOCUS_SESSION = {"active": False, "task": "", "end_time": 0}
+
 
 def _combined_morning_brief() -> str:
     import concurrent.futures
@@ -316,8 +339,14 @@ def _combined_morning_brief() -> str:
         if friday_gmail:
             urgent_emails = friday_gmail.get_urgent()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(f) for f in (_news, _people, _brain, _email)]
+    energy = [""]
+
+    def _energy():
+        if voice_memory:
+            energy[0] = voice_memory.predict_energy_now()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(f) for f in (_news, _people, _brain, _email, _energy)]
         concurrent.futures.wait(futures, timeout=25)
 
     combined = "\n".join(f"- {v}" for v in parts.values() if v)
@@ -331,6 +360,7 @@ def _combined_morning_brief() -> str:
         f"Pending tasks: {len(pending_tasks)}\n"
         f"Recent notes: {[n['content'][:50] for n in recent_notes]}\n"
         f"{email_note}\n"
+        f"{energy[0]}\n"
     )
 
     if not combined and not pending_tasks and not recent_notes and not urgent_emails:
@@ -440,12 +470,83 @@ CALL_TRIGGERS = [
     "call ", "dial ", "call up ", "give a call", "reach out to ",
 ]
 
+# "what did i miss" moved to CATCHUP_TRIGGERS below — that feature's
+# response already folds in unread email count alongside news/tasks/
+# people, so it's a strict superset of what this email-only trigger
+# would say for that exact phrase; keeping it in both lists would just
+# mean this narrower one always wins (checked first) and the richer
+# catch-up brief would never fire for it.
 EMAIL_TRIGGERS = [
     "check my email", "what emails",
     "inbox", "any emails", "email summary",
-    "what did i miss", "unread emails",
-    "check mail",
+    "unread emails", "check mail",
 ]
+
+CATCHUP_TRIGGERS = [
+    "what did i miss", "catch me up",
+    "what happened", "what's new",
+    "brief me", "status update",
+    "bring me up to speed",
+]
+
+# "25 minutes" dropped — broad enough to match any sentence mentioning a
+# duration for an unrelated reason ("the movie's 25 minutes long", "I'll
+# be there in 25 minutes") and would start an actual focus session +
+# background timer thread on a false match, not just an odd chat reply.
+FOCUS_TRIGGERS = [
+    "focus mode", "pomodoro", "focus session",
+    "focus for", "work session",
+    "do not disturb", "focus time",
+]
+
+HABIT_LOG_TRIGGERS = [
+    "logged ", "did my ", "completed my",
+    "finished my ", "i worked out",
+    "i read ", "i meditated",
+]
+
+JOURNAL_TRIGGERS = [
+    "log today", "journal entry",
+    "diary", "log this",
+    "today was", "how my day went",
+]
+
+PROBABILITY_TRIGGERS = [
+    "what are the odds", "what are the chances",
+    "probability", "likelihood",
+    "will this work", "is this going to",
+    "how likely", "odds of",
+]
+
+COMBAT_TRIGGERS = [
+    "combat mode", "battle mode",
+    "max efficiency", "terse mode",
+    "crisis mode", "no fluff",
+]
+
+NORMAL_MODE_TRIGGERS = [
+    "normal mode", "relax", "stand down",
+    "at ease", "back to normal",
+]
+
+PRIORITY_TRIGGERS = [
+    "what should i focus on", "what should i work on",
+    "what's most important", "prioritize my day",
+    "what do i do first", "help me prioritize",
+    "what's the most important thing",
+]
+
+# "going to "/"i'm going to" dropped — far too broad ("I'm going to call
+# Pepper", "I'm going to finish this later") and would fire a real web
+# search + LLM call trying to extract a destination city from ordinary
+# sentences that have nothing to do with travel.
+TRAVEL_TRIGGERS = [
+    "i'm traveling to", "traveling to",
+    "trip to ", "flying to", "visiting ",
+]
+
+SPOTIFY_STOP_TRIGGERS = ["stop playing", "pause", "stop music", "no play"]
+SPOTIFY_PLAY_TRIGGERS = ["play ", "now play", "put on", "friday play"]
 
 NOTE_TRIGGERS = [
     "note that", "make a note",
@@ -936,6 +1037,207 @@ def command():
                 "response": response, "action": "call",
                 "contact": name, "mode": "call_initiation",
             })
+
+        # ── Catch-up brief ────────────────────────────────────────────────────
+        if any(t in p_lower for t in CATCHUP_TRIGGERS) and friday_brain:
+            import concurrent.futures
+
+            catchup_data = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {}
+                if friday_gmail:
+                    futures[executor.submit(friday_gmail.get_unread, 10)] = "emails"
+                if news_anchor:
+                    futures[executor.submit(news_anchor.morning_brief)] = "news"
+                if relationships:
+                    futures[executor.submit(relationships.who_needs_attention)] = "people"
+
+                catchup_data["tasks"] = len([t for t in get_tasks() if not t.get("done")])
+
+                for f in concurrent.futures.as_completed(futures, timeout=15):
+                    key = futures[f]
+                    try:
+                        catchup_data[key] = f.result()
+                    except Exception:
+                        pass
+
+            emails = catchup_data.get("emails", [])
+            news = catchup_data.get("news", "")
+            people = catchup_data.get("people", [])
+            tasks_cnt = catchup_data.get("tasks", 0)
+
+            result = friday_brain.think(
+                f"Catch-up brief:\n"
+                f"Unread emails: {len(emails)}\n"
+                f"Top email: {emails[0].get('subject', '') if emails else 'none'}\n"
+                f"Pending tasks: {tasks_cnt}\n"
+                f"People needing contact: {len(people)}\n"
+                f"News: {news[:100] if news else 'none'}\n\n"
+                f"Quick catch-up brief. Most important first. Under 80 words. FRIDAY style."
+            )
+            response = result["response"]
+            _log(prompt, response, "catchup")
+            return jsonify({"response": response, "mode": "catchup"})
+
+        # ── Focus / Pomodoro timer ────────────────────────────────────────────
+        if any(t in p_lower for t in FOCUS_TRIGGERS):
+            import re
+            mins_match = re.search(r"(\d+)\s*min", p_lower)
+            mins = int(mins_match.group(1)) if mins_match else 25
+
+            task = "focus session"
+            if friday_brain:
+                result = friday_brain.think(
+                    f"What task from this? '{prompt}'\n"
+                    f"Reply with just the task or 'focus session'."
+                )
+                task = result["response"].strip() or "focus session"
+
+            _FOCUS_SESSION["active"] = True
+            _FOCUS_SESSION["task"] = task
+            _FOCUS_SESSION["end_time"] = time.time() + mins * 60
+
+            def _end_focus(mins=mins, task=task):
+                time.sleep(mins * 60)
+                _FOCUS_SESSION["active"] = False
+                if VOICE_OK:
+                    friday_speak(f"Focus session complete, boss. {mins} minutes done.")
+                _push("FRIDAY", f"Focus session done: {task}")
+
+            threading.Thread(target=_end_focus, daemon=True).start()
+
+            response = f"Focus mode active, boss. {mins} minutes for: {task}. I'll hold non-urgent alerts."
+            _log(prompt, response, "focus")
+            return jsonify({"response": response, "mode": "focus"})
+
+        # ── Habit logging ─────────────────────────────────────────────────────
+        if any(t in p_lower for t in HABIT_LOG_TRIGGERS) and habits and friday_brain:
+            result = friday_brain.think(f"Extract habit from: {prompt}\nOne word reply.")
+            habit_name = result["response"].strip()
+            if habit_name:
+                log_result = habits.log(habit_name)
+                streak = log_result.get("streak", 1)
+                response = f"Logged {habit_name}, boss. That's a {streak}-day streak."
+                _log(prompt, response, "habit")
+                return jsonify({"response": response, "mode": "habit"})
+
+        # ── Journal ───────────────────────────────────────────────────────────
+        if any(t in p_lower for t in JOURNAL_TRIGGERS) and journal:
+            mood = "neutral"
+            if emotional_intel:
+                mood = emotional_intel.analyze(prompt).get("emotion", "neutral")
+            journal.log_entry(prompt, mood=mood)
+            response = "Logged, boss."
+            if friday_brain:
+                result = friday_brain.think(
+                    f"Acknowledge this journal entry warmly:\n{prompt}\n\nUnder 20 words. FRIDAY style."
+                )
+                response = result["response"] or response
+            _log(prompt, response, "journal")
+            return jsonify({"response": response, "mode": "journal"})
+
+        # ── Probability assessment ────────────────────────────────────────────
+        if any(t in p_lower for t in PROBABILITY_TRIGGERS) and friday_brain:
+            result = friday_brain.think(
+                f"Probability assessment:\n{prompt}\n\n"
+                f"Analyze like FRIDAY in Civil War.\n"
+                f"Give:\n1. Probability estimate (X%)\n2. Key factors for/against\n"
+                f"3. What would change the odds\n4. Recommended action\n\n"
+                f"Be specific. Use numbers. FRIDAY tactical style."
+            )
+            response = result["response"]
+            _log(prompt, response, "probability")
+            return jsonify({"response": response, "mode": "probability"})
+
+        # ── Combat / normal mode ──────────────────────────────────────────────
+        if any(t in p_lower for t in COMBAT_TRIGGERS) and friday_brain:
+            friday_brain.set_voice_mode("combat")
+            response = "Combat mode. Standing by."
+            _log(prompt, response, "mode")
+            return jsonify({"response": response, "mode": "combat"})
+
+        if any(t in p_lower for t in NORMAL_MODE_TRIGGERS) and friday_brain:
+            friday_brain.set_voice_mode("normal")
+            response = "Standing down, boss."
+            _log(prompt, response, "mode")
+            return jsonify({"response": response, "mode": "normal"})
+
+        # ── Priority focus ────────────────────────────────────────────────────
+        if any(t in p_lower for t in PRIORITY_TRIGGERS) and friday_brain:
+            pending = [t for t in get_tasks() if not t.get("done")]
+            emails = []
+            if friday_gmail:
+                try:
+                    emails = friday_gmail.get_urgent()
+                except Exception:
+                    pass
+
+            notes_ctx = ""
+            if second_brain:
+                actions = second_brain.get_actions()
+                if actions:
+                    notes_ctx = "\n".join(a.get("action", "") for a in actions[:3])
+
+            energy = voice_memory.predict_energy_now() if voice_memory else ""
+
+            result = friday_brain.think(
+                f"Priority analysis — what should boss focus on NOW:\n\n"
+                f"Pending tasks ({len(pending)}):\n"
+                + "\n".join(f"- {t['task']}" for t in pending[:5])
+                + f"\n\nUrgent emails: {len(emails)}\n"
+                f"Pending actions from notes: {notes_ctx}\n"
+                f"Energy read: {energy}\n\n"
+                f"What's the single most important thing to do right now?\n"
+                f"Then the next 2 things. Be specific and decisive.\n"
+                f"Under 60 words. FRIDAY tactical style."
+            )
+            response = result["response"]
+            _log(prompt, response, "priority")
+            return jsonify({"response": response, "mode": "priority"})
+
+        # ── Travel intel ──────────────────────────────────────────────────────
+        if any(t in p_lower for t in TRAVEL_TRIGGERS) and friday_brain:
+            import re
+            match = re.search(
+                r"(?:traveling to|trip to|flying to|visiting)\s+(.+?)(?:\s+(?:for|on|next|this).*)?$",
+                p_lower
+            )
+            city = match.group(1).strip().title() if match else ""
+
+            if city:
+                from core.tools.web import search
+                results = search(f"{city} travel tips time zone weather", 3)
+                result = friday_brain.think(
+                    f"Travel intel for {city}:\n\n"
+                    + "\n".join(
+                        f"- {r.get('title', '')}: {r.get('snippet', '')[:100]}"
+                        for r in results[:3]
+                    )
+                    + "\n\nBrief travel brief:\n"
+                      "1. Current time and time zone difference from New York\n"
+                      "2. Current weather\n3. 2-3 things to know\nUnder 60 words. FRIDAY style."
+                )
+                response = result["response"]
+                _log(prompt, response, "travel")
+                return jsonify({"response": response, "mode": "travel"})
+
+        # ── Spotify direct control ────────────────────────────────────────────
+        if any(t in p_lower for t in SPOTIFY_STOP_TRIGGERS) and friday_spotify:
+            friday_spotify.pause()
+            response = "Pausing, boss."
+            _log(prompt, response, "spotify")
+            return jsonify({"response": response, "mode": "spotify"})
+
+        for trigger in SPOTIFY_PLAY_TRIGGERS:
+            if trigger in p_lower and friday_spotify:
+                query = p_lower.split(trigger)[-1].strip().replace("on spotify", "").strip()
+                result = friday_spotify.play(query)
+                if result.get("playing"):
+                    response = f"Playing {result.get('track', '')} by {result.get('artist', '')}, boss."
+                else:
+                    response = result.get("error", "Couldn't play that, boss.")
+                _log(prompt, response, "spotify")
+                return jsonify({"response": response, "mode": "spotify"})
 
         # ── Email ─────────────────────────────────────────────────────────────
         if any(t in p_lower for t in EMAIL_TRIGGERS) and friday_gmail:
@@ -1588,6 +1890,67 @@ def email_urgent():
     if not friday_gmail:
         return jsonify({"urgent": []})
     return jsonify({"urgent": friday_gmail.get_urgent()})
+
+
+# ── Spotify ──────────────────────────────────────────────────────────────────
+
+@app.route("/friday/spotify/auth")
+def spotify_auth():
+    if not friday_spotify:
+        return "Spotify not configured", 500
+    return redirect(friday_spotify.auth_url())
+
+
+@app.route("/friday/spotify/callback")
+def spotify_callback():
+    if not friday_spotify:
+        return "Spotify not configured", 500
+    code = request.args.get("code", "")
+    if not code:
+        return jsonify({"error": request.args.get("error", "No code provided")}), 400
+    result = friday_spotify.exchange_code(code)
+    if result.get("ok"):
+        return "Spotify connected. You can close this tab, boss."
+    return jsonify(result), 400
+
+
+# ── Habits / Journal / Focus ─────────────────────────────────────────────────
+
+@app.route("/friday/habits")
+def get_habits():
+    if not habits:
+        return jsonify({})
+    return jsonify(habits.all_streaks())
+
+
+@app.route("/friday/habits/log", methods=["POST"])
+def log_habit():
+    data = request.get_json(silent=True) or {}
+    name = data.get("habit", "").strip()
+    if not name or not habits:
+        return jsonify({"error": "No habit"}), 400
+    return jsonify(habits.log(name))
+
+
+@app.route("/friday/journal/log", methods=["POST"])
+def journal_log():
+    data = request.get_json(silent=True) or {}
+    content = data.get("content", "").strip()
+    if not content or not journal:
+        return jsonify({"error": "No content"}), 400
+    return jsonify(journal.log_entry(content))
+
+
+@app.route("/friday/journal/reflection")
+def journal_reflection():
+    if not journal:
+        return jsonify({"reflection": ""})
+    return jsonify({"reflection": journal.weekly_reflection()})
+
+
+@app.route("/friday/focus/status")
+def focus_status():
+    return jsonify(_FOCUS_SESSION)
 
 
 # ── Military-grade systems (OODA, EMCON, scenario/Sokovia) ──────────────────────

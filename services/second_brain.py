@@ -59,6 +59,18 @@ class SecondBrain:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in scored[:limit]]
 
+    def get_actions(self, limit: int = 10) -> list:
+        """Flattened action items pulled off recent entries — each
+        returned as {"action": str, "source": entry id}, newest entries
+        first."""
+        actions = []
+        for entry in sorted(self._entries.values(), key=lambda e: e.get("ts", ""), reverse=True):
+            for action in entry.get("actions", []):
+                actions.append({"action": action, "source": entry.get("id", "")})
+                if len(actions) >= limit:
+                    return actions
+        return actions
+
     def daily_digest(self) -> str:
         from core.friday_brain import friday_brain
 

@@ -196,4 +196,13 @@ FRIDAY_VOICE_MODES = {
         "max_chars": 150,
         "temperature": 0.6,
     },
+    "combat": {
+        "description": "Maximum efficiency — crisis/battle tone",
+        "max_chars": 60,
+        "temperature": 0.3,
+        "system_note": (
+            "COMBAT MODE. Maximum efficiency. One sentence only. "
+            "No pleasantries. Facts and actions only. Like FRIDAY mid-battle."
+        ),
+    },
 }

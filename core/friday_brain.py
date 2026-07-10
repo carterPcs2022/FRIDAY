@@ -245,6 +245,9 @@ class FridayBrain:
         if self.voice_mode == "coverage":
             system += ("\n\nYou are currently covering for JARVIS who is offline. "
                       "Acknowledge this if relevant. Be extra helpful.")
+        mode_note = FRIDAY_VOICE_MODES.get(self.voice_mode, {}).get("system_note", "")
+        if mode_note:
+            system += f"\n\n{mode_note}"
         return system
 
     def _build_messages(self, query: str, context: str) -> list[dict]:

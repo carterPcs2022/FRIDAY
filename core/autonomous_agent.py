@@ -34,6 +34,7 @@ class AutonomousAgent:
             ("movement", self._movement_reminder, 5400),
             ("bill_check", self._bill_check, 3600),
             ("email_check", self._email_check, 3600),
+            ("meeting_prep", self._meeting_prep, 300),
         ]
 
         for name, fn, interval in monitors:
@@ -149,7 +150,9 @@ class AutonomousAgent:
 
     # ── Sunday weekly brief ──────────────────────────────────────────────────
     def _sunday_brief(self):
-        """Every Sunday night FRIDAY auto-generates a week ahead brief and sends it."""
+        """Every Sunday night FRIDAY auto-generates a full weekly review
+        (tasks completed/pending, journal entries, habit streaks) and
+        sends it."""
         now = datetime.now()
         if now.weekday() != 6:  # Not Sunday
             return
@@ -163,19 +166,56 @@ class AutonomousAgent:
         flag.parent.mkdir(parents=True, exist_ok=True)
         flag.touch()
 
+        import json
+
+        def _get_tasks() -> list:
+            if not TASK_FILE.exists():
+                return []
+            try:
+                return json.loads(TASK_FILE.read_text())
+            except Exception:
+                return []
+
+        tasks = _get_tasks()
+        week_tasks = []
+        for t in tasks:
+            if not t.get("done"):
+                continue
+            try:
+                if (now - datetime.fromisoformat(t.get("completed", "1970-01-01"))).days < 7:
+                    week_tasks.append(t)
+            except Exception:
+                pass
+        pending_tasks = [t for t in tasks if not t.get("done")]
+
+        journal_count = 0
+        try:
+            from services.friday_journal import journal
+            journal_count = len(journal.recent_entries(7))
+        except Exception:
+            pass
+
+        streaks = {}
+        try:
+            from services.friday_habits import habits
+            streaks = habits.all_streaks()
+        except Exception:
+            pass
+
         from core.friday_brain import friday_brain
         result = friday_brain.think(
-            f"Generate a Sunday evening week-ahead brief.\n"
-            f"Today is {now.strftime('%A %B %d')}.\n\n"
-            f"Include:\n"
-            f"1. Mindset for the week\n"
-            f"2. Top 3 priorities to focus on\n"
-            f"3. One thing to let go of from last week\n\n"
-            f"FRIDAY style. Warm but focused. Under 80 words."
+            f"Weekly review — Sunday {now.strftime('%B %d')}:\n"
+            f"Tasks completed this week: {len(week_tasks)}\n"
+            f"Tasks still pending: {len(pending_tasks)}\n"
+            f"Journal entries: {journal_count}\n"
+            f"Active habit streaks: {streaks}\n\n"
+            f"Generate a warm, honest weekly review. What went well? "
+            f"What's pending? One thing to focus on next week?\n"
+            f"Under 100 words. FRIDAY Sunday tone."
         )
         brief = result.get("response", "")
         if brief:
-            self._alert(brief, priority="normal", title="FRIDAY — Week Ahead")
+            self._alert(brief, priority="normal", title="FRIDAY — Weekly Review")
 
     # ── Weather alert ────────────────────────────────────────────────────────
     def _weather_alert(self):
@@ -278,9 +318,53 @@ class AutonomousAgent:
         except Exception:
             pass
 
+    # ── Meeting prep ─────────────────────────────────────────────────────────
+    def _meeting_prep(self):
+        """No calendar integration yet, so this works off the task list —
+        any pending task that reads like a meeting gets a brief. Real
+        time-before-meeting alerting needs Google Calendar wired in;
+        _alert()'s own hour-based dedup keeps this from repeating more
+        than once an hour in the meantime."""
+        try:
+            import json
+            if not TASK_FILE.exists():
+                return
+            tasks = json.loads(TASK_FILE.read_text())
+            meeting_tasks = [
+                t for t in tasks
+                if any(w in t.get("task", "").lower()
+                      for w in ["meeting", "call", "interview", "standup", "review", "sync"])
+                and not t.get("done")
+            ]
+            if not meeting_tasks:
+                return
+
+            task = meeting_tasks[0]
+            from core.friday_brain import friday_brain
+            result = friday_brain.think(
+                f"Pre-meeting brief for: {task['task']}\n\n"
+                f"What should boss know going in? Under 20 words. FRIDAY briefing style."
+            )
+            if result.get("response"):
+                self._alert(result["response"], title="FRIDAY — Meeting Prep", priority="normal")
+        except Exception:
+            pass
+
     # ── Alert dispatcher ─────────────────────────────────────────────────────
     def _alert(self, message: str, priority: str = "normal", title: str = "FRIDAY"):
         """Send alert through all channels."""
+        # Hold non-urgent alerts during an active focus session — server.py
+        # owns _FOCUS_SESSION; imported at call time (not at module load)
+        # since server.py starts this agent's thread from inside its own
+        # startup code, so importing it back at module scope would be
+        # circular.
+        try:
+            from server import _FOCUS_SESSION
+            if _FOCUS_SESSION.get("active") and priority != "high":
+                return
+        except Exception:
+            pass
+
         # Dedupe — don't repeat same alert within the hour.
         msg_key = message[:50]
         recent = [

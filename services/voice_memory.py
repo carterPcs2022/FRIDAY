@@ -65,6 +65,32 @@ class VoiceMemory:
         )
         return result["response"]
 
+    def predict_energy_now(self) -> str:
+        """One-sentence read on current energy based on the last few
+        hours' logged emotional patterns."""
+        hour = datetime.now().hour
+        patterns = self._profile.get("hourly_patterns", {})
+
+        hour_data = []
+        for h in range(max(0, hour - 3), hour + 1):
+            emotions = patterns.get(str(h), [])
+            if emotions:
+                dominant = Counter(emotions).most_common(1)[0][0]
+                hour_data.append(f"{h}:00 — {dominant}")
+
+        if not hour_data:
+            return ""
+
+        from core.friday_brain import friday_brain
+        result = friday_brain.think(
+            f"Energy pattern right now:\n"
+            + "\n".join(hour_data)
+            + f"\n\nCurrent time: {hour}:00\n\n"
+              f"One sentence energy prediction. Should boss do deep work, "
+              f"admin, or rest? Under 15 words."
+        )
+        return result["response"]
+
     def _load(self) -> dict:
         if VOICE_PROFILE_FILE.exists():
             try:
