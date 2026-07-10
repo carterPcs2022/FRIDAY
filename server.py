@@ -221,6 +221,32 @@ except Exception as e:
     logging.warning(f"Calendar failed: {e}")
 
 try:
+    from services.friday_continuity import continuity
+except Exception as e:
+    continuity = None
+    logging.warning(f"Continuity failed: {e}")
+
+try:
+    from services.friday_goals import goals
+except Exception as e:
+    goals = None
+    logging.warning(f"Goals failed: {e}")
+
+
+def _extract_topic(prompt: str) -> str:
+    TOPIC_KEYWORDS = {
+        "project": "project", "work": "work", "meeting": "meeting",
+        "family": "family", "health": "health", "money": "finances",
+        "jarvis": "JARVIS build", "suit": "Iron Man suit",
+        "friday": "FRIDAY build", "code": "coding", "deploy": "deployment",
+    }
+    p = prompt.lower()
+    for keyword, topic in TOPIC_KEYWORDS.items():
+        if keyword in p:
+            return topic
+    return ""
+
+try:
     from services.friday_security import friday_security
     SECURITY_OK = True
 except Exception as e:
@@ -358,8 +384,21 @@ def _combined_morning_brief() -> str:
         if friday_calendar and friday_calendar.is_connected():
             todays_events = friday_calendar.get_today()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-        futures = [executor.submit(f) for f in (_news, _people, _brain, _email, _energy, _calendar)]
+    followup = [""]
+
+    def _followup():
+        if continuity:
+            followup[0] = continuity.generate_followup()
+
+    goal_nudge = [""]
+
+    def _goal_nudge_check():
+        if goals:
+            goal_nudge[0] = goals.nudge_neglected()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(f) for f in
+                  (_news, _people, _brain, _email, _energy, _calendar, _followup, _goal_nudge_check)]
         concurrent.futures.wait(futures, timeout=25)
 
     combined = "\n".join(f"- {v}" for v in parts.values() if v)
@@ -379,9 +418,12 @@ def _combined_morning_brief() -> str:
         f"{email_note}\n"
         f"{calendar_note}\n"
         f"{energy[0]}\n"
+        f"Emotional followup needed: {followup[0]}\n"
+        f"Goal reminder: {goal_nudge[0]}\n"
     )
 
-    if not combined and not pending_tasks and not recent_notes and not urgent_emails and not todays_events:
+    if (not combined and not pending_tasks and not recent_notes and not urgent_emails
+            and not todays_events and not followup[0] and not goal_nudge[0]):
         return ""
     if not friday_brain:
         return combined
@@ -570,6 +612,45 @@ CALENDAR_ADD_TRIGGERS = [
     "add to my calendar", "put on my calendar",
     "schedule a meeting", "add an event",
     "create an event", "book a meeting",
+]
+
+DRAFT_TRIGGERS = [
+    "draft a reply", "reply to",
+    "write a reply", "respond to",
+    "draft email", "write email to",
+]
+
+# "inbox"/"what emails" (EMAIL_TRIGGERS) are substrings of "triage my
+# inbox"/"organize my inbox"/"what emails need attention" — this list
+# must be checked BEFORE EMAIL_TRIGGERS in command() or the narrower
+# email-summary trigger always wins and smart triage never fires.
+TRIAGE_TRIGGERS = [
+    "triage my inbox", "sort my emails",
+    "organize my inbox", "what emails need attention",
+    "email categories", "sort emails",
+]
+
+# "i want to" dropped from the source spec's list — same reasoning as
+# "need to" (TASK_ADD_TRIGGERS) and "going to " (TRAVEL_TRIGGERS): matches
+# a huge share of ordinary sentences ("I want to eat lunch", "I want to
+# know...") and would spin up a real LLM extraction call plus a new
+# tracked goal on the false match.
+GOAL_ADD_TRIGGERS = [
+    "add goal", "new goal",
+    "my goal is", "set a goal",
+    "track my progress on",
+]
+
+GOAL_PROGRESS_TRIGGERS = [
+    "worked on", "made progress on",
+    "spent time on", "did work on",
+    "progress update",
+]
+
+GOAL_REPORT_TRIGGERS = [
+    "goal report", "how am i doing on",
+    "progress report", "goals status",
+    "what are my goals",
 ]
 
 NOTE_TRIGGERS = [
@@ -1293,6 +1374,106 @@ def command():
             _log(prompt, response, "calendar")
             return jsonify({"response": response, "mode": "calendar"})
 
+        # ── Goals ─────────────────────────────────────────────────────────────
+        if any(t in p_lower for t in GOAL_REPORT_TRIGGERS) and goals:
+            active = goals.get_active_goals()
+            if not active:
+                response = "No goals tracked yet, boss. Tell me your goals and I'll track them."
+            elif friday_brain:
+                result = friday_brain.think(
+                    f"Quick goal status for {len(active)} active goals:\n"
+                    + "\n".join(
+                        f"- {g['name']}: {g.get('sessions', 0)} sessions, "
+                        f"last worked {(g.get('last_worked') or 'never')[:10]}"
+                        for g in active
+                    )
+                    + "\n\nBrief status. Under 40 words. FRIDAY style."
+                )
+                response = result["response"]
+            else:
+                response = f"{len(active)} active goals, boss."
+            _log(prompt, response, "goal_report")
+            return jsonify({"response": response, "mode": "goal_report"})
+
+        if any(t in p_lower for t in GOAL_ADD_TRIGGERS) and goals and friday_brain:
+            import re as rex
+            extract = friday_brain.think(
+                f"Extract goal from: '{prompt}'\n"
+                f'Reply as JSON: {{"name": str, "description": str}}'
+            )
+            try:
+                clean = rex.sub(r"```json|```", "", extract["response"]).strip()
+                data = json.loads(clean)
+                name = data.get("name", "")
+                if name:
+                    goals.add_goal(name, data.get("description", ""))
+                    response = f"Goal added, boss: {name}. I'll track your progress."
+                else:
+                    response = "What's the goal, boss?"
+            except Exception:
+                response = "What's the goal, boss?"
+            _log(prompt, response, "goal_add")
+            return jsonify({"response": response, "mode": "goal_add"})
+
+        # Left out of the source spec's command() wiring entirely (the
+        # trigger list was declared but never actually checked) — without
+        # this, "worked on X" would never log progress, which defeats the
+        # whole point of tracking goals automatically.
+        if any(t in p_lower for t in GOAL_PROGRESS_TRIGGERS) and goals:
+            log_result = goals.log_progress(work_done=prompt, auto_detect=True)
+            if log_result.get("logged"):
+                response = f"Logged progress on {log_result['goal']}, boss. Session {log_result['sessions']}."
+            else:
+                response = "Noted — didn't match it to a tracked goal, boss."
+            _log(prompt, response, "goal_progress")
+            return jsonify({"response": response, "mode": "goal_progress"})
+
+        # ── Email: draft / triage (checked before EMAIL_TRIGGERS — that
+        # list's bare "inbox"/"what emails" are substrings of these
+        # phrases and would otherwise always win first) ────────────────────
+        if any(t in p_lower for t in DRAFT_TRIGGERS) and friday_gmail and friday_brain:
+            import re as rex
+            extract = friday_brain.think(
+                f"From this: '{prompt}'\n"
+                f"Extract: who to reply to and what to say.\n"
+                f'JSON: {{"to": str, "instruction": str}}'
+            )
+            try:
+                clean = rex.sub(r"```json|```", "", extract["response"]).strip()
+                data = json.loads(clean)
+                search = data.get("to", "")
+                instruction = data.get("instruction", "")
+            except Exception:
+                search, instruction = prompt, ""
+
+            found = friday_gmail.find_email(search)
+            if found:
+                draft_result = friday_gmail.draft_reply(
+                    email_subject=found.get("subject", ""), email_from=found.get("from", ""),
+                    email_body=found.get("body", ""), instruction=instruction,
+                )
+                draft = draft_result.get("draft", "")
+                response = (
+                    f"Here's a draft reply to {found.get('from', '')[:30]}, boss:\n\n"
+                    f"{draft}\n\nWant me to send it or adjust anything?"
+                )
+            else:
+                response = "I couldn't find that email, boss. Try 'FRIDAY draft a reply to [exact name or subject]'."
+            _log(prompt, response, "email_draft")
+            return jsonify({"response": response, "mode": "email_draft"})
+
+        if any(t in p_lower for t in TRIAGE_TRIGGERS) and friday_gmail:
+            triage = friday_gmail.smart_triage()
+            summary = triage.get("summary", "")
+            cats = triage.get("categories", {})
+            urgent = cats.get("urgent", [])
+            response = (
+                f"Inbox triage complete, boss. {summary}.\n"
+                f"Urgent: {', '.join(urgent[:2]) if urgent else 'none'}."
+            )
+            _log(prompt, response, "email_triage")
+            return jsonify({"response": response, "triage": triage, "mode": "email_triage"})
+
         # ── Email ─────────────────────────────────────────────────────────────
         if any(t in p_lower for t in EMAIL_TRIGGERS) and friday_gmail:
             summary = friday_gmail.summarize_inbox()
@@ -1409,6 +1590,15 @@ def command():
                     emotion_data = emotional_intel.analyze(prompt)
                     if emotion_data.get("emotion") != "neutral":
                         log_emotion(emotion_data["emotion"], emotion_data["intensity"], prompt)
+                        try:
+                            if continuity and emotion_data.get("intensity", 0) >= 4:
+                                continuity.record_session(
+                                    emotion=emotion_data.get("emotion", "neutral"),
+                                    intensity=emotion_data.get("intensity", 0),
+                                    context=prompt[:200], topic=_extract_topic(prompt),
+                                )
+                        except Exception:
+                            pass
 
                 context = get_context_for(prompt)
                 if TRAINING_OK:
@@ -1944,6 +2134,61 @@ def email_urgent():
     if not friday_gmail:
         return jsonify({"urgent": []})
     return jsonify({"urgent": friday_gmail.get_urgent()})
+
+
+@app.route("/friday/email/draft", methods=["POST"])
+def email_draft():
+    data = request.get_json(silent=True) or {}
+    if not friday_gmail:
+        return jsonify({"error": "Gmail not configured"}), 503
+    return jsonify(friday_gmail.draft_reply(
+        email_subject=data.get("subject", ""), email_from=data.get("from", ""),
+        email_body=data.get("body", ""), instruction=data.get("instruction", ""),
+    ))
+
+
+@app.route("/friday/email/triage")
+def email_triage():
+    if not friday_gmail:
+        return jsonify({"error": "Gmail not configured"}), 503
+    return jsonify(friday_gmail.smart_triage())
+
+
+# ── Goals ────────────────────────────────────────────────────────────────────
+
+@app.route("/friday/goals")
+def get_goals():
+    if not goals:
+        return jsonify([])
+    return jsonify(goals.get_active_goals())
+
+
+@app.route("/friday/goals/add", methods=["POST"])
+def add_goal():
+    data = request.get_json(silent=True) or {}
+    if not goals:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(goals.add_goal(
+        data.get("name", ""), data.get("description", ""),
+        data.get("target_date", ""), data.get("milestones", []),
+    ))
+
+
+@app.route("/friday/goals/progress", methods=["POST"])
+def log_goal_progress():
+    data = request.get_json(silent=True) or {}
+    if not goals:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(goals.log_progress(
+        data.get("goal_id", ""), data.get("work", ""), auto_detect=True,
+    ))
+
+
+@app.route("/friday/goals/report")
+def goal_report():
+    if not goals:
+        return jsonify({"report": ""})
+    return jsonify({"report": goals.weekly_progress_report()})
 
 
 # ── Spotify ──────────────────────────────────────────────────────────────────

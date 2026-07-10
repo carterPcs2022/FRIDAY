@@ -35,6 +35,8 @@ class AutonomousAgent:
             ("bill_check", self._bill_check, 3600),
             ("email_check", self._email_check, 3600),
             ("meeting_prep", self._meeting_prep, 300),
+            ("emotional_check", self._morning_emotional_check, 3600),
+            ("goal_nudge", self._goal_nudge, 86400),
         ]
 
         for name, fn, interval in monitors:
@@ -391,6 +393,47 @@ class AutonomousAgent:
             )
             if result.get("response"):
                 self._alert(result["response"], title="FRIDAY — Meeting Prep", priority="normal")
+        except Exception:
+            pass
+
+    # ── Morning emotional check-in ───────────────────────────────────────────
+    def _morning_emotional_check(self):
+        """Only at 8am, once per day."""
+        if datetime.now().hour != 8:
+            return
+        key = f"emotional_check_{datetime.now().date()}"
+        flag = Path(f"logs/.{key}")
+        if flag.exists():
+            return
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.touch()
+
+        try:
+            from services.friday_continuity import continuity
+            from server import _log
+            followup = continuity.morning_emotional_check()
+            if followup:
+                _log("FRIDAY", followup, "emotional_followup")
+        except Exception:
+            pass
+
+    # ── Weekly goal nudge ─────────────────────────────────────────────────────
+    def _goal_nudge(self):
+        """Only on Wednesdays, once per day."""
+        if datetime.now().weekday() != 2:
+            return
+        key = f"goal_nudge_{datetime.now().date()}"
+        flag = Path(f"logs/.{key}")
+        if flag.exists():
+            return
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.touch()
+
+        try:
+            from services.friday_goals import goals
+            nudge = goals.nudge_neglected()
+            if nudge:
+                self._alert(nudge, title="FRIDAY — Goals")
         except Exception:
             pass
 

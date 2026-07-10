@@ -6,6 +6,7 @@ integration (core/tools/gmail.py), which uses OAuth2 instead — two
 different repos, two different credential mechanisms, not meant to share
 state."""
 import os
+import json
 import imaplib
 import email
 from email.header import decode_header
@@ -112,6 +113,79 @@ class FridayGmail:
             if any(k in subj for k in URGENT_KEYWORDS):
                 urgent.append(e)
         return urgent
+
+    def draft_reply(self, email_subject: str = "", email_from: str = "",
+                    email_body: str = "", instruction: str = "") -> dict:
+        """Draft a reply — FRIDAY writes it, the boss approves before
+        anything actually sends (this never calls send_email() itself)."""
+        from core.friday_brain import friday_brain
+
+        result = friday_brain.think(
+            f"Draft an email reply:\n\n"
+            f"From: {email_from}\nSubject: {email_subject}\n"
+            f"Message: {email_body[:500]}\n\n"
+            f"Instruction: {instruction or 'Draft a professional reply'}\n\n"
+            f"Write the reply email body only. No subject line. "
+            f"No 'Dear...' opener needed. Match the tone of the original. "
+            f"Keep it concise and clear."
+        )
+
+        return {
+            "draft": result["response"], "subject": f"Re: {email_subject}",
+            "to": email_from, "ready": True,
+        }
+
+    def find_email(self, search: str = "") -> dict:
+        """Finds a specific email to reply to — scoped to the last 20
+        unread messages, not the whole mailbox. A "reply to X" request
+        about something already read or archived won't be found; that's
+        a real scope limit, not a bug, but worth knowing."""
+        emails = self.get_unread(20)
+        search_lower = search.lower()
+
+        for msg in emails:
+            subj = msg.get("subject", "").lower()
+            sender = msg.get("from", "").lower()
+            if search_lower in subj or search_lower in sender:
+                return msg
+        return {}
+
+    def smart_triage(self) -> dict:
+        """Full inbox triage with action categories: urgent, reply_needed,
+        read_later, probably_spam."""
+        import re
+        from core.friday_brain import friday_brain
+
+        emails = self.get_unread(20)
+        if not emails:
+            return {"categories": {}, "total": 0}
+
+        result = friday_brain.think(
+            f"Email triage — {len(emails)} emails:\n\n"
+            + "\n".join(
+                f"From: {e['from'][:40]}\nSubject: {e['subject']}\n"
+                for e in emails[:15]
+            )
+            + "\n\nCategorize each as:\n"
+              "URGENT - needs action today\nREPLY - needs a reply this week\n"
+              "READ - worth reading, no action\nSKIP - probably spam/newsletters\n\n"
+              'Reply as JSON: {"urgent": [], "reply": [], "read": [], "skip": []} '
+              "with subject lines."
+        )
+
+        try:
+            clean = re.sub(r"```json|```", "", result["response"]).strip()
+            categories = json.loads(clean)
+        except Exception:
+            categories = {"urgent": [], "reply": [], "read": [], "skip": []}
+
+        return {
+            "categories": categories, "total": len(emails),
+            "summary": (
+                f"{len(categories.get('urgent', []))} urgent, "
+                f"{len(categories.get('reply', []))} need replies"
+            ),
+        }
 
 
 friday_gmail = FridayGmail()
