@@ -409,6 +409,22 @@ CALLER_TRIGGERS = [
     "who is this calling",
 ]
 
+# "phone " and "ring " dropped from the source spec's list, and the
+# literal "get [name] on the phone" removed entirely (that's a template
+# placeholder, not real text — it can never match an actual prompt,
+# since nobody types the literal string "[name]"). "phone "/"ring " are
+# common enough in ordinary sentences ("phone battery is low", "the
+# doorbell rang") that they'd regularly misfire — and unlike a
+# false-positive task-list add, a misfire here returns action:"call" to
+# whatever automation consumes it, i.e. a real attempted phone call to a
+# garbled name, not just an odd chat reply. "call " stays: it's still
+# broad, but it's also the one phrasing anyone will actually use to ask
+# FRIDAY to call someone, and dropping it would break the feature's core
+# use case.
+CALL_TRIGGERS = [
+    "call ", "dial ", "call up ", "give a call", "reach out to ",
+]
+
 NOTE_TRIGGERS = [
     "note that", "make a note",
     "write that down", "remember that",
@@ -858,6 +874,46 @@ def command():
                 if VOICE_OK:
                     friday_speak(response)
                 return jsonify({"response": response, "caller": caller, "mode": "caller_id"})
+
+        # ── FRIDAY initiates a call ───────────────────────────────────────────
+        if any(t in p_lower for t in CALL_TRIGGERS):
+            import re
+            match = re.search(
+                r"(?:call|dial|call up|reach out to)\s+(.+?)(?:\s+(?:for|about|and|please|now).*)?$",
+                p_lower
+            )
+            name = match.group(1).strip().title() if match else ""
+
+            if not name:
+                response = "Who do you want me to call, boss?"
+                _log(prompt, response, "call")
+                return jsonify({"response": response, "action": None})
+
+            rel_intel = {}
+            if relationships:
+                rel_intel = relationships.get_intel(name)
+
+            brief = ""
+            if friday_brain:
+                notes = rel_intel.get("notes", [])
+                days = rel_intel.get("days_since", -1)
+                brief_result = friday_brain.think(
+                    f"Pre-call brief for calling {name}.\n"
+                    f"Last contact: {days} days ago.\n"
+                    f"Notes: {notes[-2:] if notes else 'None'}\n"
+                    f"Context: {rel_intel.get('brief', '')}\n\n"
+                    f"One sentence prep brief BEFORE the call. "
+                    f"What to know going in. Under 15 words."
+                )
+                brief = brief_result["response"]
+
+            response = f"Calling {name} now, boss. {brief}" if brief else f"Calling {name} now, boss."
+
+            _log(prompt, response, "call")
+            return jsonify({
+                "response": response, "action": "call",
+                "contact": name, "mode": "call_initiation",
+            })
 
         # ── Note that ─────────────────────────────────────────────────────────
         if any(t in p_lower for t in NOTE_TRIGGERS):
@@ -1464,6 +1520,30 @@ def add_bill():
     BILLS_FILE.parent.mkdir(parents=True, exist_ok=True)
     BILLS_FILE.write_text(json.dumps(bills, indent=2))
     return jsonify({"added": True})
+
+
+# ── Calls ────────────────────────────────────────────────────────────────────
+
+@app.route("/friday/call/log", methods=["POST"])
+def log_call():
+    """Called after a call ends via iOS Shortcut."""
+    data = request.get_json(silent=True) or {}
+    contact = data.get("contact", "")
+    duration = data.get("duration", 0)
+    notes = data.get("notes", "")
+
+    if contact and relationships:
+        relationships.log_contact(contact, notes=f"Call ({duration} min): {notes}")
+
+    response = f"Call with {contact} logged, boss." if contact else "Call logged, boss."
+    if friday_brain:
+        result = friday_brain.think(
+            f"Call ended with {contact}. Duration: {duration} minutes. Notes: {notes}\n\n"
+            f"Brief acknowledgment. Under 10 words."
+        )
+        response = result["response"] or response
+
+    return jsonify({"response": response, "logged": True})
 
 
 # ── Military-grade systems (OODA, EMCON, scenario/Sokovia) ──────────────────────
