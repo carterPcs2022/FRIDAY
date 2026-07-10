@@ -225,7 +225,7 @@ class FridayBrain:
 
     # ── LLM calls ─────────────────────────────────────────────────────────────
 
-    def _call_groq(self, messages: list, system: str, model: str) -> dict | None:
+    def _call_groq(self, messages: list, system: str, model: str, max_tokens: int = 512) -> dict | None:
         if not GROQ_API_KEY:
             return None
 
@@ -239,7 +239,7 @@ class FridayBrain:
             r = _GROQ_CLIENT.post(
                 "/chat/completions",
                 json={
-                    "model": model, "messages": msgs, "max_tokens": 512,
+                    "model": model, "messages": msgs, "max_tokens": max_tokens,
                     "temperature": FRIDAY_VOICE_MODES.get(self.voice_mode, {}).get("temperature", 0.8),
                 },
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -265,7 +265,7 @@ class FridayBrain:
             _last_groq_failure = time.time()
             return None
 
-    def _call_anthropic(self, messages: list, system: str, model: str) -> dict | None:
+    def _call_anthropic(self, messages: list, system: str, model: str, max_tokens: int = 256) -> dict | None:
         if not ANTHROPIC_KEY:
             return None
 
@@ -276,7 +276,7 @@ class FridayBrain:
         try:
             from anthropic import Anthropic
             client = Anthropic(api_key=ANTHROPIC_KEY)
-            r = client.messages.create(model=model, max_tokens=256, system=system, messages=messages)
+            r = client.messages.create(model=model, max_tokens=max_tokens, system=system, messages=messages)
             budget.record_call(r.usage.output_tokens, model)
             global _last_anthropic_success
             _last_anthropic_success = time.time()
@@ -286,6 +286,117 @@ class FridayBrain:
             global _last_anthropic_failure
             _last_anthropic_failure = time.time()
             return None
+
+    # ── Advanced reasoning (opt-in, endpoint-only — not wired into casual
+    # chat triggers, same convention as JARVIS_V5's server/routes/
+    # brain_enhancement.py: "none of this is auto-triggered by regular
+    # chat, since most of it costs multiple LLM calls per invocation") ──────
+
+    def deep_think(self, query: str, context: str = "") -> dict:
+        """Multi-step reasoning before answering: understand -> reason
+        -> answer. Three real LLM calls, so this is meaningfully slower
+        and costs more than a normal think() — use it deliberately."""
+        start = time.time()
+
+        understanding = self._call_groq([
+            {"role": "user", "content":
+             f"What is actually being asked here? What do I need to know "
+             f"to answer well?\n\nQuestion: {query}"}
+        ], "You analyze questions carefully.", MODELS["fast"], max_tokens=400)
+
+        reasoning = self._call_anthropic([
+            {"role": "user", "content":
+             f"Think through this step by step:\n{query}\n\n"
+             f"What I understand about the question: "
+             f"{understanding.get('content', '') if understanding else ''}\n\n"
+             f"Context: {context[:500]}\n\n"
+             f"Work through this carefully before answering."}
+        ], FRIDAY_PERSONALITY, MODELS["deep"], max_tokens=800)
+
+        final = self._call_anthropic([
+            {"role": "user", "content":
+             f"Question: {query}\n\n"
+             f"Your reasoning: {reasoning.get('content', '') if reasoning else ''}\n\n"
+             f"Now give the final answer. Clear. Direct. FRIDAY style."}
+        ], FRIDAY_PERSONALITY, MODELS["deep"], max_tokens=600)
+
+        ms = round((time.time() - start) * 1000)
+        content = final.get("content", "") if final else ""
+
+        return {
+            "response": content,
+            "reasoning": reasoning.get("content", "") if reasoning else "",
+            "method": "chain_of_thought", "model": MODELS["deep"], "ms": ms,
+        }
+
+    def self_critique(self, query: str, initial_response: str) -> str:
+        """FRIDAY critiques her own answer and improves it before handing
+        it back — like reviewing your own work before submitting it."""
+        critique = self._call_anthropic([
+            {"role": "user", "content":
+             f"You just answered this question:\nQ: {query}\nA: {initial_response}\n\n"
+             f"Critique your answer:\n- Is it accurate?\n- Is it complete?\n"
+             f"- Is it the best possible answer?\n- What's missing?\n\n"
+             f"Then give an improved version.\n"
+             f"Format: CRITIQUE: [critique]\nIMPROVED: [better answer]"}
+        ], FRIDAY_PERSONALITY, MODELS["deep"], max_tokens=800)
+
+        if not critique:
+            return initial_response
+
+        content = critique.get("content", "")
+        if "IMPROVED:" in content:
+            return content.split("IMPROVED:")[-1].strip()
+        return initial_response
+
+    def parallel_think(self, query: str) -> str:
+        """Three angles generated simultaneously, then a judge step picks
+        the strongest or synthesizes the best of each — inspired by how
+        JARVIS's Mythos system cross-validates findings from multiple
+        sources rather than trusting a single pass."""
+        import concurrent.futures
+
+        angles = [
+            "Answer directly and practically — the most straightforward, "
+            "actionable take.",
+            "Answer analytically — consider edge cases, risks, and what "
+            "could go wrong.",
+            "Answer creatively — consider an unconventional angle others "
+            "might miss.",
+        ]
+
+        def generate_angle(angle: str) -> str:
+            result = self._call_groq([
+                {"role": "user", "content": f"{angle}\n\nQuestion: {query}"}
+            ], FRIDAY_PERSONALITY, MODELS["smart"])
+            return result.get("content", "") if result else ""
+
+        answers = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(generate_angle, a) for a in angles]
+            for f in concurrent.futures.as_completed(futures, timeout=15):
+                try:
+                    text = f.result()
+                    if text:
+                        answers.append(text)
+                except Exception:
+                    pass
+
+        if not answers:
+            return ""
+        if len(answers) == 1:
+            return answers[0]
+
+        judge = self._call_anthropic([
+            {"role": "user", "content":
+             f"Question: {query}\n\n"
+             + "\n\n".join(f"Answer {i + 1}:\n{a}" for i, a in enumerate(answers))
+             + "\n\nPick the strongest answer, or synthesize the best parts "
+               "of each into one. Reply with ONLY the final answer text, "
+               "nothing else."}
+        ], FRIDAY_PERSONALITY, MODELS["deep"], max_tokens=600)
+
+        return judge.get("content", "") if judge else answers[0]
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

@@ -2289,6 +2289,38 @@ def focus_status():
     return jsonify(_FOCUS_SESSION)
 
 
+# ── Advanced reasoning ───────────────────────────────────────────────────────
+# Opt-in / on-demand only — same convention as JARVIS_V5's
+# server/routes/brain_enhancement.py: none of this is wired into casual
+# chat triggers, since each of these costs multiple LLM calls per
+# invocation (deep_think alone is 3 real calls). Use these when you
+# explicitly want FRIDAY to think harder about something specific.
+
+@app.route("/friday/reason/deep", methods=["POST"])
+def reason_deep():
+    data = request.get_json(silent=True) or {}
+    if not friday_brain:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(friday_brain.deep_think(data.get("query", ""), data.get("context", "")))
+
+
+@app.route("/friday/reason/critique", methods=["POST"])
+def reason_critique():
+    data = request.get_json(silent=True) or {}
+    if not friday_brain:
+        return jsonify({"error": "unavailable"}), 503
+    improved = friday_brain.self_critique(data.get("query", ""), data.get("response", ""))
+    return jsonify({"improved": improved})
+
+
+@app.route("/friday/reason/parallel", methods=["POST"])
+def reason_parallel():
+    data = request.get_json(silent=True) or {}
+    if not friday_brain:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"response": friday_brain.parallel_think(data.get("query", ""))})
+
+
 # ── Military-grade systems (OODA, EMCON, scenario/Sokovia) ──────────────────────
 # On-demand/opt-in only, same as JARVIS's /stark equivalents — none of
 # these are auto-triggered by regular chat.
