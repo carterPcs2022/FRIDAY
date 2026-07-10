@@ -358,6 +358,19 @@ def _morning_brief_loop():
 
 _start_thread(_morning_brief_loop, "morning brief")
 
+
+def _start_autonomous():
+    time.sleep(45)  # After health check passes
+    try:
+        from core.autonomous_agent import autonomous
+        autonomous.start()
+        print("[FRIDAY] Autonomous agent started")
+    except Exception as e:
+        print(f"[FRIDAY] Autonomous failed: {e}")
+
+
+_start_thread(_start_autonomous, "autonomous agent")
+
 # ── Proactive emotional check-ins ────────────────────────────────────────────
 # core/emotional_intel.py's should_check_in() was defined but explicitly
 # documented as unwired ("FRIDAY has no way to message first, only respond").
@@ -391,6 +404,7 @@ def _push(title: str, message: str, priority: int = 0):
 CALLER_TRIGGERS = [
     "incoming call from",
     "calling from",
+    "call from",
     "who is calling",
     "who is this calling",
 ]
@@ -426,6 +440,32 @@ TASK_SHOW_TRIGGERS = [
 ]
 
 TASK_FILE = Path("memory/friday_tasks.json")
+WORKOUT_FILE = Path("memory/friday_workouts.json")
+BILLS_FILE = Path("memory/friday_bills.json")
+
+HOMEKIT_TRIGGERS = {
+    "turn off lights": "shortcuts run 'Lights Off'",
+    "turn on lights": "shortcuts run 'Lights On'",
+    "i'm leaving": "shortcuts run 'Leaving Home'",
+    "i'm home": "shortcuts run 'Arriving Home'",
+    "lock the door": "shortcuts run 'Lock Door'",
+    "night mode": "shortcuts run 'Night Mode'",
+}
+
+
+def log_workout(workout_type: str, duration: int = 0):
+    workouts = []
+    if WORKOUT_FILE.exists():
+        try:
+            workouts = json.loads(WORKOUT_FILE.read_text())
+        except Exception:
+            workouts = []
+    workouts.append({
+        "type": workout_type, "duration": duration,
+        "ts": datetime.datetime.now().isoformat(),
+    })
+    WORKOUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WORKOUT_FILE.write_text(json.dumps(workouts[-365:], indent=2))
 
 
 def get_tasks() -> list:
@@ -791,18 +831,29 @@ def command():
         # ── Caller intelligence ──────────────────────────────────────────────
         if any(t in p_lower for t in CALLER_TRIGGERS):
             import re
-            match = re.search(r"(?:call from|calling from|incoming call from)\s+(.+)", p_lower)
-            caller = match.group(1).strip() if match else ""
+            match = re.search(r"(?:call from|calling from|incoming call from)\s+(.+?)(?:\.|$)", p_lower)
+            caller = match.group(1).strip().title() if match else ""
 
-            if caller and relationships and friday_brain:
+            if not caller:
+                response = "Who's calling, boss?"
+                _log(prompt, response, "caller_id")
+                return jsonify({"response": response, "mode": "caller_id"})
+
+            if relationships and friday_brain:
                 intel = relationships.get_intel(caller)
+                days_since = intel.get("days_since", -1)
+                notes = intel.get("notes", [])
+                context = f"Days since last contact: {days_since}\n" if days_since >= 0 else ""
+                context += f"Notes: {notes[-1] if notes else 'None'}\n"
+                context += f"Brief: {intel.get('brief', '')}"
+
                 result = friday_brain.think(
-                    f"Caller ID: {caller}\n"
-                    f"Known info: {intel.get('brief', 'Unknown')}\n"
-                    f"Last contact: {intel.get('days_since', 'unknown')} days ago\n\n"
-                    f"Should boss answer? Brief. Under 15 words. FRIDAY style."
+                    f"Caller ID: {caller}\n{context}\n\n"
+                    f"FRIDAY caller announcement. Who they are, last contact if "
+                    f"known, answer or skip recommendation. Under 20 words. "
+                    f"Natural. FRIDAY style."
                 )
-                response = result["response"]
+                response = result["response"] or f"It's {caller}, boss."
                 _log(prompt, response, "caller_id")
                 if VOICE_OK:
                     friday_speak(response)
@@ -875,6 +926,25 @@ def command():
                 response = "What do you want to add, boss?"
             _log(prompt, response, "task_add")
             return jsonify({"response": response, "mode": "task_add"})
+
+        # ── Smart home via HomeKit (Shortcuts run on the Mac Bridge) ──────────
+        for trigger, shortcut in HOMEKIT_TRIGGERS.items():
+            if trigger in p_lower:
+                mac_url = os.environ.get("MAC_BRIDGE_URL", "")
+                if not mac_url:
+                    response = "Mac bridge isn't configured, boss."
+                else:
+                    try:
+                        import requests as req
+                        r = req.post(f"{mac_url}/mac/run",
+                                    json={"command": shortcut, "token": os.environ.get("MAC_BRIDGE_TOKEN", "")},
+                                    timeout=5)
+                        ok = r.status_code == 200 and not r.json().get("error")
+                        response = "Done, boss." if ok else "Couldn't reach the Mac bridge, boss."
+                    except Exception:
+                        response = "Couldn't reach the Mac bridge, boss."
+                _log(prompt, response, "homekit")
+                return jsonify({"response": response, "mode": "homekit"})
 
         # Proxy to JARVIS if online and not in coverage mode
         if JARVIS_ONLINE and not COVERAGE_MODE:
@@ -1341,6 +1411,59 @@ def friday_tasks_complete():
         return jsonify({"error": "id required"}), 400
     complete_task(int(task_id))
     return jsonify({"completed": True, "id": task_id})
+
+
+# ── Workouts / Bills ─────────────────────────────────────────────────────────
+
+@app.route("/friday/workout/log", methods=["POST"])
+def workout_log():
+    data = request.get_json(silent=True) or {}
+    log_workout(data.get("type", "workout"), data.get("duration", 0))
+    return jsonify({"logged": True})
+
+
+@app.route("/friday/workout/streak")
+def workout_streak():
+    if not WORKOUT_FILE.exists():
+        return jsonify({"streak": 0})
+    try:
+        workouts = json.loads(WORKOUT_FILE.read_text())
+    except Exception:
+        return jsonify({"streak": 0})
+
+    dates = sorted(set(w["ts"][:10] for w in workouts), reverse=True)
+    streak = 0
+    expected = datetime.datetime.now().date()
+    for date_str in dates:
+        date = datetime.datetime.fromisoformat(date_str).date()
+        if date >= expected - datetime.timedelta(days=1):
+            streak += 1
+            expected = date - datetime.timedelta(days=1)
+        else:
+            break
+    return jsonify({"streak": streak, "dates": dates[:7]})
+
+
+@app.route("/friday/bills/add", methods=["POST"])
+def add_bill():
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    bills = []
+    if BILLS_FILE.exists():
+        try:
+            bills = json.loads(BILLS_FILE.read_text())
+        except Exception:
+            bills = []
+    bills.append({
+        "name": name, "amount": data.get("amount", 0),
+        "due_day": data.get("due_day", 1),
+        "added": datetime.datetime.now().isoformat(),
+    })
+    BILLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    BILLS_FILE.write_text(json.dumps(bills, indent=2))
+    return jsonify({"added": True})
 
 
 # ── Military-grade systems (OODA, EMCON, scenario/Sokovia) ──────────────────────
