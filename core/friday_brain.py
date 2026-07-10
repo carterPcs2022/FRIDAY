@@ -19,6 +19,38 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GROQ_BASE = "https://api.groq.com/openai/v1"
 
+# Provider health, tracked from real chat calls instead of a separate
+# polling loop that hit GET .../v1/models every 30s regardless of actual
+# usage (core/friday_protocols.py's check_range() called it on every
+# JARVIS-monitor tick — 2 extra API calls every 30s, forever, burning
+# quota independent of whether FRIDAY was even being used). Updated
+# in-place from _call_groq()/_call_anthropic() below.
+_HEALTH_FRESH_SECONDS = 300
+_last_groq_success = 0.0
+_last_groq_failure = 0.0
+_last_anthropic_success = 0.0
+_last_anthropic_failure = 0.0
+
+
+def is_groq_healthy() -> bool:
+    """True if the most recent real call succeeded more recently than the
+    most recent real failure, OR nothing's been tried recently either way
+    (idle isn't the same as down — defaulting to "assume down" here would
+    mean every quiet period looks like an outage)."""
+    if not GROQ_API_KEY:
+        return False
+    if _last_groq_failure > _last_groq_success:
+        return time.time() - _last_groq_failure > _HEALTH_FRESH_SECONDS
+    return True
+
+
+def is_anthropic_healthy() -> bool:
+    if not ANTHROPIC_KEY:
+        return False
+    if _last_anthropic_failure > _last_anthropic_success:
+        return time.time() - _last_anthropic_failure > _HEALTH_FRESH_SECONDS
+    return True
+
 # Module-level pooled client, reused across every _call_groq() instead of
 # a fresh httpx.post() (and its own TCP+TLS handshake) per call — saves
 # 200-500ms per request via keep-alive connection reuse.
@@ -207,15 +239,20 @@ class FridayBrain:
                 # immediately instead of blocking the request for 10s first
                 # (same fix as JARVIS's core/llm/openai.py — a reactive
                 # sleep-after-429 just delays the fallback that's already
-                # about to happen).
+                # about to happen). Not a health failure — Groq is reachable
+                # and working, just rate-limited right now.
                 print("[FRIDAY] Groq rate limited — falling back immediately")
                 return None
             r.raise_for_status()
             self._call_times.append(time.time())
             content = r.json()["choices"][0]["message"]["content"]
+            global _last_groq_success
+            _last_groq_success = time.time()
             return {"content": content, "model": model, "provider": "groq"}
         except Exception as e:
             print(f"[FRIDAY] Groq error: {e}")
+            global _last_groq_failure
+            _last_groq_failure = time.time()
             return None
 
     def _call_anthropic(self, messages: list, system: str, model: str) -> dict | None:
@@ -231,9 +268,13 @@ class FridayBrain:
             client = Anthropic(api_key=ANTHROPIC_KEY)
             r = client.messages.create(model=model, max_tokens=256, system=system, messages=messages)
             budget.record_call(r.usage.output_tokens, model)
+            global _last_anthropic_success
+            _last_anthropic_success = time.time()
             return {"content": r.content[0].text, "model": model, "provider": "anthropic"}
         except Exception as e:
             print(f"[FRIDAY] Anthropic error: {e}")
+            global _last_anthropic_failure
+            _last_anthropic_failure = time.time()
             return None
 
     # ── Helpers ───────────────────────────────────────────────────────────────

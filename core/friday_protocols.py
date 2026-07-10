@@ -24,8 +24,6 @@ from enum import Enum
 
 import httpx
 
-from core.friday_brain import GROQ_API_KEY, ANTHROPIC_KEY
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Same handful of files JARVIS watches for Protocol 11, scoped to what
@@ -354,28 +352,19 @@ class FridayProtocols:
         }
 
     def _check_groq(self) -> bool:
-        if not GROQ_API_KEY:
-            return False
-        try:
-            r = httpx.get(
-                "https://api.groq.com/openai/v1/models",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=3,
-            )
-            return r.status_code == 200
-        except Exception:
-            return False
+        # Previously a live GET to .../v1/models on every check_range() call
+        # (every 30s from server.py's JARVIS monitor loop, forever) — real
+        # API traffic that had nothing to do with whether FRIDAY was
+        # actually being used, and it was burning Groq's rate limit on its
+        # own. FRIDAY already learns whether Groq/Anthropic are working
+        # from every real chat call; reusing that instead of polling
+        # separately.
+        from core.friday_brain import is_groq_healthy
+        return is_groq_healthy()
 
     def _check_anthropic(self) -> bool:
-        if not ANTHROPIC_KEY:
-            return False
-        try:
-            r = httpx.get(
-                "https://api.anthropic.com/v1/models",
-                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"}, timeout=3,
-            )
-            return r.status_code == 200
-        except Exception:
-            return False
+        from core.friday_brain import is_anthropic_healthy
+        return is_anthropic_healthy()
 
     def _log_event(self, entry: dict):
         entry["ts"] = datetime.now().isoformat()
