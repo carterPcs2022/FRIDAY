@@ -215,6 +215,12 @@ except Exception as e:
     logging.warning(f"Journal failed: {e}")
 
 try:
+    from services.friday_calendar import friday_calendar
+except Exception as e:
+    friday_calendar = None
+    logging.warning(f"Calendar failed: {e}")
+
+try:
     from services.friday_security import friday_security
     SECURITY_OK = True
 except Exception as e:
@@ -345,8 +351,15 @@ def _combined_morning_brief() -> str:
         if voice_memory:
             energy[0] = voice_memory.predict_energy_now()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(f) for f in (_news, _people, _brain, _email, _energy)]
+    todays_events = []
+
+    def _calendar():
+        nonlocal todays_events
+        if friday_calendar and friday_calendar.is_connected():
+            todays_events = friday_calendar.get_today()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(f) for f in (_news, _people, _brain, _email, _energy, _calendar)]
         concurrent.futures.wait(futures, timeout=25)
 
     combined = "\n".join(f"- {v}" for v in parts.values() if v)
@@ -355,15 +368,20 @@ def _combined_morning_brief() -> str:
     pending_tasks = [t for t in get_tasks() if not t.get("done")]
     recent_notes = get_notes(3)
     email_note = f"{len(urgent_emails)} urgent emails need attention." if urgent_emails else ""
+    calendar_note = (
+        f"Today's calendar: {', '.join(e['title'] for e in todays_events[:5])}"
+        if todays_events else ""
+    )
 
     extra = (
         f"Pending tasks: {len(pending_tasks)}\n"
         f"Recent notes: {[n['content'][:50] for n in recent_notes]}\n"
         f"{email_note}\n"
+        f"{calendar_note}\n"
         f"{energy[0]}\n"
     )
 
-    if not combined and not pending_tasks and not recent_notes and not urgent_emails:
+    if not combined and not pending_tasks and not recent_notes and not urgent_emails and not todays_events:
         return ""
     if not friday_brain:
         return combined
@@ -547,6 +565,12 @@ TRAVEL_TRIGGERS = [
 
 SPOTIFY_STOP_TRIGGERS = ["stop playing", "pause", "stop music", "no play"]
 SPOTIFY_PLAY_TRIGGERS = ["play ", "now play", "put on", "friday play"]
+
+CALENDAR_ADD_TRIGGERS = [
+    "add to my calendar", "put on my calendar",
+    "schedule a meeting", "add an event",
+    "create an event", "book a meeting",
+]
 
 NOTE_TRIGGERS = [
     "note that", "make a note",
@@ -1239,6 +1263,36 @@ def command():
                 _log(prompt, response, "spotify")
                 return jsonify({"response": response, "mode": "spotify"})
 
+        # ── Calendar: create an event ─────────────────────────────────────────
+        if any(t in p_lower for t in CALENDAR_ADD_TRIGGERS) and friday_brain:
+            if not (friday_calendar and friday_calendar.is_connected()):
+                response = "Your calendar isn't connected yet, boss."
+                _log(prompt, response, "calendar")
+                return jsonify({"response": response, "mode": "calendar"})
+
+            import re as rex
+            result = friday_brain.think(
+                f"Extract a calendar event from: {prompt}\n"
+                f"Current time: {datetime.datetime.now().isoformat()}\n\n"
+                f'Reply as JSON: {{"title": str, "start": "ISO 8601 datetime", '
+                f'"end": "ISO 8601 datetime"}}\n'
+                f"If no duration is given, default to 30 minutes. JSON only."
+            )
+            try:
+                clean = rex.sub(r"```json|```", "", result["response"]).strip()
+                data = json.loads(clean)
+                created = friday_calendar.create_event(
+                    data.get("title", "Event"), data["start"], data["end"]
+                )
+                if created.get("ok"):
+                    response = f"Added \"{data.get('title', 'Event')}\" to your calendar, boss."
+                else:
+                    response = created.get("error", "Couldn't add that to your calendar, boss.")
+            except Exception:
+                response = "Wasn't sure what to schedule there, boss — try again with a time?"
+            _log(prompt, response, "calendar")
+            return jsonify({"response": response, "mode": "calendar"})
+
         # ── Email ─────────────────────────────────────────────────────────────
         if any(t in p_lower for t in EMAIL_TRIGGERS) and friday_gmail:
             summary = friday_gmail.summarize_inbox()
@@ -1912,6 +1966,43 @@ def spotify_callback():
     if result.get("ok"):
         return "Spotify connected. You can close this tab, boss."
     return jsonify(result), 400
+
+
+# ── Calendar ─────────────────────────────────────────────────────────────────
+
+@app.route("/friday/calendar/auth")
+def calendar_auth():
+    if not friday_calendar or not friday_calendar.is_configured():
+        return "Calendar not configured", 500
+    return redirect(friday_calendar.auth_url())
+
+
+@app.route("/friday/calendar/callback")
+def calendar_callback():
+    if not friday_calendar:
+        return "Calendar not configured", 500
+    code = request.args.get("code", "")
+    if not code:
+        return jsonify({"error": request.args.get("error", "No code provided")}), 400
+    result = friday_calendar.exchange_code(code)
+    if result.get("ok"):
+        return "Calendar connected. You can close this tab, boss."
+    return jsonify(result), 400
+
+
+@app.route("/friday/calendar/today")
+def calendar_today():
+    if not friday_calendar:
+        return jsonify({"events": []})
+    return jsonify({"events": friday_calendar.get_today()})
+
+
+@app.route("/friday/calendar/upcoming")
+def calendar_upcoming():
+    if not friday_calendar:
+        return jsonify({"events": []})
+    hours = request.args.get("hours", 24, type=int)
+    return jsonify({"events": friday_calendar.get_upcoming(hours)})
 
 
 # ── Habits / Journal / Focus ─────────────────────────────────────────────────

@@ -204,11 +204,21 @@ class FridayBrain:
             return "Morning, boss. Ready when you are."
         if "good night" in q:
             return "Night, boss. I'll keep watch."
-        # FRIDAY has no calendar integration of her own — without this
-        # guard a calendar question just goes to the LLM, which has no
-        # way to know that and may invent plausible-sounding events.
+        # Without this guard a calendar question just goes to the LLM,
+        # which has no way to know whether a calendar is connected and
+        # may invent plausible-sounding events.
         if any(t in q for t in ["my calendar", "on my schedule", "any meetings",
                                 "any events", "what's on my agenda"]):
+            try:
+                from services.friday_calendar import friday_calendar
+                if friday_calendar.is_connected():
+                    events = friday_calendar.get_today()
+                    if not events:
+                        return "Nothing on your calendar today, boss."
+                    names = ", ".join(e["title"] for e in events[:5])
+                    return f"You've got {len(events)} today: {names}."
+            except Exception:
+                pass
             return "Your calendar isn't connected yet, boss."
 
         return None

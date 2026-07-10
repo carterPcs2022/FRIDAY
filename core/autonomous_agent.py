@@ -5,7 +5,7 @@ within an hour."""
 import os
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TASK_FILE = Path("memory/friday_tasks.json")
@@ -320,11 +320,55 @@ class AutonomousAgent:
 
     # ── Meeting prep ─────────────────────────────────────────────────────────
     def _meeting_prep(self):
-        """No calendar integration yet, so this works off the task list —
-        any pending task that reads like a meeting gets a brief. Real
-        time-before-meeting alerting needs Google Calendar wired in;
-        _alert()'s own hour-based dedup keeps this from repeating more
-        than once an hour in the meantime."""
+        """Real calendar-based prep when Google Calendar is connected —
+        briefs on anything starting within 30 minutes, deduped per event
+        (not just per message) so a 5-minute poll interval doesn't refire
+        for the same meeting repeatedly during its prep window. Falls
+        back to guessing off the task list when there's no calendar."""
+        try:
+            from services.friday_calendar import friday_calendar
+            if friday_calendar and friday_calendar.is_connected():
+                self._meeting_prep_from_calendar(friday_calendar)
+                return
+        except Exception:
+            pass
+        self._meeting_prep_from_tasks()
+
+    def _meeting_prep_from_calendar(self, friday_calendar):
+        upcoming = friday_calendar.get_upcoming(hours=1)
+        now = datetime.now(timezone.utc)
+        for event in upcoming:
+            start_raw = event.get("start", "")
+            if not start_raw:
+                continue
+            try:
+                start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            minutes_until = (start - now).total_seconds() / 60
+            if not (0 <= minutes_until <= 30):
+                continue
+
+            key = f"meeting_prep_{event.get('id', event.get('title', ''))}"
+            flag = Path(f"logs/.{key}")
+            if flag.exists():
+                continue
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.touch()
+
+            from core.friday_brain import friday_brain
+            result = friday_brain.think(
+                f"Pre-meeting brief for: {event.get('title', 'meeting')}\n"
+                f"Starting in {int(minutes_until)} minutes.\n\n"
+                f"What should boss know going in? Under 20 words. FRIDAY briefing style."
+            )
+            if result.get("response"):
+                self._alert(result["response"], title="FRIDAY — Meeting Prep", priority="normal")
+
+    def _meeting_prep_from_tasks(self):
+        """No calendar connected — best-effort guess off the task list.
+        _alert()'s hour-based dedup keeps this from repeating more than
+        once an hour."""
         try:
             import json
             if not TASK_FILE.exists():
