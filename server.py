@@ -1781,6 +1781,11 @@ function playAudio(file) {
   if (currentAudio) { currentAudio.pause(); currentAudio = null; }
   const url = `${BASE}/friday/voice/audio?file=${encodeURIComponent(file)}&t=${Date.now()}`;
   currentAudio = new Audio(url);
+  // Same page as the arc reactor canvas, so no server round-trip needed —
+  // these real play/ended/pause events are the reactor's actual signal.
+  currentAudio.addEventListener('play', () => { if (window.onFridaySpeak) window.onFridaySpeak(); });
+  currentAudio.addEventListener('ended', () => { if (window.onFridayDone) window.onFridayDone(); });
+  currentAudio.addEventListener('pause', () => { if (window.onFridayDone) window.onFridayDone(); });
   currentAudio.play().catch(() => {});
 }
 
@@ -1890,49 +1895,71 @@ document.addEventListener('keydown', e => {
   if (e.ctrlKey && e.key === '/') { document.getElementById('chat-inp').focus(); e.preventDefault(); }
 });
 
-// FRIDAY arc reactor (blue tinted)
+// FRIDAY arc reactor (blue tinted) — voice-reactive: surges when she
+// speaks. window.onFridaySpeak/onFridayDone are called from playAudio()'s
+// real Audio play/ended/pause listeners above, same page, no server
+// round-trip needed (unlike JARVIS's globe, FRIDAY's HUD has no separate
+// page that needs cross-window sync).
 (function() {
   const c   = document.getElementById('friday-arc');
   if (!c) return;
   const ctx = c.getContext('2d');
   const W = 32, H = 32, CX = 16, CY = 16;
   let t = 0;
+  let speakIntensity = 0;
+  let speaking = false;
+
+  window.onFridaySpeak = function() {
+    speaking = true;
+    speakIntensity = 0;
+  };
+  window.onFridayDone = function() {
+    speaking = false;
+  };
 
   function drawFriday() {
     ctx.clearRect(0, 0, W, H);
-    const glow = 0.5 + Math.sin(t * 2) * 0.3;
 
-    // Blue tinted for FRIDAY
+    if (speaking) speakIntensity = Math.min(1, speakIntensity + 0.08);
+    else          speakIntensity = Math.max(0, speakIntensity - 0.04);
+
+    const glow  = 0.5 + Math.sin(t * 2) * 0.3 + speakIntensity * 0.5;
+    const speed = 1 + speakIntensity * 4;
+
+    // Outer ring
     ctx.beginPath();
     ctx.arc(CX, CY, 14, 0, Math.PI * 2);
     ctx.strokeStyle = `rgba(72,202,228,${glow * 0.8})`;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth   = speaking ? 2 : 1.5;
+    ctx.shadowColor = '#00b4d8';
+    ctx.shadowBlur  = speaking ? 8 * speakIntensity : 0;
     ctx.stroke();
+    ctx.shadowBlur  = 0;
 
     ctx.save();
     ctx.translate(CX, CY);
-    ctx.rotate(t * 0.5);
+    ctx.rotate(t * 0.5 * speed);
     for (let i = 0; i < 6; i++) {
       const a1 = (i/6)*Math.PI*2;
-      const a2 = a1 + Math.PI/6*0.7;
+      const a2 = a1 + Math.PI/6*(0.7 + speakIntensity*0.3);
       ctx.beginPath();
       ctx.arc(0, 0, 10, a1, a2);
       ctx.strokeStyle = `rgba(0,180,216,${glow*0.7})`;
-      ctx.lineWidth = 2;
+      ctx.lineWidth   = 2 + speakIntensity * 1.5;
       ctx.stroke();
     }
     ctx.restore();
 
     ctx.save();
     ctx.translate(CX, CY);
-    ctx.rotate(-t * 0.8);
+    ctx.rotate(-t * 0.8 * speed);
     for (let i = 0; i < 4; i++) {
       const a1 = (i/4)*Math.PI*2;
-      const a2 = a1 + Math.PI/4*0.6;
+      const a2 = a1 + Math.PI/4*(0.6 + speakIntensity*0.4);
       ctx.beginPath();
       ctx.arc(0, 0, 7, a1, a2);
       ctx.strokeStyle = `rgba(0,150,199,${glow*0.6})`;
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth   = 1.5 + speakIntensity;
       ctx.stroke();
     }
     ctx.restore();
@@ -1940,7 +1967,9 @@ document.addEventListener('keydown', e => {
     // Blue triangle core
     ctx.save();
     ctx.translate(CX, CY);
-    ctx.rotate(t * 0.1);
+    ctx.rotate(t * 0.1 * speed);
+    const ts = 1 + speakIntensity * 0.3;
+    ctx.scale(ts, ts);
     ctx.beginPath();
     for (let i = 0; i < 3; i++) {
       const angle = (i/3)*Math.PI*2 - Math.PI/6;
@@ -1951,18 +1980,32 @@ document.addEventListener('keydown', e => {
     }
     ctx.closePath();
     ctx.strokeStyle = `rgba(144,224,239,${glow*0.9})`;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth   = 1.5 + speakIntensity;
+    ctx.shadowColor = '#48cae4';
+    ctx.shadowBlur  = speakIntensity * 6;
     ctx.stroke();
+    ctx.shadowBlur  = 0;
     ctx.restore();
 
     // Blue center glow
-    const cg = ctx.createRadialGradient(CX,CY,0,CX,CY,4);
+    const sz = 4 + speakIntensity * 3;
+    const cg = ctx.createRadialGradient(CX,CY,0,CX,CY,sz);
     cg.addColorStop(0, `rgba(200,240,255,${glow})`);
+    cg.addColorStop(0.5, `rgba(72,202,228,${glow*0.6})`);
     cg.addColorStop(1, 'rgba(0,168,255,0)');
     ctx.beginPath();
-    ctx.arc(CX, CY, 4, 0, Math.PI*2);
+    ctx.arc(CX, CY, sz, 0, Math.PI*2);
     ctx.fillStyle = cg;
     ctx.fill();
+
+    // Pulse ring while speaking
+    if (speaking && Math.sin(t * 8) > 0.7) {
+      ctx.beginPath();
+      ctx.arc(CX, CY, 14 + speakIntensity * 4, 0, Math.PI*2);
+      ctx.strokeStyle = `rgba(72,202,228,${speakIntensity * 0.3})`;
+      ctx.lineWidth   = 1;
+      ctx.stroke();
+    }
 
     t += 0.015;
     requestAnimationFrame(drawFriday);
