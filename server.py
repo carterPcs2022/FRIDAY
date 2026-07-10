@@ -2943,10 +2943,10 @@ function addMsg(type, label, text, meta = {}) {
   const wrap = document.createElement('div');
   wrap.className = `msg-wrap ${type}`;
   const clean = escapeHtml(text)
-    .replace(/\[Confidence:\s*\d+%\]/gi, '')
+    .replace(/\\[Confidence:\\s*\\d+%\\]/gi, '')
     .replace(/_FYI:.*?_/gi, '')
-    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.*?)\*/g, '<em>$1</em>');
+    .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
+    .replace(/\\*(.*?)\\*/g, '<em>$1</em>');
   let metaHtml = '';
   if (meta.model || meta.ms) {
     metaHtml = `<div class="msg-meta">

@@ -17,6 +17,11 @@ class AutonomousAgent:
     def __init__(self):
         self._running = False
         self._actions_taken = []
+        # 10 independent monitor threads all call _alert() on their own
+        # schedules and can genuinely overlap in real time — without this,
+        # two concurrent alerts racing on the read-slice-reassign below
+        # could silently drop one's dedup entry.
+        self._actions_lock = threading.Lock()
 
     def start(self):
         """Start all autonomous monitors."""
@@ -452,17 +457,21 @@ class AutonomousAgent:
         except Exception:
             pass
 
-        # Dedupe — don't repeat same alert within the hour.
+        # Dedupe — don't repeat same alert within the hour. Check-then-
+        # record has to be one atomic step: two monitor threads racing
+        # through this with only the append protected (not the check)
+        # could both pass the dedup test for the same message and both
+        # alert.
         msg_key = message[:50]
-        recent = [
-            a for a in self._actions_taken
-            if a.get("msg", "")[:50] == msg_key and time.time() - a.get("ts", 0) < 3600
-        ]
-        if recent:
-            return
-
-        self._actions_taken.append({"msg": message, "ts": time.time()})
-        self._actions_taken = self._actions_taken[-100:]
+        with self._actions_lock:
+            recent = [
+                a for a in self._actions_taken
+                if a.get("msg", "")[:50] == msg_key and time.time() - a.get("ts", 0) < 3600
+            ]
+            if recent:
+                return
+            self._actions_taken.append({"msg": message, "ts": time.time()})
+            self._actions_taken = self._actions_taken[-100:]
 
         print(f"[FRIDAY Autonomous] {title}: {message}")
 

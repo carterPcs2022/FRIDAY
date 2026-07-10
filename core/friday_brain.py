@@ -12,6 +12,7 @@ Model cascade:
 import os
 import time
 import re
+import threading
 import httpx
 from datetime import datetime
 
@@ -84,6 +85,13 @@ class FridayBrain:
         self.voice_mode = "normal"
         self._response_cache: dict = {}
         self._call_times: list = []
+        # friday_brain is a shared singleton — the main request thread and
+        # several core/autonomous_agent.py background monitors (news_spike,
+        # sunday_brief, meeting_prep, emotional_check, goal_nudge) all call
+        # think() -> _call_groq() concurrently, so this rate-limit
+        # bookkeeping list needs protecting from the same read-modify-write
+        # race as autonomous_agent.py's _actions_taken.
+        self._call_times_lock = threading.Lock()
 
     # ── Query classification ─────────────────────────────────────────────────
 
@@ -230,8 +238,10 @@ class FridayBrain:
             return None
 
         now = time.time()
-        self._call_times = [t for t in self._call_times if now - t < 60]
-        if len(self._call_times) >= 28:
+        with self._call_times_lock:
+            self._call_times = [t for t in self._call_times if now - t < 60]
+            over_limit = len(self._call_times) >= 28
+        if over_limit:
             time.sleep(5)
 
         try:
