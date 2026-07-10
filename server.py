@@ -19,6 +19,7 @@ def health():
 
 
 import os
+import json
 import datetime
 import logging
 import threading
@@ -307,15 +308,25 @@ def _combined_morning_brief() -> str:
         concurrent.futures.wait(futures, timeout=25)
 
     combined = "\n".join(f"- {v}" for v in parts.values() if v)
-    if not combined:
+
+    from core.friday_memory import get_notes
+    pending_tasks = [t for t in get_tasks() if not t.get("done")]
+    recent_notes = get_notes(3)
+
+    extra = (
+        f"Pending tasks: {len(pending_tasks)}\n"
+        f"Recent notes: {[n['content'][:50] for n in recent_notes]}\n"
+    )
+
+    if not combined and not pending_tasks and not recent_notes:
         return ""
     if not friday_brain:
         return combined
 
     result = friday_brain.think(
-        f"Combine these into one morning brief for the boss:\n{combined}\n\n"
-        f"News, relationships needing attention, and anything relevant from "
-        f"stored knowledge. One flowing brief, not separate sections. "
+        f"Combine these into one morning brief for the boss:\n{combined}\n{extra}\n\n"
+        f"News, relationships needing attention, tasks, and anything relevant "
+        f"from stored knowledge. One flowing brief, not separate sections. "
         f"Under 80 words. FRIDAY style."
     )
     return result["response"]
@@ -373,6 +384,92 @@ def _push(title: str, message: str, priority: int = 0):
         }, timeout=5)
     except Exception:
         pass
+
+
+# ── Assistant features: caller ID, notes, reminders, tasks ───────────────────
+
+CALLER_TRIGGERS = [
+    "incoming call from",
+    "calling from",
+    "who is calling",
+    "who is this calling",
+]
+
+NOTE_TRIGGERS = [
+    "note that", "make a note",
+    "write that down", "remember that",
+    "add to notes", "friday note",
+    "jot that down",
+]
+
+REMINDER_TRIGGERS = [
+    "remind me", "set a reminder",
+    "don't let me forget", "alert me",
+    "notify me",
+]
+
+# "need to" dropped from the source spec's list — it's broad enough to
+# match a large share of ordinary conversation ("I need to know...", "you
+# need to check...") and would silently misfile those as new tasks rather
+# than answering the actual question. The rest are specific enough that
+# false positives are rare.
+TASK_ADD_TRIGGERS = [
+    "add to my list", "add task",
+    "todo:", "to do:",
+    "don't forget to", "put on my list",
+]
+
+TASK_SHOW_TRIGGERS = [
+    "what's on my list", "show my tasks",
+    "what do i need to do", "my todo",
+    "pending tasks", "what's pending",
+]
+
+TASK_FILE = Path("memory/friday_tasks.json")
+
+
+def get_tasks() -> list:
+    if TASK_FILE.exists():
+        try:
+            return json.loads(TASK_FILE.read_text())
+        except Exception:
+            return []
+    return []
+
+
+def add_task(task: str, priority: str = "normal") -> dict:
+    tasks = get_tasks()
+    new_task = {
+        "id": len(tasks) + 1, "task": task, "priority": priority,
+        "done": False, "added": datetime.datetime.now().isoformat(),
+    }
+    tasks.append(new_task)
+    TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TASK_FILE.write_text(json.dumps(tasks, indent=2))
+    return new_task
+
+
+def complete_task(task_id: int):
+    tasks = get_tasks()
+    for t in tasks:
+        if t.get("id") == task_id:
+            t["done"] = True
+            t["completed"] = datetime.datetime.now().isoformat()
+    TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TASK_FILE.write_text(json.dumps(tasks, indent=2))
+
+
+def add_reminder(text: str, minutes: int):
+    """Fires _push() (the same real Pushover helper everything else in
+    this file uses) after the given delay, plus a voice announcement."""
+    def _fire():
+        import time
+        time.sleep(minutes * 60)
+        if VOICE_OK:
+            friday_speak(f"Boss — reminder: {text}")
+        _log("FRIDAY", f"Reminder: {text}", "reminder")
+        _push("FRIDAY Reminder", text)
+    threading.Thread(target=_fire, daemon=True).start()
 
 
 def _proactive_checkin():
@@ -690,6 +787,94 @@ def command():
             response = result.get("brief") or f"No intel on {name} yet, boss."
             _log(prompt, response, "intel")
             return jsonify({"response": response, "mode": "intel"})
+
+        # ── Caller intelligence ──────────────────────────────────────────────
+        if any(t in p_lower for t in CALLER_TRIGGERS):
+            import re
+            match = re.search(r"(?:call from|calling from|incoming call from)\s+(.+)", p_lower)
+            caller = match.group(1).strip() if match else ""
+
+            if caller and relationships and friday_brain:
+                intel = relationships.get_intel(caller)
+                result = friday_brain.think(
+                    f"Caller ID: {caller}\n"
+                    f"Known info: {intel.get('brief', 'Unknown')}\n"
+                    f"Last contact: {intel.get('days_since', 'unknown')} days ago\n\n"
+                    f"Should boss answer? Brief. Under 15 words. FRIDAY style."
+                )
+                response = result["response"]
+                _log(prompt, response, "caller_id")
+                if VOICE_OK:
+                    friday_speak(response)
+                return jsonify({"response": response, "caller": caller, "mode": "caller_id"})
+
+        # ── Note that ─────────────────────────────────────────────────────────
+        if any(t in p_lower for t in NOTE_TRIGGERS):
+            from core.friday_memory import save_note, get_recent_turns
+            turns = get_recent_turns(2)
+            note = {
+                "ts": datetime.datetime.now().isoformat(),
+                "content": turns[-1].get("friday", "") if turns else prompt,
+                "context": prompt,
+            }
+            save_note(note)
+            response = "Noted, boss."
+            _log(prompt, response, "note")
+            return jsonify({"response": response, "mode": "note"})
+
+        # ── Reminders ─────────────────────────────────────────────────────────
+        if any(t in p_lower for t in REMINDER_TRIGGERS) and friday_brain:
+            import re as rex
+            result = friday_brain.think(
+                f"Extract reminder from: {prompt}\n\n"
+                f"Reply as JSON: {{\"task\": str, \"minutes\": int}}\n"
+                f"Examples:\n"
+                f"'remind me in 30 minutes to call back' -> {{\"task\":\"call back\",\"minutes\":30}}\n"
+                f"'remind me at 3pm' -> {{\"task\":\"reminder\",\"minutes\": calculated from now}}\n"
+                f"JSON only."
+            )["response"]
+            try:
+                clean = rex.sub(r"```json|```", "", result).strip()
+                data = json.loads(clean)
+                task = data.get("task", "reminder")
+                mins = int(data.get("minutes", 5))
+                add_reminder(task, mins)
+                response = f"Reminder set for {mins} minutes, boss. I'll let you know."
+            except Exception:
+                response = "What do you need reminding about, boss?"
+            _log(prompt, response, "reminder")
+            return jsonify({"response": response, "mode": "reminder"})
+
+        # ── Task list ─────────────────────────────────────────────────────────
+        if any(t in p_lower for t in TASK_SHOW_TRIGGERS):
+            tasks = [t for t in get_tasks() if not t.get("done")]
+            if not tasks:
+                response = "Nothing on the list, boss. Clear schedule."
+            elif friday_brain:
+                result = friday_brain.think(
+                    f"Task list summary:\n"
+                    + "\n".join(f"- {t['task']}" for t in tasks[:10])
+                    + "\n\nBrief summary. What needs attention first. Under 40 words."
+                )
+                response = result["response"]
+            else:
+                response = f"{len(tasks)} things on your list, boss."
+            _log(prompt, response, "tasks")
+            return jsonify({"response": response, "mode": "tasks"})
+
+        if any(t in p_lower for t in TASK_ADD_TRIGGERS) and friday_brain:
+            result = friday_brain.think(
+                f"Extract task from: {prompt}\n"
+                f"Reply with just the task. No extra text."
+            )["response"]
+            task = result.strip()
+            if task:
+                add_task(task)
+                response = f"Added to your list, boss: {task}"
+            else:
+                response = "What do you want to add, boss?"
+            _log(prompt, response, "task_add")
+            return jsonify({"response": response, "mode": "task_add"})
 
         # Proxy to JARVIS if online and not in coverage mode
         if JARVIS_ONLINE and not COVERAGE_MODE:
@@ -1124,6 +1309,38 @@ def voice_weekly():
     if not voice_memory:
         return jsonify({"report": ""})
     return jsonify({"report": voice_memory.weekly_report()})
+
+
+# ── Notes / Tasks ────────────────────────────────────────────────────────────
+
+@app.route("/friday/notes")
+def friday_notes():
+    from core.friday_memory import get_notes
+    return jsonify({"notes": get_notes()})
+
+
+@app.route("/friday/tasks")
+def friday_tasks():
+    return jsonify({"tasks": get_tasks()})
+
+
+@app.route("/friday/tasks/add", methods=["POST"])
+def friday_tasks_add():
+    data = request.get_json(silent=True) or {}
+    task = data.get("task", "").strip()
+    if not task:
+        return jsonify({"error": "task required"}), 400
+    return jsonify(add_task(task, data.get("priority", "normal")))
+
+
+@app.route("/friday/tasks/complete", methods=["POST"])
+def friday_tasks_complete():
+    data = request.get_json(silent=True) or {}
+    task_id = data.get("id")
+    if task_id is None:
+        return jsonify({"error": "id required"}), 400
+    complete_task(int(task_id))
+    return jsonify({"completed": True, "id": task_id})
 
 
 # ── Military-grade systems (OODA, EMCON, scenario/Sokovia) ──────────────────────

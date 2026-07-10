@@ -14,6 +14,7 @@ CONVO_FILE = MEMORY_DIR / "conversations.json"
 EMOTIONAL_FILE = MEMORY_DIR / "emotional_log.json"
 PROFILE_FILE = MEMORY_DIR / "profile.json"
 PERSONAL_FILE = MEMORY_DIR / "friday_personal.json"
+NOTES_FILE = MEMORY_DIR / "friday_notes.json"
 
 
 _DICT_FILES = (PROFILE_FILE, PERSONAL_FILE)
@@ -167,3 +168,21 @@ def friday_recall(key: str) -> str | None:
         return None
     entry = data.get(key)
     return entry.get("value") if entry else None
+
+
+# ── Notes ("note that") ──────────────────────────────────────────────────────
+
+def save_note(note: dict):
+    notes = _load(NOTES_FILE)
+    if not isinstance(notes, list):
+        notes = []
+    notes.append(note)
+    notes = notes[-500:]
+    _save(NOTES_FILE, notes)
+
+
+def get_notes(limit: int = 10) -> list:
+    notes = _load(NOTES_FILE)
+    if not isinstance(notes, list):
+        return []
+    return notes[-limit:]
