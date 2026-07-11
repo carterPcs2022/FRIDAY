@@ -11,11 +11,29 @@ import json
 import base64
 import httpx
 from pathlib import Path
+from urllib.parse import urlencode
 
 SPOTIFY_TOKEN_FILE = Path("memory/friday_spotify_token.json")
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "")
+
+# Debug visibility into what actually loaded on this deploy — CLIENT_ID/
+# REDIRECT_URI printed in full since neither is secret (redirect_uri is
+# public in the auth URL itself, client_id is meant to be public per
+# OAuth's own model), CLIENT_SECRET masked to length + first/last char
+# only, enough to confirm "yes something non-empty loaded" without
+# putting the actual secret in Render's log output.
+_secret_display = (
+    f"{CLIENT_SECRET[0]}...{CLIENT_SECRET[-1]} (len {len(CLIENT_SECRET)})"
+    if CLIENT_SECRET else "(empty)"
+)
+print(
+    f"[FRIDAY Spotify] Loaded config — "
+    f"CLIENT_ID={CLIENT_ID or '(empty)'} "
+    f"CLIENT_SECRET={_secret_display} "
+    f"REDIRECT_URI={REDIRECT_URI or '(empty)'}"
+)
 
 
 class FridaySpotify:
@@ -178,14 +196,20 @@ class FridaySpotify:
             return {"error": str(e)}
 
     def auth_url(self) -> str:
+        # Previously built with raw f-string concatenation — the literal
+        # space in scope ("...state user-modify...") was going out
+        # unencoded in the query string, which is malformed per RFC 3986.
+        # urlencode() percent-encodes every value (spaces -> %20, etc.)
+        # the way Spotify's authorize endpoint actually expects.
         scope = "user-read-playback-state user-modify-playback-state"
-        return (
-            f"https://accounts.spotify.com/authorize"
-            f"?client_id={CLIENT_ID}"
-            f"&response_type=code"
-            f"&redirect_uri={REDIRECT_URI}"
-            f"&scope={scope}"
-        )
+        params = urlencode({
+            "client_id": CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": scope,
+        })
+        print(f"[FRIDAY Spotify] auth_url scope requested: {scope}")
+        return f"https://accounts.spotify.com/authorize?{params}"
 
 
 friday_spotify = FridaySpotify()
