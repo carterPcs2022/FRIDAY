@@ -2074,6 +2074,17 @@ def trust_status():
     return jsonify(training_wheels.status())
 
 
+@app.route("/friday/trust/set", methods=["POST"])
+def set_trust():
+    if not TRAINING_WHEELS_OK:
+        return jsonify({"error": "training wheels unavailable"}), 503
+    data = request.get_json() or {}
+    score = max(0, min(100, int(data.get("score", 50))))
+    training_wheels._data["trust"] = score
+    training_wheels._save()
+    return jsonify({"trust": score})
+
+
 # ── Health (Apple Watch) ───────────────────────────────────────────────────────
 
 @app.route("/friday/health/log", methods=["POST"])
