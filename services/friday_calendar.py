@@ -143,6 +143,10 @@ class FridayCalendar:
                 events.append({
                     "id": item.get("id", ""), "title": item.get("summary", "(no title)"),
                     "start": start, "location": item.get("location", ""),
+                    # Google's events.list already returns this on the raw
+                    # item when the event has invitees — just wasn't being
+                    # surfaced here before. Empty for solo blocked-off time.
+                    "attendees": item.get("attendees", []),
                 })
             return events
         except Exception as e:

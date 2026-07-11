@@ -123,10 +123,11 @@ except Exception as e:
     logging.warning(f"Veronica failed: {e}")
 
 try:
-    from core.friday_capabilities import CAPABILITY_MAP
+    from core.friday_capabilities import CAPABILITY_MAP, friday_caps
     CAPABILITIES_OK = True
 except Exception as e:
     CAPABILITY_MAP = {}
+    friday_caps = None
     CAPABILITIES_OK = False
     logging.warning(f"Capabilities failed: {e}")
 
@@ -232,6 +233,48 @@ except Exception as e:
     goals = None
     logging.warning(f"Goals failed: {e}")
 
+try:
+    from services.friday_vision import friday_vision
+except Exception as e:
+    friday_vision = None
+    logging.warning(f"Vision failed: {e}")
+
+try:
+    from services.friday_calibration import calibration
+except Exception as e:
+    calibration = None
+    logging.warning(f"Calibration failed: {e}")
+
+try:
+    from services.cross_check import cross_check
+except Exception as e:
+    cross_check = None
+    logging.warning(f"Cross-check failed: {e}")
+
+try:
+    from services.training_wheels import training_wheels
+    TRAINING_WHEELS_OK = True
+except Exception as e:
+    training_wheels = None
+    TRAINING_WHEELS_OK = False
+    logging.warning(f"Training wheels failed: {e}")
+
+try:
+    from services.recognizance import recognizance
+    RECON_OK = True
+except Exception as e:
+    recognizance = None
+    RECON_OK = False
+    logging.warning(f"Recognizance failed: {e}")
+
+try:
+    from services.checkin_system import checkin_system
+    CHECKIN_OK = True
+except Exception as e:
+    checkin_system = None
+    CHECKIN_OK = False
+    logging.warning(f"Check-in system failed: {e}")
+
 
 def _extract_topic(prompt: str) -> str:
     TOPIC_KEYWORDS = {
@@ -259,6 +302,12 @@ JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
 JARVIS_TOKEN = os.environ.get("JARVIS_API_TOKEN", "")
 JARVIS_ONLINE = False
 COVERAGE_MODE = False
+
+# ── Mayday ───────────────────────────────────────────────────────────────────
+# "House party" per the boss's ask — checked verbatim (no fuzzy match) so an
+# ordinary sentence that happens to mention a house party doesn't trip it.
+MAYDAY_PHRASE = os.environ.get("MAYDAY_PHRASE", "house party").lower()
+EMERGENCY_CONTACT_PHONE = os.environ.get("EMERGENCY_CONTACT_PHONE", "")
 
 
 def _monitor_jarvis():
@@ -683,6 +732,24 @@ TASK_SHOW_TRIGGERS = [
     "pending tasks", "what's pending",
 ]
 
+# Deliberately not "intel on"/"scan for" — those are CAPABILITY_MAP's
+# government_intel()/disaster_scan() (checked earlier in command()) and
+# would shadow this if reused here.
+RECON_TRIGGERS = [
+    "run recon on", "recon on", "run recognizance on",
+    "recognizance on", "scout ",
+]
+
+# "stand down" deliberately left out — NORMAL_MODE_TRIGGERS already owns
+# that phrase for voice-mode reset, and SAFE_TRIGGERS is checked earlier
+# in command() (right after Mayday), so reusing it here would shadow the
+# existing normal-mode behavior for anyone who says it outside an
+# emergency context.
+SAFE_TRIGGERS = [
+    "i'm safe", "i am safe", "all clear",
+    "confirm safe", "safe now", "false alarm",
+]
+
 TASK_FILE = Path("memory/friday_tasks.json")
 WORKOUT_FILE = Path("memory/friday_workouts.json")
 BILLS_FILE = Path("memory/friday_bills.json")
@@ -990,6 +1057,39 @@ def command():
         if not prompt:
             return jsonify({"response": "Say something, boss."})
 
+        # ── Mayday — no LLM call, responds immediately ────────────────────────
+        if MAYDAY_PHRASE in prompt.lower():
+            response = "Mayday received. What's happening, boss?"
+            _log(prompt, response, "MAYDAY")
+            if friday_caps:
+                friday_caps._pushover_alert(
+                    "FRIDAY MAYDAY",
+                    f"Mayday phrase triggered. Emergency contact on file: {EMERGENCY_CONTACT_PHONE}",
+                )
+            if CHECKIN_OK:
+                try:
+                    from services.checkin_system import emergency_pending
+                    emergency_pending.set()
+                except Exception:
+                    pass
+            audio_file = friday_speak(response) if VOICE_OK else None
+            return jsonify({
+                "response": response, "mode": "MAYDAY",
+                "has_audio": bool(audio_file), "audio_file": audio_file,
+            })
+
+        # ── Safe check-in — no LLM call, stands down any pending escalation.
+        # confirm_safe() already speaks its own line via friday_voice.speak()
+        # (same as autonomous_agent._alert()'s convention of speaking
+        # directly rather than through the HTTP response) so this doesn't
+        # also generate a second, redundant audio_file for the HUD to play. ─
+        if any(t in prompt.lower() for t in SAFE_TRIGGERS):
+            response = "Good to hear, boss. Standing down." if CHECKIN_OK else "Glad to hear it, boss."
+            if CHECKIN_OK:
+                checkin_system.confirm_safe()
+            _log(prompt, response, "safe_checkin")
+            return jsonify({"response": response, "mode": "safe_checkin"})
+
         if SECURITY_OK:
             screen = friday_security.screen_request(friday_security.client_ip(request), prompt)
             if screen.get("blocked"):
@@ -1251,8 +1351,66 @@ def command():
                 f"Be specific. Use numbers. FRIDAY tactical style."
             )
             response = result["response"]
+
+            # Track the call for later calibration checking — best-effort:
+            # a response that doesn't include a clean "X%" (rare, but the
+            # LLM occasionally hedges instead) just isn't logged rather
+            # than blocking the response on it.
+            if calibration:
+                try:
+                    import re
+                    pct_match = re.search(r"(\d{1,3})\s*%", response)
+                    if pct_match:
+                        calibration.log_prediction(prompt, int(pct_match.group(1)), reasoning=response)
+                except Exception:
+                    pass
+
             _log(prompt, response, "probability")
             return jsonify({"response": response, "mode": "probability"})
+
+        # ── Recognizance ─────────────────────────────────────────────────────
+        matched_recon = next((t for t in RECON_TRIGGERS if t in p_lower), None)
+        if matched_recon and RECON_OK and friday_brain:
+            # Case-insensitive strip of whichever trigger matched — p_lower
+            # already told us it's in there somewhere.
+            idx = p_lower.find(matched_recon)
+            situation = (prompt[:idx] + prompt[idx + len(matched_recon):]).strip() if idx >= 0 else prompt
+            result = recognizance.scout(situation or prompt)
+            response = result.get("brief") or "Nothing solid to report, boss."
+            _log(prompt, response, "recon")
+            audio_file = friday_speak(response) if VOICE_OK else None
+            return jsonify({
+                "response": response, "mode": "recon",
+                "has_audio": bool(audio_file), "audio_file": audio_file,
+            })
+
+        # ── Cross-check with JARVIS ────────────────────────────────────────────
+        CROSS_CHECK_TRIGGERS = [
+            "check with jarvis", "cross check", "ask jarvis too",
+            "get a second opinion", "what does jarvis think",
+        ]
+        matched_trigger = next((t for t in CROSS_CHECK_TRIGGERS if t in p_lower), None)
+        if matched_trigger and cross_check:
+            question = prompt
+            for t in CROSS_CHECK_TRIGGERS:
+                question = question.lower().replace(t, "").strip()
+            question = question or prompt
+
+            result = cross_check.ask_both(question)
+            friday_side = result["friday"][:150]
+            jarvis_side = result["jarvis"][:150]
+            if result["agreement"]["aligned"]:
+                response = (
+                    f"We're aligned, boss. Me: \"{friday_side}\" "
+                    f"JARVIS: \"{jarvis_side}\""
+                )
+            else:
+                response = (
+                    f"We don't agree on this one, boss. Me: \"{friday_side}\" "
+                    f"JARVIS: \"{jarvis_side}\""
+                )
+            _log(prompt, response, "cross_check")
+            return jsonify({"response": response, "mode": "cross_check", "detail": result})
 
         # ── Combat / normal mode ──────────────────────────────────────────────
         if any(t in p_lower for t in COMBAT_TRIGGERS) and friday_brain:
@@ -1551,6 +1709,11 @@ def command():
         # ── Smart home via HomeKit (Shortcuts run on the Mac Bridge) ──────────
         for trigger, shortcut in HOMEKIT_TRIGGERS.items():
             if trigger in p_lower:
+                if TRAINING_WHEELS_OK and not training_wheels.can_perform("mac_bridge_control"):
+                    response = "Not authorized yet, boss — trust score isn't there for Mac Bridge control."
+                    _log(prompt, response, "homekit")
+                    return jsonify({"response": response, "mode": "homekit", "blocked": True})
+
                 mac_url = os.environ.get("MAC_BRIDGE_URL", "")
                 if not mac_url:
                     response = "Mac bridge isn't configured, boss."
@@ -1563,9 +1726,34 @@ def command():
                         ok = r.status_code == 200 and not r.json().get("error")
                         response = "Done, boss." if ok else "Couldn't reach the Mac bridge, boss."
                     except Exception:
+                        ok = False
                         response = "Couldn't reach the Mac bridge, boss."
+                    if TRAINING_WHEELS_OK:
+                        training_wheels.record_outcome("mac_bridge_control", ok)
                 _log(prompt, response, "homekit")
                 return jsonify({"response": response, "mode": "homekit"})
+
+        # ── Open a Mac app via Mac Bridge ──────────────────────────────────────
+        MAC_APP_TRIGGERS = {
+            "open spotify": "Spotify", "open chrome": "Google Chrome",
+            "open safari": "Safari", "open terminal": "Terminal",
+            "open finder": "Finder", "open notes": "Notes",
+        }
+        for trigger, app_name in MAC_APP_TRIGGERS.items():
+            if trigger in p_lower:
+                if TRAINING_WHEELS_OK and not training_wheels.can_perform("mac_bridge_control"):
+                    response = "Not authorized yet, boss — trust score isn't there for Mac Bridge control."
+                    _log(prompt, response, "mac_bridge")
+                    return jsonify({"response": response, "mode": "mac_bridge", "blocked": True})
+
+                from services.mac_bridge import mac_bridge
+                result = mac_bridge.open_app(app_name)
+                ok = "error" not in result
+                response = f"Done, boss. {app_name} is opening." if ok else f"Couldn't reach your Mac, boss: {result['error']}"
+                if TRAINING_WHEELS_OK:
+                    training_wheels.record_outcome("mac_bridge_control", ok)
+                _log(prompt, response, "mac_bridge")
+                return jsonify({"response": response, "mode": "mac_bridge"})
 
         # Proxy to JARVIS if online and not in coverage mode
         if JARVIS_ONLINE and not COVERAGE_MODE:
@@ -1662,6 +1850,44 @@ def friday_ask():
         return jsonify({"response": "Didn't catch that, boss."})
     with app.test_request_context("/command", method="POST", json={"prompt": message}):
         return command()
+
+
+@app.route("/friday/vision/analyze", methods=["POST"])
+def friday_vision_analyze():
+    """Paperclip-button endpoint — the HUD base64-encodes the image
+    client-side (see uploadVisionImage() in the page script below) and
+    posts it here rather than a multipart upload, since the payload is
+    small (single frame, not video) and JSON keeps this symmetrical with
+    every other route on this server."""
+    if not friday_vision:
+        return jsonify({"error": "Vision isn't available, boss."}), 503
+    data = request.get_json(silent=True) or {}
+    image_b64 = data.get("image", "")
+    question = data.get("question", "")
+    if not image_b64:
+        return jsonify({"error": "No image provided."}), 400
+    result = friday_vision.analyze(image_b64, question)
+    _log(question or "[image]", result.get("analysis", result.get("error", "")), "vision")
+    return jsonify(result)
+
+
+@app.route("/friday/calibration/score")
+def friday_calibration_score():
+    if not calibration:
+        return jsonify({"error": "Calibration tracking isn't available, boss."}), 503
+    return jsonify(calibration.calibration_score())
+
+
+@app.route("/friday/calibration/resolve", methods=["POST"])
+def friday_calibration_resolve():
+    if not calibration:
+        return jsonify({"error": "Calibration tracking isn't available, boss."}), 503
+    data = request.get_json(silent=True) or {}
+    pred_id = data.get("id", "")
+    outcome = data.get("outcome")
+    if not pred_id or outcome is None:
+        return jsonify({"error": "id and outcome are required"}), 400
+    return jsonify(calibration.resolve_prediction(pred_id, bool(outcome)))
 
 
 @app.route("/friday/voice/audio")
@@ -1837,6 +2063,15 @@ def list_capabilities():
     if not CAPABILITIES_OK:
         return jsonify({"error": "capabilities unavailable"}), 503
     return jsonify({"triggers": list(CAPABILITY_MAP.keys())})
+
+
+# ── Training wheels ─────────────────────────────────────────────────────────────
+
+@app.route("/friday/trust")
+def trust_status():
+    if not TRAINING_WHEELS_OK:
+        return jsonify({"error": "training wheels unavailable"}), 503
+    return jsonify(training_wheels.status())
 
 
 # ── Health (Apple Watch) ───────────────────────────────────────────────────────
@@ -2705,11 +2940,26 @@ body {
 }
 .mute-float.on { border-color: rgba(247,127,0,0.4); color: var(--warn); }
 
+/* Holographic face — sits behind the message bubbles (transparent
+   background, see .messages-area above) but above the particle field,
+   so it reads as a projection glimpsed through the chat rather than a
+   separate screen. Own z-index tier (0, tied with .particles) — later
+   in the DOM so it paints over particles, but .chat-screen's z-index:1
+   still wins over it for every real UI element. */
+#friday-face {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  z-index: 0; opacity: 0; pointer-events: none;
+  transition: opacity 0.6s ease;
+  filter: drop-shadow(0 0 20px rgba(72,202,228,0.35));
+}
+#friday-face.on { opacity: 0.85; }
+
 </style>
 </head>
 <body>
 
 <div class="particles" id="particles"></div>
+<canvas id="friday-face" width="220" height="220"></canvas>
 <div class="cov-banner" id="cov-banner">COVERAGE MODE - JARVIS OFFLINE</div>
 <div class="backdrop" id="backdrop" onclick="closeAll()"></div>
 
@@ -2763,6 +3013,14 @@ body {
         <button class="mode-btn" onclick="setMode('focused')">FOCUSED</button>
         <button class="mode-btn" onclick="setMode('support')">SUPPORT</button>
         <button class="mode-btn" onclick="setMode('coverage')">COVERAGE</button>
+      </div>
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">TRAINING WHEELS</div>
+      <div class="stat-card">
+        <div class="stat-card-header"><span class="stat-card-label">TRUST TIER</span><span class="stat-card-value bright" id="trust-tier">-</span></div>
+        <div class="stat-bar"><div class="stat-bar-fill" id="trust-bar" style="width:0%"></div></div>
       </div>
     </div>
 
@@ -2848,6 +3106,8 @@ body {
     <div class="input-row">
       <input class="chat-inp" id="chat-inp" placeholder="Talk to FRIDAY, boss..."
              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}">
+      <input type="file" id="vision-file" accept="image/*" style="display:none" onchange="uploadVisionImage(event)">
+      <button class="mic-btn" id="vision-btn" onclick="document.getElementById('vision-file').click()" title="Show FRIDAY something">&#128206;</button>
       <button class="mic-btn" id="mic-btn" onclick="toggleMic()">&#127908;</button>
       <button class="send-btn" onclick="send()">&#9654;</button>
     </div>
@@ -2919,6 +3179,7 @@ async function send() {
     const d = await r.json();
     hideThinking();
     addMsg('fri', 'FRIDAY', d.response || '...', {model: d.model || '', ms: d.ms || 0, emotion: d.emotion});
+    showFace();
     if (!muted && d.has_audio && d.audio_file) playAudio(d.audio_file);
   } catch(e) {
     hideThinking();
@@ -2978,10 +3239,56 @@ function playAudio(file) {
   currentAudio = new Audio(url);
   // Same page as the arc reactor canvas, so no server round-trip needed —
   // these real play/ended/pause events are the reactor's actual signal.
-  currentAudio.addEventListener('play', () => { if (window.onFridaySpeak) window.onFridaySpeak(); });
-  currentAudio.addEventListener('ended', () => { if (window.onFridayDone) window.onFridayDone(); });
-  currentAudio.addEventListener('pause', () => { if (window.onFridayDone) window.onFridayDone(); });
+  currentAudio.addEventListener('play', () => {
+    if (window.onFridaySpeak) window.onFridaySpeak();
+    if (window.onFridaySpeakFace) window.onFridaySpeakFace();
+  });
+  currentAudio.addEventListener('ended', () => {
+    if (window.onFridayDone) window.onFridayDone();
+    if (window.onFridayDoneFace) window.onFridayDoneFace();
+  });
+  currentAudio.addEventListener('pause', () => {
+    if (window.onFridayDone) window.onFridayDone();
+    if (window.onFridayDoneFace) window.onFridayDoneFace();
+  });
   currentAudio.play().catch(() => {});
+}
+
+let faceHideTimer = null;
+function showFace() {
+  const el = document.getElementById('friday-face');
+  if (!el) return;
+  el.classList.add('on');
+  if (faceHideTimer) clearTimeout(faceHideTimer);
+  faceHideTimer = setTimeout(() => el.classList.remove('on'), 4000);
+}
+
+async function uploadVisionImage(event) {
+  const file = event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async () => {
+    // reader.result is "data:image/...;base64,XXXX" — strip the prefix,
+    // the vision route only wants the raw base64 payload.
+    const b64 = reader.result.split(',')[1];
+    addMsg('user', 'YOU', `[image: ${file.name}]`);
+    showThinking();
+    try {
+      const r = await fetch(`${BASE}/friday/vision/analyze`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({image: b64, question: ''}),
+      });
+      const d = await r.json();
+      hideThinking();
+      addMsg('fri', 'FRIDAY', d.analysis || d.error || "Couldn't make sense of that, boss.");
+      showFace();
+    } catch (e) {
+      hideThinking();
+      addMsg('sys', 'SYSTEM', 'Vision analysis failed, boss.');
+    }
+  };
+  reader.readAsDataURL(file);
 }
 
 function toggleMute() {
@@ -3079,10 +3386,21 @@ async function pollVeronica() {
   } catch(e) {}
 }
 
+async function pollTrust() {
+  try {
+    const r = await fetch(`${BASE}/friday/trust`);
+    const d = await r.json();
+    document.getElementById('trust-tier').textContent = (d.tier || '-').replace('_', ' ').toUpperCase();
+    document.getElementById('trust-bar').style.width = `${d.trust || 0}%`;
+  } catch(e) {}
+}
+
 pollState();
 pollVeronica();
+pollTrust();
 setInterval(pollState, 5000);
 setInterval(pollVeronica, 30000);
+setInterval(pollTrust, 30000);
 document.getElementById('chat-inp').focus();
 
 document.addEventListener('keydown', e => {
@@ -3206,6 +3524,91 @@ document.addEventListener('keydown', e => {
     requestAnimationFrame(drawFriday);
   }
   drawFriday();
+})();
+
+// Holographic face — a separate canvas from friday-arc (that one stays the
+// small top-bar reactor); this one is the big centered projection that
+// fades in on every response via showFace() above. Kept intentionally
+// simple (arcs + lines, no image assets) since it redraws every frame on
+// every page load, not just while actively speaking.
+(function() {
+  const c = document.getElementById('friday-face');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  const W = 220, H = 220, CX = 110, CY = 100;
+  let t = 0;
+  let speaking = false;
+  let mouthOpen = 0;
+
+  window.onFridaySpeakFace = function() { speaking = true; };
+  window.onFridayDoneFace = function() { speaking = false; };
+
+  function drawFace() {
+    ctx.clearRect(0, 0, W, H);
+
+    // Jaw / face outline — an open hexagonal contour, not a closed mask,
+    // so it reads as a HUD wireframe rather than a solid head.
+    ctx.beginPath();
+    ctx.moveTo(CX - 55, CY - 40);
+    ctx.lineTo(CX - 60, CY + 10);
+    ctx.lineTo(CX - 35, CY + 55);
+    ctx.lineTo(CX, CY + 70);
+    ctx.lineTo(CX + 35, CY + 55);
+    ctx.lineTo(CX + 60, CY + 10);
+    ctx.lineTo(CX + 55, CY - 40);
+    ctx.strokeStyle = 'rgba(72,202,228,0.45)';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    // Scan lines — slow vertical sweep across the face box.
+    const scanY = CY - 70 + ((t * 20) % 150);
+    ctx.beginPath();
+    ctx.moveTo(CX - 65, scanY);
+    ctx.lineTo(CX + 65, scanY);
+    ctx.strokeStyle = 'rgba(72,202,228,0.15)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Eyes — glow pulses gently at rest, brighter and slightly wider while
+    // speaking so the face doesn't look inert during a response.
+    const glow = 0.55 + Math.sin(t * 2) * 0.25 + (speaking ? 0.2 : 0);
+    for (const ex of [CX - 22, CX + 22]) {
+      const grad = ctx.createRadialGradient(ex, CY - 5, 0, ex, CY - 5, 9);
+      grad.addColorStop(0, `rgba(210,245,255,${glow})`);
+      grad.addColorStop(0.5, `rgba(72,202,228,${glow * 0.7})`);
+      grad.addColorStop(1, 'rgba(0,168,255,0)');
+      ctx.beginPath();
+      ctx.arc(ex, CY - 5, 9, 0, Math.PI * 2);
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(ex, CY - 5, 3, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,255,255,${glow})`;
+      ctx.fill();
+    }
+
+    // Mouth — only animates while speaking; otherwise settles to a flat
+    // line so the face doesn't look like it's talking when it isn't.
+    if (speaking) mouthOpen = Math.max(0.15, (Math.sin(t * 14) + 1) / 2);
+    else mouthOpen = Math.max(0, mouthOpen - 0.08);
+
+    ctx.beginPath();
+    ctx.ellipse(CX, CY + 35, 16, 2 + mouthOpen * 8, 0, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(144,224,239,${0.6 + mouthOpen * 0.4})`;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Small data readout — flavor text, not real telemetry.
+    ctx.font = '8px monospace';
+    ctx.fillStyle = 'rgba(72,202,228,0.5)';
+    ctx.fillText(speaking ? 'VOICE: ACTIVE' : 'STANDBY', CX - 60, CY + 90);
+    ctx.fillText(`T+${Math.floor(t)}`, CX + 30, CY + 90);
+
+    t += 0.03;
+    requestAnimationFrame(drawFace);
+  }
+  drawFace();
 })();
 </script>
 </body>

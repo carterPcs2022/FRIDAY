@@ -153,20 +153,19 @@ class FridayBrain:
         system = self._build_system(emotion_context)
         messages = self._build_messages(query, context)
 
-        result = None
-        if tier == "maximum" and ANTHROPIC_KEY:
-            result = self._call_anthropic(messages, system, MODELS["maximum"])
-        elif tier == "nuanced" and ANTHROPIC_KEY:
-            result = self._call_anthropic(messages, system, MODELS["nuanced"])
-        elif tier == "deep" and ANTHROPIC_KEY:
-            result = self._call_anthropic(messages, system, MODELS["deep"])
-        elif tier in ("fast", "instant") and GROQ_API_KEY:
-            result = self._call_groq(messages, system, MODELS["fast"])
-        elif GROQ_API_KEY:
-            result = self._call_groq(messages, system, MODELS["smart"])
+        # Cost cascade: Groq (free) -> Mac Bridge Ollama (free, local) ->
+        # Anthropic (paid, last resort only). This intentionally overrides
+        # the old tier->Anthropic-first routing for "maximum"/"nuanced"/
+        # "deep" — those tiers now only reach Anthropic if Groq and Ollama
+        # both failed, not by default, per the boss's cost-cutting ask.
+        groq_model = MODELS["fast"] if tier in ("fast", "instant") else MODELS["smart"]
+        result = self._call_groq(messages, system, groq_model) if GROQ_API_KEY else None
+
+        if not result:
+            result = self._call_ollama_fallback(messages, system)
 
         if not result and ANTHROPIC_KEY:
-            result = self._call_anthropic(messages, system, MODELS["nuanced"])
+            result = self._call_anthropic(messages, system, MODELS.get(tier, MODELS["nuanced"]))
 
         if not result:
             result = {"content": f"(offline) Got it, boss: {query}", "model": "offline", "provider": "local"}
@@ -274,6 +273,28 @@ class FridayBrain:
             global _last_groq_failure
             _last_groq_failure = time.time()
             return None
+
+    def _call_ollama_fallback(self, messages: list, system: str) -> dict | None:
+        """Mac Bridge's local Ollama model — free, but only reachable when
+        the boss's Mac is on and the bridge/tunnel are up, so this is a
+        best-effort middle tier between Groq and paid Anthropic calls."""
+        mac_url = os.getenv("MAC_BRIDGE_URL", "")
+        if not mac_url:
+            return None
+        try:
+            import httpx
+            prompt = messages[-1]["content"] if messages else ""
+            r = httpx.post(
+                f"{mac_url}/mac/ollama",
+                json={"prompt": prompt, "system": system},
+                timeout=45,
+            )
+            content = r.json().get("response", "")
+            if content:
+                return {"content": content, "model": "llama3.1-local", "provider": "ollama"}
+        except Exception as e:
+            print(f"[FRIDAY] Ollama fallback error: {e}")
+        return None
 
     def _call_anthropic(self, messages: list, system: str, model: str, max_tokens: int = 256) -> dict | None:
         if not ANTHROPIC_KEY:

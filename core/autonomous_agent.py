@@ -28,13 +28,13 @@ class AutonomousAgent:
         self._running = True
 
         monitors = [
-            ("battery_watch", self._battery_monitor, 60),
+            ("battery_watch", self._battery_monitor, 300),
             ("task_staleness", self._task_staleness, 3600),
             ("relationship", self._relationship_check, 86400),
             ("meal_reminder", self._meal_reminder, 3600),
             ("sunday_brief", self._sunday_brief, 3600),
-            ("weather_alert", self._weather_alert, 1800),
-            ("news_spike", self._news_spike, 3600),
+            ("weather_alert", self._weather_alert, 3600),
+            ("news_spike", self._news_spike, 7200),
             ("hydration", self._hydration_check, 1800),
             ("movement", self._movement_reminder, 5400),
             ("bill_check", self._bill_check, 3600),
@@ -42,6 +42,7 @@ class AutonomousAgent:
             ("meeting_prep", self._meeting_prep, 300),
             ("emotional_check", self._morning_emotional_check, 3600),
             ("goal_nudge", self._goal_nudge, 86400),
+            ("calibration_check", self._calibration_check, 86400),
         ]
 
         for name, fn, interval in monitors:
@@ -372,6 +373,24 @@ class AutonomousAgent:
             if result.get("response"):
                 self._alert(result["response"], title="FRIDAY — Meeting Prep", priority="normal")
 
+            # Recognizance auto-trigger — only for meetings with attendees
+            # (a solo blocked-off hold has no one to recon). Reuses the same
+            # per-event flag file above rather than a second dedup key, so
+            # the 5-minute poll can't refire this any more than the prep
+            # brief itself can.
+            attendees = event.get("attendees") or []
+            if attendees:
+                try:
+                    from services.recognizance import recognizance
+                    names = ", ".join(a.get("email", "") for a in attendees[:5] if a.get("email"))
+                    recon = recognizance.scout(
+                        f"Upcoming meeting '{event.get('title', 'meeting')}' with {names or 'attendees'}"
+                    )
+                    if recon.get("brief"):
+                        self._alert(recon["brief"], title="FRIDAY — Recon", priority="normal")
+                except Exception:
+                    pass
+
     def _meeting_prep_from_tasks(self):
         """No calendar connected — best-effort guess off the task list.
         _alert()'s hour-based dedup keeps this from repeating more than
@@ -439,6 +458,35 @@ class AutonomousAgent:
             nudge = goals.nudge_neglected()
             if nudge:
                 self._alert(nudge, title="FRIDAY — Goals")
+        except Exception:
+            pass
+
+    # ── Weekly calibration nudge ─────────────────────────────────────────────
+    def _calibration_check(self):
+        """Only on Mondays, once per day — surfaces the single oldest
+        unresolved probability call (see PROBABILITY_TRIGGERS in
+        server.py) so it actually gets checked against reality instead of
+        accumulating unresolved forever."""
+        if datetime.now().weekday() != 0:  # Not Monday
+            return
+        key = f"calibration_check_{datetime.now().date()}"
+        flag = Path(f"logs/.{key}")
+        if flag.exists():
+            return
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.touch()
+
+        try:
+            from services.friday_calibration import calibration
+            unresolved = calibration.get_unresolved(days_old=7)
+            if not unresolved:
+                return
+            oldest = unresolved[0]
+            self._alert(
+                f"Boss, you called {oldest['probability']}% on \"{oldest['question'][:60]}\" "
+                f"a week ago — how'd that turn out?",
+                title="FRIDAY — Calibration", priority="low"
+            )
         except Exception:
             pass
 

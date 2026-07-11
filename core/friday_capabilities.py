@@ -186,15 +186,23 @@ class FridayMCUCapabilities:
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
-    def _pushover_alert(self, title: str, message: str):
+    def _pushover_alert(self, title: str, message: str, priority: int = 1,
+                         retry: int | None = None, expire: int | None = None):
         user = os.environ.get("PUSHOVER_USER_KEY", "")
         token = os.environ.get("PUSHOVER_APP_TOKEN", "")
         if user and token:
             try:
                 import httpx
+                data = {"token": token, "user": user, "title": title, "message": message, "priority": priority}
+                # Pushover requires retry/expire on emergency-priority (2)
+                # messages — it re-sends every `retry` seconds until `expire`
+                # seconds pass or the boss acknowledges it on the device.
+                if priority == 2:
+                    data["retry"] = retry or 60
+                    data["expire"] = expire or 1800
                 httpx.post(
                     "https://api.pushover.net/1/messages.json",
-                    data={"token": token, "user": user, "title": title, "message": message, "priority": 1},
+                    data=data,
                     timeout=5,
                 )
             except Exception:

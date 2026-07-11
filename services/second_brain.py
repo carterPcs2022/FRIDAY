@@ -59,6 +59,43 @@ class SecondBrain:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in scored[:limit]]
 
+    def recall_semantic(self, query: str, limit: int = 5) -> list:
+        """Semantic variant of recall() — one LLM call over the last 30
+        entries' summaries instead of keyword overlap, for queries that
+        don't share literal words with what was stored (e.g. "that thing
+        about scaling databases" matching an entry summarized as "Postgres
+        read replicas"). recall() stays the fast keyword fallback since
+        this costs a real LLM call and can't run for every lookup."""
+        from core.friday_brain import friday_brain
+
+        recent = list(self._entries.values())[-30:]
+        if not recent:
+            return []
+
+        numbered = "\n".join(
+            f"{i + 1}. {e.get('summary', '') or e.get('content', '')[:100]}"
+            for i, e in enumerate(recent)
+        )
+        result = friday_brain.think(
+            f"Here are numbered stored entries:\n{numbered}\n\n"
+            f"Query: {query}\n\n"
+            f"Which entry numbers are relevant to this query? Reply with "
+            f"ONLY comma-separated numbers, most relevant first (e.g. "
+            f"'3,1,7'). If none are relevant, reply 'none'."
+        )["response"]
+
+        numbers = [int(n) for n in re.findall(r"\d+", result)]
+        matched = []
+        seen = set()
+        for n in numbers:
+            idx = n - 1
+            if 0 <= idx < len(recent) and idx not in seen:
+                seen.add(idx)
+                matched.append(recent[idx])
+            if len(matched) >= limit:
+                break
+        return matched
+
     def get_actions(self, limit: int = 10) -> list:
         """Flattened action items pulled off recent entries — each
         returned as {"action": str, "source": entry id}, newest entries

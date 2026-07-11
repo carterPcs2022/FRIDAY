@@ -3,11 +3,20 @@ in, real anomaly detection, real voice alerts — no fabricated readings.
 Feed it from an iOS Shortcut posting to POST /friday/health/log.
 """
 import json
+import os
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 HEALTH_LOG = BASE_DIR / "memory" / "friday_health_log.json"
+
+# Hard thresholds, distinct from _check_anomalies()'s soft
+# deviation-from-your-own-baseline detection below — these fire on
+# absolute values regardless of personal baseline, since a heart rate
+# that's merely "unusual for you" and one that's medically critical
+# need different urgency (voice-only nudge vs. emergency-priority push).
+CRITICAL_THRESHOLDS = {"hr_high": 150, "hr_low": 40, "blood_oxygen_low": 90}
 
 
 class FridayHealthMonitor:
@@ -33,7 +42,74 @@ class FridayHealthMonitor:
             except Exception:
                 pass
 
+        # Runs alongside _check_anomalies() above, not instead of it — soft
+        # baseline deviations and hard critical thresholds are different
+        # concerns and every real Watch post should be screened for both.
+        try:
+            self.check_critical(entry.get("heart_rate", 0), entry.get("blood_oxygen", 0))
+        except Exception:
+            pass
+
         return entry
+
+    def check_critical(self, hr: float, bo: float) -> dict:
+        reasons = []
+        if hr and hr >= CRITICAL_THRESHOLDS["hr_high"]:
+            reasons.append(f"heart rate critically high at {hr:.0f}")
+        elif hr and 0 < hr <= CRITICAL_THRESHOLDS["hr_low"]:
+            reasons.append(f"heart rate critically low at {hr:.0f}")
+        if bo and 0 < bo <= CRITICAL_THRESHOLDS["blood_oxygen_low"]:
+            reasons.append(f"blood oxygen critically low at {bo:.0f}%")
+
+        if not reasons:
+            return {"critical": False}
+
+        reason = "; ".join(reasons)
+        self._escalate_critical(reason)
+        return {"critical": True, "reason": reason}
+
+    def _escalate_critical(self, reason: str):
+        try:
+            from services.friday_voice import speak
+            speak(f"Boss, critical health alert — {reason}. Please respond.")
+        except Exception:
+            pass
+
+        try:
+            from core.friday_capabilities import friday_caps
+            friday_caps._pushover_alert(
+                "FRIDAY CRITICAL HEALTH ALERT",
+                f"{reason}. Respond immediately or FRIDAY will notify your emergency contact.",
+                priority=2, retry=60, expire=1800,
+            )
+        except Exception:
+            pass
+
+        try:
+            from services.checkin_system import emergency_pending
+            emergency_pending.set()
+        except Exception:
+            return
+
+        def _followup():
+            import time
+            time.sleep(300)
+            if not emergency_pending.is_set():
+                return  # boss already confirmed safe via a SAFE_TRIGGERS phrase
+            phone = os.environ.get("EMERGENCY_CONTACT_PHONE", "")
+            if not phone:
+                return
+            try:
+                from core.friday_capabilities import friday_caps
+                friday_caps._pushover_alert(
+                    "FRIDAY — No Response",
+                    f"No response to critical health alert ({reason}). "
+                    f"Emergency contact on file: {phone}.",
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=_followup, daemon=True).start()
 
     def _check_anomalies(self, entry: dict, log: dict) -> list:
         alerts = []
