@@ -275,6 +275,14 @@ except Exception as e:
     CHECKIN_OK = False
     logging.warning(f"Check-in system failed: {e}")
 
+try:
+    from services.suit_lockdown import suit_lockdown
+    LOCKDOWN_OK = True
+except Exception as e:
+    suit_lockdown = None
+    LOCKDOWN_OK = False
+    logging.warning(f"Suit lockdown failed: {e}")
+
 
 def _extract_topic(prompt: str) -> str:
     TOPIC_KEYWORDS = {
@@ -1056,6 +1064,29 @@ def command():
 
         if not prompt:
             return jsonify({"response": "Say something, boss."})
+
+        # ── Suit Lockdown — checked before EVERYTHING else, including Mayday.
+        # While locked, the only thing this system will do with any message
+        # is compare it to ENDGAME_PASSPHRASE — no trigger word, no prefix
+        # stripping (see services/suit_lockdown.py's docstring for why that
+        # used to be the actual bug). Anything else gets the same generic
+        # "system locked" reply, so a stolen device can't fish for behavior
+        # differences to guess the passphrase. ─────────────────────────────
+        if LOCKDOWN_OK and suit_lockdown.is_locked():
+            if suit_lockdown.try_unlock(prompt):
+                response = "Unlocked. Welcome back, boss."
+                _log(prompt, response, "lockdown_unlock")
+                return jsonify({"response": response, "mode": "lockdown_unlock"})
+            response = "System locked. Provide the passphrase to unlock."
+            _log(prompt, response, "lockdown")
+            return jsonify({"response": response, "mode": "lockdown", "blocked": True})
+
+        LOCKDOWN_TRIGGERS = ["lockdown now", "emergency lockdown", "lock the system", "suit lockdown"]
+        if LOCKDOWN_OK and any(t in prompt.lower() for t in LOCKDOWN_TRIGGERS):
+            suit_lockdown.activate(reason="voice command")
+            response = "Lockdown active. Standing by."
+            _log(prompt, response, "lockdown_activate")
+            return jsonify({"response": response, "mode": "lockdown_activate"})
 
         # ── Mayday — no LLM call, responds immediately ────────────────────────
         if MAYDAY_PHRASE in prompt.lower():
@@ -2083,6 +2114,19 @@ def set_trust():
     training_wheels._data["trust"] = score
     training_wheels._save()
     return jsonify({"trust": score})
+
+
+# ── Suit Lockdown ────────────────────────────────────────────────────────────
+# Bookmark this URL on a device other than your primary phone/Mac — if that
+# device is lost or stolen, hitting this from anywhere locks the system down
+# immediately. No auth on this route by design: the whole point is it has
+# to work from a device you've never used with this account before.
+
+@app.route("/friday/lockdown", methods=["POST"])
+def trigger_lockdown():
+    if not LOCKDOWN_OK:
+        return jsonify({"error": "lockdown unavailable"}), 503
+    return jsonify(suit_lockdown.activate(reason="remote_trigger"))
 
 
 # ── Health (Apple Watch) ───────────────────────────────────────────────────────
