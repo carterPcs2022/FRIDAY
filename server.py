@@ -96,6 +96,14 @@ except Exception as e:
     VOICE_OK = False
     logging.warning(f"Voice failed: {e}")
 
+try:
+    from services.voice_transcribe import transcribe_audio
+    TRANSCRIBE_OK = True
+except Exception as e:
+    transcribe_audio = None
+    TRANSCRIBE_OK = False
+    logging.warning(f"Voice transcription failed: {e}")
+
 # ── Training (learns from JARVIS) + range protocols ──────────────────────────
 try:
     from core.friday_training import friday_trainer
@@ -1944,6 +1952,22 @@ def friday_voice_audio():
     return response
 
 
+@app.route("/friday/voice/transcribe", methods=["POST"])
+def friday_voice_transcribe():
+    """Hands-free command capture: the HUD records after hearing the wake
+    word and posts the clip here rather than doing STT in-browser, since
+    Web Speech API recognition quality/availability varies a lot by
+    browser — a single server-side Whisper call is consistent everywhere."""
+    if not TRANSCRIBE_OK:
+        return jsonify({"text": "", "error": "Transcription isn't available, boss."}), 503
+    if "audio" not in request.files:
+        return jsonify({"text": "", "error": "audio file required"}), 400
+
+    audio_file = request.files["audio"]
+    result = transcribe_audio(audio_file.read(), filename=audio_file.filename or "audio.webm")
+    return jsonify(result)
+
+
 # ── JARVIS takeover ────────────────────────────────────────────────────────────
 
 @app.route("/takeover", methods=["POST"])
@@ -2787,6 +2811,14 @@ body {
   color: var(--bright); transition: all 0.2s;
 }
 .panel-toggle:hover { background: var(--glass2); box-shadow: 0 0 12px rgba(72,202,228,0.2); }
+.voice-mode-btn {
+  width: auto; border-radius: 16px; padding: 0 12px; font-size: 10px; font-weight: 600;
+  letter-spacing: 0.6px; white-space: nowrap;
+}
+.voice-mode-btn.on {
+  border-color: rgba(72,202,228,0.5); color: var(--bright); background: var(--glass2);
+  box-shadow: 0 0 12px rgba(72,202,228,0.25); animation: mic-pulse 1.6s ease-in-out infinite;
+}
 
 .messages-area {
   flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column;
@@ -2871,6 +2903,7 @@ body {
 }
 .chat-inp { flex: 1; background: transparent; border: none; outline: none; color: var(--text); font-size: 15px; font-family: inherit; letter-spacing: 0.3px; }
 .chat-inp::placeholder { color: var(--muted); }
+.voice-hint { font-size: 11px; color: var(--muted); letter-spacing: 0.3px; margin-top: 6px; padding-left: 4px; }
 
 .mic-btn {
   width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--border2); background: var(--glass);
@@ -3139,6 +3172,7 @@ body {
 
     <div class="top-right">
       <div class="clock-display" id="clock">--:--:--</div>
+      <button class="panel-toggle voice-mode-btn" id="voice-mode-btn" onclick="toggleVoiceMode()" title="Hands-free wake-word listening">VOICE OFF</button>
       <button class="panel-toggle" onclick="toggleLeft()" title="Systems">&#9881;</button>
       <button class="panel-toggle" onclick="toggleRight()" title="Intelligence">&#9670;</button>
     </div>
@@ -3159,13 +3193,14 @@ body {
     </div>
 
     <div class="input-row">
-      <input class="chat-inp" id="chat-inp" placeholder="Talk to FRIDAY, boss..."
+      <input class="chat-inp" id="chat-inp" placeholder="Say 'FRIDAY' or type here, boss..."
              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}">
       <input type="file" id="vision-file" accept="image/*" style="display:none" onchange="uploadVisionImage(event)">
       <button class="mic-btn" id="vision-btn" onclick="document.getElementById('vision-file').click()" title="Show FRIDAY something">&#128206;</button>
       <button class="mic-btn" id="mic-btn" onclick="toggleMic()">&#127908;</button>
       <button class="send-btn" onclick="send()">&#9654;</button>
     </div>
+    <div class="voice-hint" id="voice-hint" style="display:none;">Listening for "FRIDAY" — say the wake word, then your command.</div>
   </div>
 
 </div>
@@ -3301,6 +3336,7 @@ function playAudio(file) {
   currentAudio.addEventListener('ended', () => {
     if (window.onFridayDone) window.onFridayDone();
     if (window.onFridayDoneFace) window.onFridayDoneFace();
+    openConversationWindow();
   });
   currentAudio.addEventListener('pause', () => {
     if (window.onFridayDone) window.onFridayDone();
@@ -3357,6 +3393,228 @@ function toggleMute() {
 function toggleMic() {
   recording = !recording;
   document.getElementById('mic-btn').classList.toggle('on', recording);
+}
+
+// ── Wake-word ("FRIDAY") + hands-free command capture ─────────────────────
+// Separate from mic-btn/toggleMic() above (that's an unrelated pre-existing
+// stub) — this is continuous background listening for the wake word using
+// the browser's free Web Speech API, then MediaRecorder to grab the actual
+// command as audio and ship it to the server for real Whisper transcription
+// (Web Speech's own transcript is unreliable enough across browsers that we
+// don't trust it for the command itself, only for wake-word spotting).
+const WAKE_WORD = 'friday';
+const FOLLOWUP_MS = 6000;
+let voiceModeOn = false;
+let wakeRecognition = null;
+let commandRecorder = null;
+let commandChunks = [];
+let silenceTimer = null;
+let awaitingCommand = false;
+
+function getSpeechRecognition() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+// Floating "listening" pill, distinct from the status-orb color change
+// beginCommandCapture() already does — a persistent state readable at a
+// glance beats scanning the chat log mid-sentence.
+function showListeningIndicator(active, symbol) {
+  let el = document.getElementById('voice-listening-indicator');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'voice-listening-indicator';
+    el.style.cssText = `
+      position: fixed; top: 70px; left: 50%; transform: translateX(-50%);
+      padding: 8px 20px; border-radius: 20px; font-size: 11px;
+      letter-spacing: 2px; z-index: 100; display: none;
+      backdrop-filter: blur(10px); transition: all 0.2s;
+    `;
+    document.body.appendChild(el);
+  }
+  if (!active) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  if (symbol === '?') {
+    el.style.background = 'rgba(255,204,0,0.15)';
+    el.style.border = '1px solid rgba(255,204,0,0.4)';
+    el.style.color = '#ffcc00';
+    el.textContent = '? DID YOU MEAN ME?';
+  } else {
+    el.style.background = 'rgba(72,202,228,0.15)';
+    el.style.border = '1px solid rgba(72,202,228,0.4)';
+    el.style.color = '#48cae4';
+    el.textContent = '● LISTENING...';
+  }
+}
+
+// Local browser TTS for an instant ack on ambiguous wake-word detections —
+// no server round trip for a reflexive "Yes, boss?".
+function speakQuick(text) {
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.1; u.volume = 0.8;
+    window.speechSynthesis.speak(u);
+  } catch (e) {}
+}
+
+function toggleVoiceMode() {
+  const SR = getSpeechRecognition();
+  if (!SR) {
+    addMsg('sys', 'SYSTEM', "This browser doesn't support wake-word listening, boss.");
+    return;
+  }
+  voiceModeOn = !voiceModeOn;
+  const btn = document.getElementById('voice-mode-btn');
+  btn.textContent = voiceModeOn ? 'VOICE ON' : 'VOICE OFF';
+  btn.classList.toggle('on', voiceModeOn);
+  document.getElementById('voice-hint').style.display = voiceModeOn ? 'block' : 'none';
+  if (voiceModeOn) startWakeListening();
+  else stopWakeListening();
+}
+
+function startWakeListening() {
+  const SR = getSpeechRecognition();
+  wakeRecognition = new SR();
+  wakeRecognition.continuous = true;
+  wakeRecognition.interimResults = true;
+  wakeRecognition.lang = 'en-US';
+
+  wakeRecognition.onresult = (event) => {
+    if (awaitingCommand) return;
+    const last = event.results[event.results.length - 1];
+    const transcript = Array.from(event.results)
+      .map(r => r[0].transcript)
+      .join(' ')
+      .toLowerCase();
+    if (!transcript.includes(WAKE_WORD)) return;
+
+    // confidence is 0/unset on some browsers for interim results — treat
+    // that the same as high confidence rather than silently dropping every
+    // wake word on browsers that don't report it.
+    const confidence = last[0].confidence || 0;
+    if (confidence > 0 && confidence < 0.35) return; // background noise — ignored
+
+    if (confidence > 0 && confidence < 0.65) {
+      beginCommandCapture(true);
+    } else {
+      beginCommandCapture(false);
+    }
+  };
+
+  // Web Speech recognizers stop themselves periodically (silence, browser
+  // policy, etc.) — restart automatically so "continuous" listening actually
+  // stays continuous while VOICE ON is toggled on.
+  wakeRecognition.onend = () => {
+    if (voiceModeOn && !awaitingCommand) {
+      try { wakeRecognition.start(); } catch (e) {}
+    }
+  };
+  wakeRecognition.onerror = () => {
+    if (voiceModeOn && !awaitingCommand) {
+      try { wakeRecognition.start(); } catch (e) {}
+    }
+  };
+
+  try { wakeRecognition.start(); } catch (e) {}
+}
+
+function stopWakeListening() {
+  awaitingCommand = false;
+  if (wakeRecognition) {
+    wakeRecognition.onend = null;
+    wakeRecognition.onerror = null;
+    try { wakeRecognition.stop(); } catch (e) {}
+    wakeRecognition = null;
+  }
+  if (commandRecorder && commandRecorder.state !== 'inactive') {
+    try { commandRecorder.stop(); } catch (e) {}
+  }
+  clearTimeout(silenceTimer);
+}
+
+async function beginCommandCapture(ambiguous, timeoutMs) {
+  if (awaitingCommand) return;
+  awaitingCommand = true;
+  try { wakeRecognition.stop(); } catch (e) {}
+
+  // Interrupt: wake word heard mid-response means "stop talking, I'm
+  // talking to you now" — harmless to call when nothing is playing.
+  if (currentAudio && !currentAudio.paused) { currentAudio.pause(); currentAudio.currentTime = 0; }
+  try { window.speechSynthesis.cancel(); } catch (e) {}
+
+  if (ambiguous) {
+    showListeningIndicator(true, '?');
+    speakQuick('Yes, boss?');
+  } else {
+    showListeningIndicator(true, '●');
+  }
+  document.getElementById('status-orb-dot').style.background = 'var(--warn)';
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    addMsg('sys', 'SYSTEM', "Couldn't access the microphone, boss.");
+    showListeningIndicator(false);
+    awaitingCommand = false;
+    if (voiceModeOn) try { wakeRecognition.start(); } catch (e2) {}
+    return;
+  }
+
+  commandChunks = [];
+  commandRecorder = new MediaRecorder(stream);
+  commandRecorder.ondataavailable = (e) => { if (e.data.size > 0) commandChunks.push(e.data); };
+  commandRecorder.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop());
+    clearTimeout(silenceTimer);
+    showListeningIndicator(false);
+    const blob = new Blob(commandChunks, { type: 'audio/webm' });
+    await sendCommandAudio(blob);
+    awaitingCommand = false;
+    if (voiceModeOn) { try { wakeRecognition.start(); } catch (e) {} }
+  };
+
+  commandRecorder.start();
+  resetSilenceTimer(timeoutMs);
+}
+
+function resetSilenceTimer(timeoutMs) {
+  clearTimeout(silenceTimer);
+  // 2.5s of silence after the wake word = "the command is done" by default
+  // (no reliable cross-browser voice-activity signal to key off of); the
+  // follow-up conversation window below passes a longer timeout instead.
+  silenceTimer = setTimeout(() => {
+    if (commandRecorder && commandRecorder.state !== 'inactive') commandRecorder.stop();
+  }, timeoutMs || 2500);
+}
+
+// ── Conversation continuity ─────────────────────────────────────────────────
+// After FRIDAY finishes speaking, keep listening briefly without requiring
+// the wake word again, so "and what about tomorrow" works as a natural
+// follow-up instead of every turn needing "friday" repeated.
+function openConversationWindow() {
+  if (!voiceModeOn || awaitingCommand) return;
+  beginCommandCapture(false, FOLLOWUP_MS);
+}
+
+async function sendCommandAudio(blob) {
+  if (blob.size < 500) return; // near-empty capture (e.g. an unanswered follow-up window) — not worth a transcribe call
+  const form = new FormData();
+  form.append('audio', blob, 'command.webm');
+  try {
+    const r = await fetch(`${BASE}/friday/voice/transcribe`, { method: 'POST', body: form });
+    const d = await r.json();
+    let text = (d.text || '').trim();
+    if (!text) return;
+    // Strip a leading wake word so "friday what's my status" becomes
+    // "what's my status" before it hits the normal send() path.
+    const wakeRe = new RegExp(`^\\s*${WAKE_WORD}\\s*[,:]?\\s*`, 'i');
+    text = text.replace(wakeRe, '').trim();
+    if (!text) return;
+    document.getElementById('chat-inp').value = text;
+    send();
+  } catch (e) {
+    addMsg('sys', 'SYSTEM', 'Voice transcription failed, boss.');
+  }
 }
 
 async function setMode(mode) {
