@@ -392,6 +392,23 @@ def _start_thread(target, name: str):
 
 _start_thread(_monitor_jarvis, "JARVIS monitor")
 
+
+def _startup_config_check():
+    """Runs once, right after boot, so a misconfigured deploy pages the
+    boss immediately instead of surfacing as a mystifying downstream
+    failure hours later. Backgrounded like everything else here — /health
+    must keep answering even if this (or the alert it sends) blows up."""
+    try:
+        from core.config_validator import check_and_alert
+        result = check_and_alert()
+        if not result["ok"]:
+            logging.warning(f"Config check failed: {result['issues']}")
+    except Exception as e:
+        logging.warning(f"Config check failed to run: {e}")
+
+
+_start_thread(_startup_config_check, "config check")
+
 # ── Morning brief auto-trigger ───────────────────────────────────────────────
 # Fires once a day at 8am local server time, so it happens even if nobody
 # opens the HUD. A sleep-loop rather than the `schedule` package — one
@@ -1420,6 +1437,25 @@ def command():
             audio_file = friday_speak(response) if VOICE_OK else None
             return jsonify({
                 "response": response, "mode": "recon",
+                "has_audio": bool(audio_file), "audio_file": audio_file,
+            })
+
+        # ── System doctor ────────────────────────────────────────────────────
+        DIAGNOSTICS_TRIGGERS = ["run diagnostics"]
+        if any(t in p_lower for t in DIAGNOSTICS_TRIGGERS):
+            from services import system_doctor
+            report = system_doctor.full_check()
+            response = "Health check unavailable, boss."
+            if friday_brain:
+                result = friday_brain.think(
+                    f"Summarize this system health check for the boss, naturally, "
+                    f"not as raw data. One or two sentences, FRIDAY style:\n{report}"
+                )
+                response = result.get("response", response)
+            _log(prompt, response, "diagnostics")
+            audio_file = friday_speak(response) if VOICE_OK else None
+            return jsonify({
+                "response": response, "mode": "diagnostics",
                 "has_audio": bool(audio_file), "audio_file": audio_file,
             })
 
@@ -2692,6 +2728,26 @@ def friday_sokovia_safe_action():
     data = request.get_json(silent=True) or {}
     from core.sokovia import sokovia
     return jsonify(sokovia.calculate_safe_action(data.get("action", ""), data.get("constraints", [])))
+
+
+# ── Self-maintenance ─────────────────────────────────────────────────────────
+
+@app.route("/friday/system/config-check")
+def friday_config_check():
+    from core.config_validator import check
+    return jsonify(check())
+
+
+@app.route("/friday/system/doctor")
+def friday_system_doctor():
+    from services import system_doctor
+    return jsonify(system_doctor.full_check())
+
+
+@app.route("/friday/system/cleanup", methods=["POST"])
+def friday_system_cleanup():
+    from services import disk_cleanup
+    return jsonify(disk_cleanup.clean())
 
 
 # ── Budget ─────────────────────────────────────────────────────────────────────

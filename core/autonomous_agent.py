@@ -22,6 +22,7 @@ class AutonomousAgent:
         # two concurrent alerts racing on the read-slice-reassign below
         # could silently drop one's dedup entry.
         self._actions_lock = threading.Lock()
+        self._mac_bridge_failures = 0
 
     def start(self):
         """Start all autonomous monitors."""
@@ -43,6 +44,8 @@ class AutonomousAgent:
             ("emotional_check", self._morning_emotional_check, 3600),
             ("goal_nudge", self._goal_nudge, 86400),
             ("calibration_check", self._calibration_check, 86400),
+            ("mac_bridge_check", self._mac_bridge_check, 1800),
+            ("disk_cleanup", self._disk_cleanup, 43200),
         ]
 
         for name, fn, interval in monitors:
@@ -508,6 +511,49 @@ class AutonomousAgent:
                 f"a week ago — how'd that turn out?",
                 title="FRIDAY — Calibration", priority="low"
             )
+        except Exception:
+            pass
+
+    # ── Mac Bridge health ─────────────────────────────────────────────────────
+    def _mac_bridge_check(self):
+        """Same /mac/battery ping _battery_monitor already uses (the only
+        Mac Bridge route this repo is known to poll) — a real GET/response
+        cycle rather than just checking whether the URL is configured.
+        Debounced to 2 consecutive failures before alerting so a single
+        dropped request on an otherwise-fine bridge doesn't page anyone."""
+        mac_url = os.getenv("MAC_BRIDGE_URL", "")
+        if not mac_url:
+            return
+        try:
+            import httpx
+            r = httpx.get(
+                f"{mac_url}/mac/battery", timeout=5,
+                headers={"Authorization": f"Bearer {os.getenv('MAC_BRIDGE_TOKEN', '')}"},
+            )
+            ok = r.status_code == 200
+        except Exception:
+            ok = False
+
+        if ok:
+            self._mac_bridge_failures = 0
+            return
+
+        self._mac_bridge_failures += 1
+        if self._mac_bridge_failures >= 2:
+            self._alert("Boss, Mac Bridge isn't responding — checked twice now.", priority="high")
+            self._mac_bridge_failures = 0  # avoid re-alerting every 30 min while still down
+
+    # ── Disk cleanup ──────────────────────────────────────────────────────────
+    def _disk_cleanup(self):
+        """Old voice mp3s/logs/dedup flag files pile up on Render's disk
+        with nothing else ever clearing them — see services/disk_cleanup.py.
+        Only worth a log line if it actually freed something meaningful."""
+        try:
+            from services import disk_cleanup
+            result = disk_cleanup.clean()
+            if result.get("freed_bytes", 0) > 1_000_000:
+                print(f"[FRIDAY Autonomous] disk_cleanup freed {result['freed_bytes'] / 1024 / 1024:.1f}MB "
+                      f"({len(result.get('removed', []))} files)")
         except Exception:
             pass
 
