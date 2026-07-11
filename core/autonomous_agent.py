@@ -278,9 +278,20 @@ class AutonomousAgent:
         except Exception:
             pass
 
+    # ── Quiet hours ───────────────────────────────────────────────────────────
+    def _is_quiet_hours(self) -> bool:
+        """Routine wellness nudges (hydration, movement) shouldn't wake the
+        boss up or buzz his phone overnight — only these two opt in to this
+        check, not every monitor, since health/security escalations (Mayday,
+        critical health, lockdown alerts) are deliberately never silenced."""
+        hour = datetime.now().hour
+        return hour >= 23 or hour < 7
+
     # ── Hydration reminder ───────────────────────────────────────────────────
     def _hydration_check(self):
         """Every ~2 hours between 8am-10pm, nudge about water."""
+        if self._is_quiet_hours():
+            return
         hour = datetime.now().hour
         if 8 <= hour <= 22:
             key = f"hydration_{datetime.now().date()}_{hour // 2}"
@@ -293,6 +304,8 @@ class AutonomousAgent:
     # ── Movement reminder ────────────────────────────────────────────────────
     def _movement_reminder(self):
         """Remind to move roughly every 90 minutes (interval=5400)."""
+        if self._is_quiet_hours():
+            return
         key = f"move_{datetime.now().date()}_{datetime.now().hour}"
         flag = Path(f"logs/.{key}")
         if flag.exists():
