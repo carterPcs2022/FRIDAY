@@ -74,7 +74,15 @@ class AutonomousAgent:
             return
         try:
             import httpx
-            r = httpx.get(f"{mac_url}/mac/battery", timeout=3)
+            # bridge.py's before_request auth reads the token from the
+            # request body OR the Authorization header for every /mac/*
+            # route uniformly — this was a bare GET with neither, so it
+            # 401'd correctly (bridge.py wasn't inconsistent; this call
+            # just never sent credentials at all).
+            r = httpx.get(
+                f"{mac_url}/mac/battery", timeout=3,
+                headers={"Authorization": f"Bearer {os.getenv('MAC_BRIDGE_TOKEN', '')}"},
+            )
             data = r.json()
             pct = int(data.get("battery", 100))
 
