@@ -194,6 +194,12 @@ except Exception as e:
     logging.warning(f"Translator failed: {e}")
 
 try:
+    from services.friday_medicine import medicine_tracker
+except Exception as e:
+    medicine_tracker = None
+    logging.warning(f"Medicine tracker failed: {e}")
+
+try:
     from services.voice_memory import voice_memory
 except Exception as e:
     voice_memory = None
@@ -772,6 +778,21 @@ TASK_SHOW_TRIGGERS = [
     "what's on my list", "show my tasks",
     "what do i need to do", "my todo",
     "pending tasks", "what's pending",
+]
+
+MED_ADD_TRIGGERS = [
+    "add medicine", "track my medicine", "remind me to take",
+    "i take", "add my medication", "track medication",
+]
+MED_TAKEN_TRIGGERS = [
+    "i took my", "took my medicine", "just took my",
+]
+MED_SKIP_TRIGGERS = [
+    "skip my", "skipping my", "not taking my",
+]
+MED_SCHEDULE_TRIGGERS = [
+    "my medicine schedule", "what medicine", "medicine schedule",
+    "what do i need to take", "medication schedule",
 ]
 
 # Deliberately not "intel on"/"scan for" — those are CAPABILITY_MAP's
@@ -1817,6 +1838,76 @@ def command():
             _log(prompt, response, "task_add")
             return jsonify({"response": response, "mode": "task_add"})
 
+        # ── Medicine tracker ─────────────────────────────────────────────────
+        if any(t in p_lower for t in MED_SCHEDULE_TRIGGERS) and medicine_tracker:
+            response = medicine_tracker.get_schedule_summary()
+            _log(prompt, response, "medicine")
+            return jsonify({"response": response, "mode": "medicine"})
+
+        if any(t in p_lower for t in MED_TAKEN_TRIGGERS) and medicine_tracker and friday_brain:
+            extract = friday_brain.think(
+                f"Extract medicine name from: '{prompt}'\n"
+                f"Reply with just the name, nothing else."
+            )
+            med_name = extract["response"].strip()
+            if med_name:
+                result = medicine_tracker.log_taken(med_name)
+                response = (
+                    f"Logged, boss. {med_name} marked as taken."
+                    if result.get("logged")
+                    else f"Couldn't find {med_name} in your schedule, boss."
+                )
+            else:
+                response = "Which medicine did you take, boss?"
+            _log(prompt, response, "medicine")
+            return jsonify({"response": response, "mode": "medicine"})
+
+        if any(t in p_lower for t in MED_SKIP_TRIGGERS) and medicine_tracker and friday_brain:
+            extract = friday_brain.think(
+                f"Extract medicine name from: '{prompt}'\n"
+                f"Reply with just the name, nothing else."
+            )
+            med_name = extract["response"].strip()
+            if med_name:
+                result = medicine_tracker.log_skipped(med_name)
+                response = (
+                    f"Got it, boss. {med_name} logged as skipped."
+                    if result.get("logged")
+                    else f"Couldn't find {med_name} in your schedule, boss."
+                )
+            else:
+                response = "Which medicine are you skipping, boss?"
+            _log(prompt, response, "medicine")
+            return jsonify({"response": response, "mode": "medicine"})
+
+        if any(t in p_lower for t in MED_ADD_TRIGGERS) and medicine_tracker and friday_brain:
+            import re as medrex
+            extract = friday_brain.think(
+                f"Extract medicine tracking info from: '{prompt}'\n"
+                f"Reply as JSON: {{\"name\": str, \"times\": [\"HH:MM\"], \"dosage\": str}}\n"
+                f"If time isn't specified, use a reasonable default "
+                f"like [\"08:00\"]. JSON only."
+            )
+            try:
+                clean = medrex.sub(r"```json|```", "", extract["response"]).strip()
+                data = json.loads(clean)
+                result = medicine_tracker.add_medicine(
+                    data.get("name", ""),
+                    data.get("times", ["08:00"]),
+                    data.get("dosage", ""),
+                )
+                response = (
+                    f"Added {result['name']} to your schedule, boss. "
+                    f"I'll remind you."
+                )
+            except Exception:
+                response = (
+                    "What medicine, and what time should I remind "
+                    "you, boss?"
+                )
+            _log(prompt, response, "medicine")
+            return jsonify({"response": response, "mode": "medicine"})
+
         # ── Smart home via HomeKit (Shortcuts run on the Mac Bridge) ──────────
         for trigger, shortcut in HOMEKIT_TRIGGERS.items():
             if trigger in p_lower:
@@ -2356,6 +2447,58 @@ def health_log():
         sleep_hours=data.get("sleep_hours", 0), sleep_quality=data.get("sleep_quality", 0),
     )
     return jsonify(entry)
+
+
+# ── Medicine tracker ─────────────────────────────────────────────────────────
+
+@app.route("/friday/medicine/add", methods=["POST"])
+def medicine_add():
+    if not medicine_tracker:
+        return jsonify({"error": "unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    return jsonify(medicine_tracker.add_medicine(
+        data.get("name", ""), data.get("times", []),
+        data.get("dosage", ""), data.get("notes", "")
+    ))
+
+
+@app.route("/friday/medicine/list")
+def medicine_list():
+    if not medicine_tracker:
+        return jsonify([])
+    return jsonify(medicine_tracker.get_active_medicines())
+
+
+@app.route("/friday/medicine/taken", methods=["POST"])
+def medicine_taken():
+    if not medicine_tracker:
+        return jsonify({"error": "unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    return jsonify(medicine_tracker.log_taken(data.get("name", "")))
+
+
+@app.route("/friday/medicine/due")
+def medicine_due():
+    if not medicine_tracker:
+        return jsonify([])
+    return jsonify(medicine_tracker.get_due_now())
+
+
+@app.route("/friday/hud/medicine")
+def hud_medicine_display():
+    """
+    Minimal JSON designed for a microcontroller/HUD display
+    to poll directly — small payload, no auth complexity,
+    designed for a battery-powered device polling every
+    30-60 seconds.
+    """
+    if not medicine_tracker:
+        return jsonify({"due": [], "missed": []})
+    return jsonify({
+        "due": medicine_tracker.get_due_now(window_minutes=10),
+        "missed": medicine_tracker.get_missed_today(),
+        "ts": time.time(),
+    })
 
 
 # ── Contacts ───────────────────────────────────────────────────────────────────

@@ -46,6 +46,7 @@ class AutonomousAgent:
             ("calibration_check", self._calibration_check, 86400),
             ("mac_bridge_check", self._mac_bridge_check, 1800),
             ("disk_cleanup", self._disk_cleanup, 43200),
+            ("medicine_check", self._medicine_check, 300),
         ]
 
         for name, fn, interval in monitors:
@@ -166,6 +167,49 @@ class AutonomousAgent:
         flag.touch()
 
         self._alert(f"It's {meal} time, boss. Have you eaten?", priority="low")
+
+    # ── Medicine check ───────────────────────────────────────────────────────
+    def _medicine_check(self):
+        """Check for due and missed medicines."""
+        try:
+            from services.friday_medicine import medicine_tracker
+            if not medicine_tracker:
+                return
+
+            due = medicine_tracker.get_due_now(window_minutes=5)
+            for med in due:
+                key = f"med_due_{med['name']}_{med['scheduled_time']}_{datetime.now().date()}"
+                flag = Path(f"logs/.{key}")
+                if flag.exists():
+                    continue
+                flag.parent.mkdir(exist_ok=True)
+                flag.touch()
+
+                dosage_str = f" — {med['dosage']}" if med.get('dosage') else ""
+                self._alert(
+                    f"Time to take {med['name']}{dosage_str}, boss.",
+                    priority="high",
+                    title="FRIDAY — Medicine Reminder"
+                )
+
+            missed = medicine_tracker.get_missed_today()
+            for med in missed:
+                key = f"med_missed_{med['name']}_{datetime.now().date()}"
+                flag = Path(f"logs/.{key}")
+                if flag.exists():
+                    continue
+                flag.parent.mkdir(exist_ok=True)
+                flag.touch()
+
+                self._alert(
+                    f"Boss, you may have missed {med['name']} — "
+                    f"it was due {med['minutes_late']} minutes ago "
+                    f"at {med['scheduled_time']}.",
+                    priority="high",
+                    title="FRIDAY — Missed Dose"
+                )
+        except Exception as e:
+            print(f"[FRIDAY] Medicine check error: {e}")
 
     # ── Sunday weekly brief ──────────────────────────────────────────────────
     def _sunday_brief(self):
