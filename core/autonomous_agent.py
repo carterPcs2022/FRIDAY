@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TASK_FILE = Path("memory/friday_tasks.json")
-BILLS_FILE = Path("memory/friday_bills.json")
 
 
 class AutonomousAgent:
@@ -367,10 +366,8 @@ class AutonomousAgent:
         own hour-based dedup keeps this from repeating more than once an
         hour even though this window can span several days."""
         try:
-            import json
-            if not BILLS_FILE.exists():
-                return
-            bills = json.loads(BILLS_FILE.read_text())
+            from core.friday_bills import get_bills
+            bills = get_bills()
             today = datetime.now().day
             for bill in bills:
                 if abs(bill.get("due_day", 0) - today) <= 2:

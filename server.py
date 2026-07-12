@@ -27,6 +27,8 @@ from collections import deque
 from pathlib import Path
 from flask import request, send_file
 
+from db import turso_http_client as turso
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -821,7 +823,6 @@ SAFE_TRIGGERS = [
 
 TASK_FILE = Path("memory/friday_tasks.json")
 WORKOUT_FILE = Path("memory/friday_workouts.json")
-BILLS_FILE = Path("memory/friday_bills.json")
 
 HOMEKIT_TRIGGERS = {
     "turn off lights": "shortcuts run 'Lights Off'",
@@ -833,19 +834,70 @@ HOMEKIT_TRIGGERS = {
 }
 
 
+WORKOUT_TABLE = "workouts"
+
+
 def log_workout(workout_type: str, duration: int = 0):
+    record = {
+        "type": workout_type, "duration": duration,
+        "ts": datetime.datetime.now().isoformat(),
+    }
+
+    # Local JSON stays the write-through cache during the observation
+    # window for this file's migration — Turso is the new source of
+    # truth, but a write here means we never lose data even if Turso
+    # is having a bad day.
     workouts = []
     if WORKOUT_FILE.exists():
         try:
             workouts = json.loads(WORKOUT_FILE.read_text())
         except Exception:
             workouts = []
-    workouts.append({
-        "type": workout_type, "duration": duration,
-        "ts": datetime.datetime.now().isoformat(),
-    })
+    workouts.append(record)
     WORKOUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     WORKOUT_FILE.write_text(json.dumps(workouts[-365:], indent=2))
+
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(WORKOUT_TABLE)
+            turso.list_insert(WORKOUT_TABLE, record)
+        except Exception as e:
+            print(f"[Turso] workout write failed, local JSON already has it: {e}")
+
+
+def _read_local_workouts() -> list:
+    if WORKOUT_FILE.exists():
+        try:
+            return json.loads(WORKOUT_FILE.read_text())
+        except Exception:
+            return []
+    return []
+
+
+def get_workouts() -> list:
+    if turso.is_configured():
+        rows = None
+        try:
+            turso.ensure_list_table(WORKOUT_TABLE)
+            rows = turso.list_all(WORKOUT_TABLE)
+        except Exception as e:
+            print(f"[Turso] workout read failed, falling back to local JSON: {e}")
+        if rows:
+            return rows
+        if rows is not None:
+            # Query succeeded but came back empty — either genuinely no
+            # workouts yet, or this is the first read since migrating and
+            # Turso hasn't been seeded from the pre-existing local JSON.
+            # Backfill once so history isn't invisible after a redeploy
+            # wipes the local file.
+            local = _read_local_workouts()
+            for record in local:
+                try:
+                    turso.list_insert(WORKOUT_TABLE, record)
+                except Exception as e:
+                    print(f"[Turso] workout seed failed: {e}")
+            return local
+    return _read_local_workouts()
 
 
 def get_tasks() -> list:
@@ -2701,11 +2753,8 @@ def workout_log():
 
 @app.route("/friday/workout/streak")
 def workout_streak():
-    if not WORKOUT_FILE.exists():
-        return jsonify({"streak": 0})
-    try:
-        workouts = json.loads(WORKOUT_FILE.read_text())
-    except Exception:
+    workouts = get_workouts()
+    if not workouts:
         return jsonify({"streak": 0})
 
     dates = sorted(set(w["ts"][:10] for w in workouts), reverse=True)
@@ -2727,19 +2776,8 @@ def add_bill():
     name = data.get("name", "").strip()
     if not name:
         return jsonify({"error": "name required"}), 400
-    bills = []
-    if BILLS_FILE.exists():
-        try:
-            bills = json.loads(BILLS_FILE.read_text())
-        except Exception:
-            bills = []
-    bills.append({
-        "name": name, "amount": data.get("amount", 0),
-        "due_day": data.get("due_day", 1),
-        "added": datetime.datetime.now().isoformat(),
-    })
-    BILLS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BILLS_FILE.write_text(json.dumps(bills, indent=2))
+    from core.friday_bills import add_bill as _add_bill
+    _add_bill(name, data.get("amount", 0), data.get("due_day", 1))
     return jsonify({"added": True})
 
 
