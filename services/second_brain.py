@@ -1,29 +1,18 @@
 """services/second_brain.py — stores ingested content with an
-LLM-extracted summary/insights, recallable by keyword later.
-
-Turso is the source of truth (Render's disk is ephemeral — see
-db/turso_client.py's module docstring). Cache is hydrated from Turso
-once at process start, then kept in sync write-through: every ingest()
-updates the in-memory cache AND Turso immediately. The old local-JSON
-path stays as a fallback for both hydrate and write — if Turso is
-unconfigured or a call fails, this falls back to it rather than
-hard-crashing ingestion."""
+LLM-extracted summary/insights, recallable by keyword later."""
 import json
 import re
 import hashlib
 from pathlib import Path
 from datetime import datetime
 
-from db import turso_client
-
 BRAIN_FILE = Path("memory/second_brain.json")
-TURSO_TABLE = "second_brain"
 
 
 class SecondBrain:
 
     def __init__(self):
-        self._entries = self._hydrate()
+        self._entries = self._load()
 
     def ingest(self, content: str, source: str = "", tags: list | None = None) -> dict:
         from core.friday_brain import friday_brain
@@ -53,7 +42,7 @@ class SecondBrain:
         }
 
         self._entries[entry_id] = entry
-        self._write_through(entry_id)
+        self._save()
         return {"id": entry_id, "summary": entry["summary"], "stored": True}
 
     def recall(self, query: str, limit: int = 5) -> list:
@@ -135,26 +124,7 @@ class SecondBrain:
     def stats(self) -> dict:
         return {"entries": len(self._entries)}
 
-    # ── Turso (source of truth) with local-JSON fallback ────────────────────
-
-    def _hydrate(self) -> dict:
-        if turso_client.is_configured():
-            try:
-                return turso_client.kv_all(TURSO_TABLE)
-            except Exception as e:
-                print(f"[FRIDAY] Turso hydrate failed for second_brain, falling back to local JSON: {e}")
-        return self._load_local()
-
-    def _write_through(self, entry_id: str):
-        if turso_client.is_configured():
-            try:
-                turso_client.kv_set(TURSO_TABLE, entry_id, self._entries[entry_id])
-                return
-            except Exception as e:
-                print(f"[FRIDAY] Turso write failed for second_brain, falling back to local JSON: {e}")
-        self._save_local()
-
-    def _load_local(self) -> dict:
+    def _load(self) -> dict:
         if BRAIN_FILE.exists():
             try:
                 return json.loads(BRAIN_FILE.read_text())
@@ -162,7 +132,7 @@ class SecondBrain:
                 return {}
         return {}
 
-    def _save_local(self):
+    def _save(self):
         BRAIN_FILE.parent.mkdir(parents=True, exist_ok=True)
         BRAIN_FILE.write_text(json.dumps(self._entries, indent=2))
 

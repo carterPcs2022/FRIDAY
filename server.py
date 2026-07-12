@@ -27,8 +27,6 @@ from collections import deque
 from pathlib import Path
 from flask import request, send_file
 
-from db import turso_client
-
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -446,17 +444,13 @@ def _combined_morning_brief() -> str:
         if news_anchor:
             parts["news"] = news_anchor.morning_brief()
 
-    # EMERGENCY REVERT (2026-07-12): _people/_brain disabled entirely for
-    # now — relationships/second_brain are Turso-backed, and calling them
-    # from this function's background thread (or the ThreadPoolExecutor
-    # workers below) risks the same production crash loop documented in
-    # core/autonomous_agent.py's module docstring. Re-enable once Turso
-    # access is isolated to the main Flask thread.
     def _people():
-        pass
+        if relationships:
+            parts["relationships"] = relationships.relationship_brief()
 
     def _brain():
-        pass
+        if second_brain:
+            parts["brain"] = second_brain.daily_digest()
 
     urgent_emails = []
 
@@ -499,19 +493,9 @@ def _combined_morning_brief() -> str:
 
     combined = "\n".join(f"- {v}" for v in parts.values() if v)
 
-    # EMERGENCY REVERT (2026-07-12): reading TASK_FILE/NOTES_FILE directly
-    # instead of get_tasks()/get_notes() — see module-level note above and
-    # core/autonomous_agent.py's docstring for why. This runs on
-    # _morning_brief_loop's background thread.
-    try:
-        pending_tasks = [t for t in json.loads(TASK_FILE.read_text()) if not t.get("done")] if TASK_FILE.exists() else []
-    except Exception:
-        pending_tasks = []
-    try:
-        notes_file = Path("memory/friday_notes.json")
-        recent_notes = json.loads(notes_file.read_text())[-3:] if notes_file.exists() else []
-    except Exception:
-        recent_notes = []
+    from core.friday_memory import get_notes
+    pending_tasks = [t for t in get_tasks() if not t.get("done")]
+    recent_notes = get_notes(3)
     email_note = f"{len(urgent_emails)} urgent emails need attention." if urgent_emails else ""
     # Always an explicit status line — never leave calendar blank in the
     # prompt. An empty calendar_note gives the LLM zero signal about
@@ -849,96 +833,36 @@ HOMEKIT_TRIGGERS = {
 }
 
 
-# Turso-backed (Render's disk is ephemeral — see db/turso_client.py's
-# module docstring). Cache hydrated from Turso once at process start,
-# kept in sync write-through on every log. Old local-JSON path stays as
-# a fallback if Turso is unconfigured or a call fails. The old 365-cap
-# only bounded the local file's size; list_insert has no equivalent, so
-# writes also call list_trim (same approach as notes/journal).
-WORKOUTS_TABLE = "workouts"
-_WORKOUTS_CAP = 365
-_workouts_cache = None
-
-
-def get_workouts() -> list:
-    global _workouts_cache
-    if _workouts_cache is None:
-        _workouts_cache = _hydrate_workouts()
-    return _workouts_cache
-
-
-def _hydrate_workouts() -> list:
-    if turso_client.is_configured():
-        try:
-            return turso_client.list_all(WORKOUTS_TABLE)
-        except Exception as e:
-            print(f"[FRIDAY] Turso hydrate failed for workouts, falling back to local JSON: {e}")
+def log_workout(workout_type: str, duration: int = 0):
+    workouts = []
     if WORKOUT_FILE.exists():
         try:
-            return json.loads(WORKOUT_FILE.read_text())
+            workouts = json.loads(WORKOUT_FILE.read_text())
+        except Exception:
+            workouts = []
+    workouts.append({
+        "type": workout_type, "duration": duration,
+        "ts": datetime.datetime.now().isoformat(),
+    })
+    WORKOUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WORKOUT_FILE.write_text(json.dumps(workouts[-365:], indent=2))
+
+
+def get_tasks() -> list:
+    if TASK_FILE.exists():
+        try:
+            return json.loads(TASK_FILE.read_text())
         except Exception:
             return []
     return []
 
 
-def log_workout(workout_type: str, duration: int = 0):
-    workouts = get_workouts()
-    new_workout = {
-        "type": workout_type, "duration": duration,
-        "ts": datetime.datetime.now().isoformat(),
-    }
-    if turso_client.is_configured():
-        try:
-            new_workout["id"] = turso_client.list_insert(WORKOUTS_TABLE, new_workout)
-        except Exception as e:
-            print(f"[FRIDAY] Turso write failed for workouts, falling back to local JSON: {e}")
-            workouts.append(new_workout)
-            WORKOUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-            WORKOUT_FILE.write_text(json.dumps(workouts[-_WORKOUTS_CAP:], indent=2))
-            return
-        try:
-            turso_client.list_trim(WORKOUTS_TABLE, _WORKOUTS_CAP)
-        except Exception as e:
-            print(f"[FRIDAY] Turso trim failed for workouts (non-fatal): {e}")
-        workouts.append(new_workout)
-        return
-    workouts.append(new_workout)
-    WORKOUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    WORKOUT_FILE.write_text(json.dumps(workouts[-_WORKOUTS_CAP:], indent=2))
-
-
-# Turso-backed (Render's disk is ephemeral — see db/turso_client.py's
-# module docstring). Cache hydrated from Turso once at process start,
-# kept in sync write-through on every add/complete. Old local-JSON path
-# stays as a fallback if Turso is unconfigured or a call fails.
-TASKS_TABLE = "tasks"
-_tasks_cache = None
-
-
-def get_tasks() -> list:
-    global _tasks_cache
-    if _tasks_cache is None:
-        _tasks_cache = _hydrate_tasks()
-    return _tasks_cache
-
-
 def add_task(task: str, priority: str = "normal") -> dict:
     tasks = get_tasks()
     new_task = {
-        "task": task, "priority": priority,
+        "id": len(tasks) + 1, "task": task, "priority": priority,
         "done": False, "added": datetime.datetime.now().isoformat(),
     }
-    if turso_client.is_configured():
-        try:
-            new_task["id"] = turso_client.list_insert(TASKS_TABLE, new_task)
-            tasks.append(new_task)
-            return new_task
-        except Exception as e:
-            print(f"[FRIDAY] Turso write failed for tasks, falling back to local JSON: {e}")
-    # Fallback keeps the old id scheme (len()+1) — not a fix for its
-    # known collision risk after a delete, just resilience parity with
-    # what this file already did before the migration.
-    new_task["id"] = len(tasks) + 1
     tasks.append(new_task)
     TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
     TASK_FILE.write_text(json.dumps(tasks, indent=2))
@@ -951,29 +875,8 @@ def complete_task(task_id: int):
         if t.get("id") == task_id:
             t["done"] = True
             t["completed"] = datetime.datetime.now().isoformat()
-            if turso_client.is_configured():
-                try:
-                    turso_client.list_update(TASKS_TABLE, task_id, t)
-                    return
-                except Exception as e:
-                    print(f"[FRIDAY] Turso write failed for tasks, falling back to local JSON: {e}")
-            TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
-            TASK_FILE.write_text(json.dumps(tasks, indent=2))
-            return
-
-
-def _hydrate_tasks() -> list:
-    if turso_client.is_configured():
-        try:
-            return turso_client.list_all(TASKS_TABLE)
-        except Exception as e:
-            print(f"[FRIDAY] Turso hydrate failed for tasks, falling back to local JSON: {e}")
-    if TASK_FILE.exists():
-        try:
-            return json.loads(TASK_FILE.read_text())
-        except Exception:
-            return []
-    return []
+    TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TASK_FILE.write_text(json.dumps(tasks, indent=2))
 
 
 def add_reminder(text: str, minutes: int):
@@ -2798,8 +2701,11 @@ def workout_log():
 
 @app.route("/friday/workout/streak")
 def workout_streak():
-    workouts = get_workouts()
-    if not workouts:
+    if not WORKOUT_FILE.exists():
+        return jsonify({"streak": 0})
+    try:
+        workouts = json.loads(WORKOUT_FILE.read_text())
+    except Exception:
         return jsonify({"streak": 0})
 
     dates = sorted(set(w["ts"][:10] for w in workouts), reverse=True)
@@ -2815,55 +2721,23 @@ def workout_streak():
     return jsonify({"streak": streak, "dates": dates[:7]})
 
 
-# Turso-backed (Render's disk is ephemeral — see db/turso_client.py's
-# module docstring). Cache hydrated from Turso once at process start,
-# kept in sync write-through on every add. Old local-JSON path stays as
-# a fallback if Turso is unconfigured or a call fails.
-BILLS_TABLE = "bills"
-_bills_cache = None
-
-
-def get_bills() -> list:
-    global _bills_cache
-    if _bills_cache is None:
-        _bills_cache = _hydrate_bills()
-    return _bills_cache
-
-
-def _hydrate_bills() -> list:
-    if turso_client.is_configured():
-        try:
-            return turso_client.list_all(BILLS_TABLE)
-        except Exception as e:
-            print(f"[FRIDAY] Turso hydrate failed for bills, falling back to local JSON: {e}")
-    if BILLS_FILE.exists():
-        try:
-            return json.loads(BILLS_FILE.read_text())
-        except Exception:
-            return []
-    return []
-
-
 @app.route("/friday/bills/add", methods=["POST"])
 def add_bill():
     data = request.get_json(silent=True) or {}
     name = data.get("name", "").strip()
     if not name:
         return jsonify({"error": "name required"}), 400
-    bills = get_bills()
-    new_bill = {
+    bills = []
+    if BILLS_FILE.exists():
+        try:
+            bills = json.loads(BILLS_FILE.read_text())
+        except Exception:
+            bills = []
+    bills.append({
         "name": name, "amount": data.get("amount", 0),
         "due_day": data.get("due_day", 1),
         "added": datetime.datetime.now().isoformat(),
-    }
-    if turso_client.is_configured():
-        try:
-            new_bill["id"] = turso_client.list_insert(BILLS_TABLE, new_bill)
-            bills.append(new_bill)
-            return jsonify({"added": True})
-        except Exception as e:
-            print(f"[FRIDAY] Turso write failed for bills, falling back to local JSON: {e}")
-    bills.append(new_bill)
+    })
     BILLS_FILE.parent.mkdir(parents=True, exist_ok=True)
     BILLS_FILE.write_text(json.dumps(bills, indent=2))
     return jsonify({"added": True})
