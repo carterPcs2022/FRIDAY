@@ -159,16 +159,40 @@ class FridaySpotify:
         try:
             r = httpx.get(
                 "https://api.spotify.com/v1/search",
-                params={"q": query, "type": "track", "limit": 1},
+                params={"q": query, "type": "track", "limit": 10},
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=5,
             )
             items = r.json().get("tracks", {}).get("items", [])
             if not items:
                 return {"error": f"Can't find {query}"}
-            uri = items[0]["uri"]
-            name = items[0]["name"]
-            artist = items[0]["artists"][0]["name"]
+
+            # Find best match by comparing track name similarity to the
+            # actual query, not just taking Spotify's top-ranked result —
+            # Spotify's own relevance ranking factors in popularity, so a
+            # cover or remix can rank above the actual song requested.
+            query_lower = query.lower().strip()
+            best_match = None
+            best_score = 0
+
+            for item in items:
+                track_name = item["name"].lower()
+                if track_name == query_lower:
+                    best_match = item
+                    break
+                if query_lower in track_name or track_name in query_lower:
+                    score = len(set(query_lower.split()) & set(track_name.split()))
+                    if score > best_score:
+                        best_score = score
+                        best_match = item
+
+            # Fallback to first result only if nothing scored as a
+            # reasonable match.
+            selected = best_match or items[0]
+
+            uri = selected["uri"]
+            name = selected["name"]
+            artist = selected["artists"][0]["name"]
             r2 = httpx.put(
                 f"https://api.spotify.com/v1/me/player/play?device_id={device_id}",
                 json={"uris": [uri]},
