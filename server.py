@@ -2111,6 +2111,29 @@ def friday_voice_profile_status():
         return jsonify({"error": f"Couldn't reach the Mac bridge, boss: {e}"}), 502
 
 
+@app.route("/friday/voice/reset", methods=["POST"])
+def friday_voice_reset():
+    """Thin proxy to Mac Bridge's /voice/reset — deletes the stored voice
+    profile so a polluted enrollment (bad/partial samples) can be cleared
+    and re-enrolled from scratch without SSHing in to rm the file."""
+    mac_url = os.environ.get("MAC_BRIDGE_URL", "")
+    if not mac_url:
+        return jsonify({"error": "Mac Bridge not configured"}), 503
+
+    profile = (request.get_json(silent=True) or {}).get("profile", "default")
+    try:
+        import httpx
+        r = httpx.post(
+            f"{mac_url}/voice/reset",
+            data={"profile": profile},
+            headers={"Authorization": f"Bearer {os.environ.get('MAC_BRIDGE_TOKEN', '')}"},
+            timeout=10,
+        )
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": f"Couldn't reach the Mac bridge, boss: {e}"}), 502
+
+
 # ── JARVIS takeover ────────────────────────────────────────────────────────────
 
 @app.route("/takeover", methods=["POST"])
@@ -3788,55 +3811,88 @@ async function sendCommandAudio(blob) {
 // ── Voice enrollment ─────────────────────────────────────────────────────────
 // Five ~3.5s samples (rather than one) give Resemblyzer enough voiceprint
 // variety to set a usable match threshold on the bridge side.
+// Enrollment state lives across separate clicks (one click = one sample,
+// no auto-continue) — a prior version looped all 5 samples automatically
+// inside one call with the button never disabled, so a single impatient
+// re-click mid-loop spawned a second concurrent enrollVoice() run; with
+// two loops racing, 28 POSTs in under a minute (instead of 5) was the
+// observed result, each capturing whatever partial/garbage audio was
+// mid-flight at the moment of the second click.
+let enrollSampleCount = 0;
+let enrollInFlight = false;
+const ENROLL_TARGET = 5;
+const ENROLL_SAMPLE_MS = 3500;
+
 async function enrollVoice() {
   const btn = document.getElementById('enroll-voice-btn');
-  const totalSamples = 5;
-  const sampleMs = 3500;
+  if (enrollInFlight || enrollSampleCount >= ENROLL_TARGET) return;
+  enrollInFlight = true;
+  btn.disabled = true;
 
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch (e) {
     btn.textContent = '⚠ MIC ACCESS DENIED';
+    enrollInFlight = false;
+    btn.disabled = false;
     return;
   }
 
-  for (let i = 1; i <= totalSamples; i++) {
-    btn.textContent = `🎤 SPEAK NOW (${i}/${totalSamples})`;
-    const chunks = [];
-    const recorder = new MediaRecorder(stream);
-    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+  const chunks = [];
+  const recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+  const recordingDone = new Promise((resolve) => { recorder.onstop = resolve; });
 
-    const recordingDone = new Promise((resolve) => {
-      recorder.onstop = resolve;
-    });
-    recorder.start();
-    await new Promise((resolve) => setTimeout(resolve, sampleMs));
-    recorder.stop();
-    await recordingDone;
+  // Visible countdown — unambiguous "safe to speak now" vs "done, uploading".
+  let remaining = Math.round(ENROLL_SAMPLE_MS / 1000);
+  btn.textContent = `🔴 RECORDING... ${remaining}`;
+  const countdown = setInterval(() => {
+    remaining -= 1;
+    if (remaining > 0) btn.textContent = `🔴 RECORDING... ${remaining}`;
+  }, 1000);
 
-    const blob = new Blob(chunks, { type: 'audio/webm' });
-    const form = new FormData();
-    form.append('audio', blob, 'enroll.webm');
-    form.append('profile', 'default');
+  recorder.start();
+  await new Promise((resolve) => setTimeout(resolve, ENROLL_SAMPLE_MS));
+  recorder.stop();
+  await recordingDone;
+  clearInterval(countdown);
+  stream.getTracks().forEach(t => t.stop());
 
-    try {
-      const r = await fetch(`${BASE}/friday/voice/enroll`, { method: 'POST', body: form });
-      const d = await r.json();
-      if (!r.ok || d.error) {
-        btn.textContent = '⚠ ERROR — RETRY';
-        stream.getTracks().forEach(t => t.stop());
-        return;
-      }
-    } catch (e) {
-      btn.textContent = '⚠ ERROR — RETRY';
-      stream.getTracks().forEach(t => t.stop());
+  btn.textContent = '⏳ Uploading...';
+  const blob = new Blob(chunks, { type: 'audio/webm' });
+  const form = new FormData();
+  form.append('audio', blob, 'enroll.webm');
+  form.append('profile', 'default');
+
+  try {
+    const r = await fetch(`${BASE}/friday/voice/enroll`, { method: 'POST', body: form });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      btn.textContent = '⚠ ERROR — CLICK TO RETRY';
+      enrollInFlight = false;
+      btn.disabled = false;
       return;
     }
+    // Trust the server's real count over a local increment — if a
+    // request genuinely failed to register server-side, the two could
+    // otherwise drift apart silently.
+    enrollSampleCount = d.sample_count || enrollSampleCount + 1;
+  } catch (e) {
+    btn.textContent = '⚠ ERROR — CLICK TO RETRY';
+    enrollInFlight = false;
+    btn.disabled = false;
+    return;
   }
 
-  stream.getTracks().forEach(t => t.stop());
-  btn.textContent = '✓ VOICE ENROLLED';
+  enrollInFlight = false;
+  if (enrollSampleCount >= ENROLL_TARGET) {
+    btn.textContent = '✓ VOICE ENROLLED';
+    btn.disabled = true; // permanent — no more samples needed
+  } else {
+    btn.textContent = `🎤 ENROLL MY VOICE (${enrollSampleCount}/${ENROLL_TARGET}) — CLICK TO CONTINUE`;
+    btn.disabled = false;
+  }
 }
 
 async function setMode(mode) {
