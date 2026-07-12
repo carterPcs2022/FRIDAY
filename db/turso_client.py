@@ -135,3 +135,16 @@ def list_update(table: str, row_id: int, data: dict):
         (json.dumps(data), _now(), row_id),
     )
     conn.commit()
+
+
+def list_trim(table: str, keep: int):
+    """Delete all but the `keep` most-recent rows (highest id) from a
+    list_* table — the Turso-side equivalent of the old JSON files'
+    `data[-N:]` cap, since list_insert has no size limit of its own."""
+    conn = _connect()
+    conn.execute(
+        f"DELETE FROM {table} WHERE id NOT IN "
+        f"(SELECT id FROM {table} ORDER BY id DESC LIMIT ?)",
+        (keep,),
+    )
+    conn.commit()

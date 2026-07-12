@@ -8,9 +8,6 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-TASK_FILE = Path("memory/friday_tasks.json")
-BILLS_FILE = Path("memory/friday_bills.json")
-
 
 class AutonomousAgent:
 
@@ -101,10 +98,13 @@ class AutonomousAgent:
     def _task_staleness(self):
         """FRIDAY flags tasks that have been sitting for 7+ days without progress."""
         try:
-            import json
-            if not TASK_FILE.exists():
+            # See _sunday_brief()'s comment — same call-time-import reasoning,
+            # same fix (was a direct TASK_FILE read that would've silently
+            # diverged from get_tasks() once tasks moved to Turso).
+            from server import get_tasks
+            tasks = get_tasks()
+            if not tasks:
                 return
-            tasks = json.loads(TASK_FILE.read_text())
 
             now = datetime.now()
             old_tasks = []
@@ -229,17 +229,16 @@ class AutonomousAgent:
         flag.parent.mkdir(parents=True, exist_ok=True)
         flag.touch()
 
-        import json
+        # Imported at call time, not module scope — server.py starts this
+        # agent's thread from inside its own startup code, so importing it
+        # back at module scope would be circular (same reason _alert()
+        # imports _FOCUS_SESSION from server this way). Was previously a
+        # local duplicate of server.py's own TASK_FILE-reading logic that
+        # would've silently diverged from get_tasks() once tasks moved to
+        # Turso — this makes both readers the same code path again.
+        from server import get_tasks
 
-        def _get_tasks() -> list:
-            if not TASK_FILE.exists():
-                return []
-            try:
-                return json.loads(TASK_FILE.read_text())
-            except Exception:
-                return []
-
-        tasks = _get_tasks()
+        tasks = get_tasks()
         week_tasks = []
         for t in tasks:
             if not t.get("done"):
@@ -367,10 +366,11 @@ class AutonomousAgent:
         own hour-based dedup keeps this from repeating more than once an
         hour even though this window can span several days."""
         try:
-            import json
-            if not BILLS_FILE.exists():
-                return
-            bills = json.loads(BILLS_FILE.read_text())
+            # See _sunday_brief()'s comment on call-time imports — same
+            # reasoning, same fix (was a direct BILLS_FILE read that would've
+            # silently diverged from get_bills() once bills moved to Turso).
+            from server import get_bills
+            bills = get_bills()
             today = datetime.now().day
             for bill in bills:
                 if abs(bill.get("due_day", 0) - today) <= 2:
@@ -464,10 +464,9 @@ class AutonomousAgent:
         _alert()'s hour-based dedup keeps this from repeating more than
         once an hour."""
         try:
-            import json
-            if not TASK_FILE.exists():
-                return
-            tasks = json.loads(TASK_FILE.read_text())
+            # See _sunday_brief()'s comment — same call-time-import reasoning.
+            from server import get_tasks
+            tasks = get_tasks()
             meeting_tasks = [
                 t for t in tasks
                 if any(w in t.get("task", "").lower()

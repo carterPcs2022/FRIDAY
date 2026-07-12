@@ -1,11 +1,21 @@
 """core/friday_memory.py — FRIDAY's memory system. Simpler than JARVIS's
 six-type system, but personal: she remembers what matters about YOU.
 Paths are anchored to the repo root (not cwd) so this works the same
-whether run via `python server.py` or gunicorn from any working directory."""
+whether run via `python server.py` or gunicorn from any working directory.
+
+profile.json is Turso-backed (Render's disk is ephemeral — see
+db/turso_client.py's module docstring); everything else in this file
+(facts, conversations, emotional log, personal memory, notes) is still
+local-JSON only pending its own migration stage. Profile's cache is
+hydrated from Turso once at process start, then kept in sync write-
+through on every update_profile() call. The old local-JSON path stays
+as a fallback if Turso is unconfigured or a call fails."""
 import json
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
+
+from db import turso_client
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 MEMORY_DIR = BASE_DIR / "memory"
@@ -15,6 +25,10 @@ EMOTIONAL_FILE = MEMORY_DIR / "emotional_log.json"
 PROFILE_FILE = MEMORY_DIR / "profile.json"
 PERSONAL_FILE = MEMORY_DIR / "friday_personal.json"
 NOTES_FILE = MEMORY_DIR / "friday_notes.json"
+
+PROFILE_TABLE = "profile"
+PROFILE_KEY = "profile"  # single-row kv table — profile is one flat dict, not many records
+_profile_cache = None
 
 
 _DICT_FILES = (PROFILE_FILE, PERSONAL_FILE)
@@ -140,12 +154,35 @@ def get_mood_history(days: int = 7) -> dict:
 # ── Profile ──────────────────────────────────────────────────────────────────
 
 def get_profile() -> dict:
-    return _load(PROFILE_FILE)
+    global _profile_cache
+    if _profile_cache is None:
+        _profile_cache = _hydrate_profile()
+    return _profile_cache
 
 
 def update_profile(key: str, value):
     profile = get_profile()
     profile[key] = value
+    _write_through_profile(profile)
+
+
+def _hydrate_profile() -> dict:
+    if turso_client.is_configured():
+        try:
+            existing = turso_client.kv_get(PROFILE_TABLE, PROFILE_KEY)
+            return existing if existing is not None else {}
+        except Exception as e:
+            print(f"[FRIDAY] Turso hydrate failed for profile, falling back to local JSON: {e}")
+    return _load(PROFILE_FILE)
+
+
+def _write_through_profile(profile: dict):
+    if turso_client.is_configured():
+        try:
+            turso_client.kv_set(PROFILE_TABLE, PROFILE_KEY, profile)
+            return
+        except Exception as e:
+            print(f"[FRIDAY] Turso write failed for profile, falling back to local JSON: {e}")
     _save(PROFILE_FILE, profile)
 
 
@@ -170,19 +207,59 @@ def friday_recall(key: str) -> str | None:
     return entry.get("value") if entry else None
 
 
-# ── Notes ("note that") ──────────────────────────────────────────────────────
+# ── Notes ("note that") — Turso-backed, same pattern as profile above ───────
+# Note: the old 500-cap only bounded the local JSON file's size; Turso's
+# list_insert has no equivalent trim, so the table itself grows unbounded
+# over time even though the in-memory cache below still caps at 500 for
+# read consistency. Not adding pruning logic for this pass — flagging it
+# rather than deciding unilaterally to add retention/deletion behavior
+# that wasn't asked for.
+
+NOTES_TABLE = "notes"
+_notes_cache = None
+
 
 def save_note(note: dict):
-    notes = _load(NOTES_FILE)
-    if not isinstance(notes, list):
-        notes = []
-    notes.append(note)
-    notes = notes[-500:]
-    _save(NOTES_FILE, notes)
+    global _notes_cache
+    if _notes_cache is None:
+        _notes_cache = _hydrate_notes()
+    _write_through_notes(note)  # may attach a Turso-assigned "id" to `note` in place
+    _notes_cache.append(note)
+    _notes_cache = _notes_cache[-500:]
 
 
 def get_notes(limit: int = 10) -> list:
+    global _notes_cache
+    if _notes_cache is None:
+        _notes_cache = _hydrate_notes()
+    return _notes_cache[-limit:]
+
+
+def _hydrate_notes() -> list:
+    if turso_client.is_configured():
+        try:
+            return turso_client.list_all(NOTES_TABLE)
+        except Exception as e:
+            print(f"[FRIDAY] Turso hydrate failed for notes, falling back to local JSON: {e}")
     notes = _load(NOTES_FILE)
-    if not isinstance(notes, list):
-        return []
-    return notes[-limit:]
+    return notes if isinstance(notes, list) else []
+
+
+def _write_through_notes(note: dict):
+    if turso_client.is_configured():
+        try:
+            note["id"] = turso_client.list_insert(NOTES_TABLE, note)
+        except Exception as e:
+            print(f"[FRIDAY] Turso write failed for notes, falling back to local JSON: {e}")
+            _save(NOTES_FILE, _notes_cache + [note])
+            return
+        # Trim is best-effort and separate from the write above — the note
+        # is already safely stored, so a trim failure here is an unbounded-
+        # growth concern, not a data-loss one, and shouldn't fall back to
+        # also writing local JSON on top of an already-successful insert.
+        try:
+            turso_client.list_trim(NOTES_TABLE, 500)
+        except Exception as e:
+            print(f"[FRIDAY] Turso trim failed for notes (non-fatal): {e}")
+        return
+    _save(NOTES_FILE, _notes_cache + [note])
