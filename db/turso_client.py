@@ -24,12 +24,29 @@ this module only owns talking to Turso itself. Every function here raises
 on failure rather than swallowing errors, so a caller's fallback-to-JSON
 logic (Stage 4) can actually detect that Turso failed instead of silently
 no-op'ing.
+
+Every public function below serializes through _lock. This app runs 10+
+background daemon threads (core/autonomous_agent.py's monitors) alongside
+the Flask request thread, all sharing this module's single connection —
+and in production this hit a real Rust-level panic ("failed to join
+thread: Resource deadlock avoided") inside libsql's internal tokio
+runtime when two threads called into it at the same time, which took
+down a gunicorn worker (WORKER TIMEOUT -> SIGKILL). The libsql Python
+bindings are not safe for concurrent multi-threaded use of one
+connection object; a single lock is the simplest fix given this app's
+scale (a handful of requests/monitors, not high-throughput) — a
+thread-local connection was considered but doesn't obviously sidestep
+the same underlying tokio-runtime issue, since it's unclear whether the
+panic was specific to sharing one connection or to libsql's runtime
+more broadly.
 """
 import os
 import json
+import threading
 from datetime import datetime
 
 _conn = None
+_lock = threading.Lock()
 
 
 class TursoNotConfigured(RuntimeError):
@@ -64,87 +81,96 @@ def _now() -> str:
 # ── Table setup ────────────────────────────────────────────────────────────
 
 def ensure_kv_table(table: str):
-    conn = _connect()
-    conn.execute(
-        f"CREATE TABLE IF NOT EXISTS {table} "
-        f"(key TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
-    )
-    conn.commit()
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {table} "
+            f"(key TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.commit()
 
 
 def ensure_list_table(table: str):
-    conn = _connect()
-    conn.execute(
-        f"CREATE TABLE IF NOT EXISTS {table} "
-        f"(id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
-    )
-    conn.commit()
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {table} "
+            f"(id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.commit()
 
 
 # ── kv_* — dict-keyed data (habits, people, second_brain, profile) ─────────
 
 def kv_get(table: str, key: str) -> dict | list | None:
-    conn = _connect()
-    row = conn.execute(f"SELECT data FROM {table} WHERE key = ?", (key,)).fetchone()
-    return json.loads(row[0]) if row else None
+    with _lock:
+        conn = _connect()
+        row = conn.execute(f"SELECT data FROM {table} WHERE key = ?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
 
 
 def kv_set(table: str, key: str, data: dict | list):
-    conn = _connect()
-    conn.execute(
-        f"INSERT INTO {table} (key, data, updated_at) VALUES (?, ?, ?) "
-        f"ON CONFLICT(key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-        (key, json.dumps(data), _now()),
-    )
-    conn.commit()
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            f"INSERT INTO {table} (key, data, updated_at) VALUES (?, ?, ?) "
+            f"ON CONFLICT(key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            (key, json.dumps(data), _now()),
+        )
+        conn.commit()
 
 
 def kv_all(table: str) -> dict:
-    conn = _connect()
-    rows = conn.execute(f"SELECT key, data FROM {table}").fetchall()
-    return {key: json.loads(data) for key, data in rows}
+    with _lock:
+        conn = _connect()
+        rows = conn.execute(f"SELECT key, data FROM {table}").fetchall()
+        return {key: json.loads(data) for key, data in rows}
 
 
 # ── list_* — flat record lists (tasks, bills, journal, workouts, notes) ────
 
 def list_insert(table: str, data: dict) -> int:
-    conn = _connect()
-    cur = conn.execute(
-        f"INSERT INTO {table} (data, updated_at) VALUES (?, ?)",
-        (json.dumps(data), _now()),
-    )
-    conn.commit()
-    return cur.lastrowid
+    with _lock:
+        conn = _connect()
+        cur = conn.execute(
+            f"INSERT INTO {table} (data, updated_at) VALUES (?, ?)",
+            (json.dumps(data), _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
 
 
 def list_all(table: str) -> list[dict]:
-    conn = _connect()
-    rows = conn.execute(f"SELECT id, data FROM {table} ORDER BY id").fetchall()
-    out = []
-    for row_id, data in rows:
-        record = json.loads(data)
-        record.setdefault("id", row_id)
-        out.append(record)
-    return out
+    with _lock:
+        conn = _connect()
+        rows = conn.execute(f"SELECT id, data FROM {table} ORDER BY id").fetchall()
+        out = []
+        for row_id, data in rows:
+            record = json.loads(data)
+            record.setdefault("id", row_id)
+            out.append(record)
+        return out
 
 
 def list_update(table: str, row_id: int, data: dict):
-    conn = _connect()
-    conn.execute(
-        f"UPDATE {table} SET data = ?, updated_at = ? WHERE id = ?",
-        (json.dumps(data), _now(), row_id),
-    )
-    conn.commit()
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            f"UPDATE {table} SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(data), _now(), row_id),
+        )
+        conn.commit()
 
 
 def list_trim(table: str, keep: int):
     """Delete all but the `keep` most-recent rows (highest id) from a
     list_* table — the Turso-side equivalent of the old JSON files'
     `data[-N:]` cap, since list_insert has no size limit of its own."""
-    conn = _connect()
-    conn.execute(
-        f"DELETE FROM {table} WHERE id NOT IN "
-        f"(SELECT id FROM {table} ORDER BY id DESC LIMIT ?)",
-        (keep,),
-    )
-    conn.commit()
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            f"DELETE FROM {table} WHERE id NOT IN "
+            f"(SELECT id FROM {table} ORDER BY id DESC LIMIT ?)",
+            (keep,),
+        )
+        conn.commit()
