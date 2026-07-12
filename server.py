@@ -782,6 +782,12 @@ RECON_TRIGGERS = [
     "recognizance on", "scout ",
 ]
 
+# Module-level (not local to command()) so friday_voice_transcribe() can
+# apply the same list when deciding whether a voice-originated lockdown
+# phrase needs a positively-verified speaker before it's even allowed to
+# reach command() as text — see that route for why.
+LOCKDOWN_TRIGGERS = ["lockdown now", "emergency lockdown", "lock the system", "suit lockdown"]
+
 # "stand down" deliberately left out — NORMAL_MODE_TRIGGERS already owns
 # that phrase for voice-mode reset, and SAFE_TRIGGERS is checked earlier
 # in command() (right after Mayday), so reusing it here would shadow the
@@ -1115,7 +1121,6 @@ def command():
             _log(prompt, response, "lockdown")
             return jsonify({"response": response, "mode": "lockdown", "blocked": True})
 
-        LOCKDOWN_TRIGGERS = ["lockdown now", "emergency lockdown", "lock the system", "suit lockdown"]
         if LOCKDOWN_OK and any(t in prompt.lower() for t in LOCKDOWN_TRIGGERS):
             suit_lockdown.activate(reason="voice command")
             response = "Lockdown active. Standing by."
@@ -2039,6 +2044,7 @@ def friday_voice_transcribe():
     # any other outcome (not enrolled, bridge unreachable, internal error)
     # fails open exactly like bridge.py's own /voice/verify does.
     mac_url = os.environ.get("MAC_BRIDGE_URL", "")
+    verify_result = None
     if mac_url:
         try:
             import httpx
@@ -2059,6 +2065,24 @@ def friday_voice_transcribe():
             pass
 
     result = transcribe_audio(audio_bytes, filename=filename)
+
+    # Extra scrutiny for Suit Lockdown specifically: the general check
+    # above only blocks a *confirmed* mismatch and fails open on anything
+    # ambiguous (not enrolled, bridge unreachable, verify error) — the
+    # right default for ordinary commands, but lockdown has no backdoor by
+    # design, so a false trigger from ambient/background audio is a real
+    # lockout, not just a wrong answer. Require a *positively confirmed*
+    # match before a lockdown phrase is even allowed to reach command() as
+    # text; anything less than that gets silently dropped here, same as a
+    # confirmed mismatch — never even acknowledging the phrase was heard.
+    # Typed lockdown triggers never pass through this route at all (no
+    # audio involved) and are completely unaffected.
+    text = (result.get("text") or "").lower()
+    if any(t in text for t in LOCKDOWN_TRIGGERS):
+        positively_verified = bool(verify_result) and verify_result.get("verified") is True and verify_result.get("match") is True
+        if not positively_verified:
+            return jsonify({"text": "", "rejected": True, "reason": "lockdown_requires_verified_speaker"})
+
     return jsonify(result)
 
 
@@ -3360,6 +3384,7 @@ body {
       <div class="clock-display" id="clock">--:--:--</div>
       <button class="panel-toggle voice-mode-btn" id="voice-mode-btn" onclick="toggleVoiceMode()" title="Hands-free wake-word listening">VOICE OFF</button>
       <button class="panel-toggle voice-mode-btn" id="enroll-voice-btn" onclick="enrollVoice()" title="Enroll your voice for speaker verification">&#127908; ENROLL MY VOICE</button>
+      <button class="panel-toggle" id="reset-voice-btn" onclick="resetVoiceEnrollment()" title="Wipe the stored voice profile and start over" style="font-size:9px">Reset &amp; Re-enroll</button>
       <button class="panel-toggle" onclick="toggleLeft()" title="Systems">&#9881;</button>
       <button class="panel-toggle" onclick="toggleRight()" title="Intelligence">&#9670;</button>
     </div>
@@ -3893,6 +3918,29 @@ async function enrollVoice() {
     btn.textContent = `🎤 ENROLL MY VOICE (${enrollSampleCount}/${ENROLL_TARGET}) — CLICK TO CONTINUE`;
     btn.disabled = false;
   }
+}
+
+async function resetVoiceEnrollment() {
+  const resetBtn = document.getElementById('reset-voice-btn');
+  const enrollBtn = document.getElementById('enroll-voice-btn');
+  resetBtn.disabled = true;
+  try {
+    await fetch(`${BASE}/friday/voice/reset`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({profile: 'default'}),
+    });
+  } catch (e) {
+    // Even if the reset call itself failed to reach the bridge, still
+    // reset local state below — worst case the boss re-enrolls over a
+    // profile that didn't actually get wiped, which is a no-op on the
+    // bridge side (enroll appends samples, doesn't require a clean slate).
+  }
+  enrollSampleCount = 0;
+  enrollInFlight = false;
+  enrollBtn.disabled = false;
+  enrollBtn.textContent = '🎤 ENROLL MY VOICE';
+  resetBtn.disabled = false;
 }
 
 async function setMode(mode) {

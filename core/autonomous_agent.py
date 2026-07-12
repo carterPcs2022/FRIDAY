@@ -520,7 +520,16 @@ class AutonomousAgent:
         Mac Bridge route this repo is known to poll) — a real GET/response
         cycle rather than just checking whether the URL is configured.
         Debounced to 2 consecutive failures before alerting so a single
-        dropped request on an otherwise-fine bridge doesn't page anyone."""
+        dropped request on an otherwise-fine bridge doesn't page anyone.
+
+        Also remembers the last known battery reading while the bridge was
+        up: production logs showed hours of repeated "unreachable" alerts
+        correlating with the Mac's battery having been in the 13-20% range
+        — almost certainly the Mac going to sleep on low power (killing
+        bridge.py/the tunnel) rather than a real crash needing intervention
+        each time. When that's the likely cause, note it in the alert and
+        throttle re-alerts to every 2 hours instead of ~hourly, since it's
+        overwhelmingly likely to be the same already-known cause repeating."""
         mac_url = os.getenv("MAC_BRIDGE_URL", "")
         if not mac_url:
             return
@@ -531,6 +540,11 @@ class AutonomousAgent:
                 headers={"Authorization": f"Bearer {os.getenv('MAC_BRIDGE_TOKEN', '')}"},
             )
             ok = r.status_code == 200
+            if ok:
+                try:
+                    self._last_known_battery = r.json().get("battery")
+                except Exception:
+                    pass
         except Exception:
             ok = False
 
@@ -539,9 +553,24 @@ class AutonomousAgent:
             return
 
         self._mac_bridge_failures += 1
-        if self._mac_bridge_failures >= 2:
-            self._alert("Boss, Mac Bridge isn't responding — checked twice now.", priority="high")
-            self._mac_bridge_failures = 0  # avoid re-alerting every 30 min while still down
+        if self._mac_bridge_failures < 2:
+            return
+
+        last_batt = getattr(self, "_last_known_battery", None)
+        likely_sleep = last_batt is not None and last_batt < 20
+        cooldown = 7200 if likely_sleep else 0  # 2hrs when a known cause likely applies; otherwise the 2-failure debounce above is throttle enough
+        last_alert_ts = getattr(self, "_last_mac_bridge_alert_ts", 0)
+        self._mac_bridge_failures = 0  # avoid re-checking the threshold every 30 min regardless of whether we actually alert below
+
+        if time.time() - last_alert_ts < cooldown:
+            return  # same known likely cause as the last alert — don't re-page yet
+
+        battery_context = (
+            f" Last known battery was {last_batt}% — likely went to sleep from low power rather than crashed."
+            if likely_sleep else ""
+        )
+        self._alert(f"Mac Bridge isn't responding, boss.{battery_context}", priority="high")
+        self._last_mac_bridge_alert_ts = time.time()
 
     # ── Disk cleanup ──────────────────────────────────────────────────────────
     def _disk_cleanup(self):
