@@ -173,15 +173,26 @@ def init_default_goals():
     """Seeds the three starting goals on first run only — never
     overwrites/duplicates if goals already exist."""
     if not goals.get_active_goals():
-        goals.add_goal(
+        suit_goal = goals.add_goal(
             name="Iron Man Suit",
             description="Build a real Iron Man suit with JARVIS as the AI backbone",
             milestones=[
-                "OBD-II driving system", "Biometric baseline complete",
-                "Mac Bridge operational", "First physical prototype",
-                "JARVIS helmet HUD", "Full suit integration",
+                "Arc reactor prop build (in progress)",
+                "OBD-II driving training system",
+                "Mac Bridge operational",
+                "Biometric baseline complete",
+                "First wearable component",
+                "Full suit integration",
             ]
         )
+        # Mac Bridge is genuinely done already — record it directly rather
+        # than through complete_milestone() (that method also fires an LLM
+        # "celebrate this" call, which is the wrong side effect for a
+        # cold-start seed running at import time, not a real just-now event).
+        goals._goals[suit_goal["id"]]["completed_milestones"].append({
+            "milestone": "Mac Bridge operational", "completed": datetime.now().isoformat(),
+        })
+        goals._save()
         goals.add_goal(
             name="JARVIS V5 Complete",
             description="All JARVIS features operational and stable",
