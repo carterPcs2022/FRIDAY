@@ -3258,6 +3258,35 @@ body {
 
 <div class="particles" id="particles"></div>
 <canvas id="friday-face" width="220" height="220"></canvas>
+
+<!-- HELMET VIEW — first-person HUD overlay -->
+<canvas id="reticle-overlay" width="680" height="680"
+  style="position:fixed;top:50%;left:50%;
+  transform:translate(-50%,-50%);
+  opacity:0.35;pointer-events:none;z-index:1;
+  mix-blend-mode:screen">
+</canvas>
+
+<div id="hud-edge-strip" style="position:fixed;top:80px;left:20px;right:20px;
+  display:flex;justify-content:space-between;
+  pointer-events:none;z-index:2;opacity:0.6">
+  <div style="font-size:9px;color:rgba(0,168,255,0.6);
+    letter-spacing:1px;font-family:'Courier New'">
+    <div>ALT: <span id="hud-alt">---</span></div>
+    <div>HDG: <span id="hud-hdg">---</span></div>
+  </div>
+  <div style="font-size:9px;color:rgba(0,168,255,0.6);
+    letter-spacing:1px;text-align:right;
+    font-family:'Courier New'">
+    <div>LAT: <span id="hud-lat">---</span></div>
+    <div>PWR: <span id="hud-pwr">---</span></div>
+  </div>
+</div>
+
+<canvas id="corner-radar-friday" width="80" height="80"
+  style="position:fixed;bottom:100px;left:20px;
+  opacity:0.5;pointer-events:none;z-index:2">
+</canvas>
 <div class="cov-banner" id="cov-banner">COVERAGE MODE - JARVIS OFFLINE</div>
 <div class="backdrop" id="backdrop" onclick="closeAll()"></div>
 
@@ -3387,6 +3416,13 @@ body {
       <button class="panel-toggle" id="reset-voice-btn" onclick="resetVoiceEnrollment()" title="Wipe the stored voice profile and start over" style="font-size:9px">Reset &amp; Re-enroll</button>
       <button class="panel-toggle" onclick="toggleLeft()" title="Systems">&#9881;</button>
       <button class="panel-toggle" onclick="toggleRight()" title="Intelligence">&#9670;</button>
+      <button id="reticle-toggle-btn" onclick="toggleReticle()"
+        style="padding:4px 12px;border-radius:2px;
+        border:1px solid rgba(0,168,255,0.6);
+        background:transparent;color:#00a8ff;
+        font-size:9px;letter-spacing:2px;cursor:pointer">
+        &#9678; HELMET VIEW
+      </button>
     </div>
   </div>
 
@@ -3991,6 +4027,8 @@ async function pollState() {
     if (d.cpu_pct !== undefined && d.cpu_pct !== null) {
       document.getElementById('p-cpu').textContent = `${d.cpu_pct}%`;
       document.getElementById('p-cpu-bar').style.width = `${d.cpu_pct}%`;
+      const pwrEl = document.getElementById('hud-pwr');
+      if (pwrEl) pwrEl.textContent = `${Math.max(0, Math.round(100 - d.cpu_pct))}%`;
     }
     if (d.ram_pct !== undefined && d.ram_pct !== null) {
       document.getElementById('p-ram').textContent = `${d.ram_pct}%`;
@@ -4248,6 +4286,164 @@ document.addEventListener('keydown', e => {
     requestAnimationFrame(drawFace);
   }
   drawFace();
+})();
+</script>
+
+<script>
+// ── Helmet view — first-person targeting reticle overlay (blue theme) ─────────
+(function() {
+  const c = document.getElementById('reticle-overlay');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  const W = 680, H = 680, CX = 340, CY = 340;
+  let t = 0;
+
+  function drawReticle() {
+    ctx.clearRect(0, 0, W, H);
+    const glow = 0.4 + Math.sin(t * 0.8) * 0.15;
+
+    const R = 220;
+    ctx.strokeStyle = `rgba(0,168,255,${glow * 0.5})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(CX, CY, R, 0, Math.PI * 2);
+    ctx.stroke();
+
+    for (let i = 0; i < 72; i++) {
+      const angle = (i / 72) * Math.PI * 2;
+      const isLong = i % 6 === 0;
+      const inner = R - (isLong ? 12 : 5);
+      const x1 = CX + Math.cos(angle) * inner;
+      const y1 = CY + Math.sin(angle) * inner;
+      const x2 = CX + Math.cos(angle) * R;
+      const y2 = CY + Math.sin(angle) * R;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.strokeStyle = isLong
+        ? `rgba(51,204,255,${glow * 0.7})`
+        : `rgba(0,168,255,${glow * 0.25})`;
+      ctx.lineWidth = isLong ? 1.5 : 0.5;
+      ctx.stroke();
+    }
+
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.rotate(t * 0.15);
+    const R2 = 160;
+    for (let i = 0; i < 6; i++) {
+      const a1 = (i / 6) * Math.PI * 2;
+      const a2 = a1 + Math.PI / 6 * 0.6;
+      ctx.beginPath();
+      ctx.arc(0, 0, R2, a1, a2);
+      ctx.strokeStyle = `rgba(0,168,255,${glow * 0.4})`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    const chSize = 14;
+    ctx.strokeStyle = `rgba(72,202,228,${glow * 0.6})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(CX - chSize, CY);
+    ctx.lineTo(CX - chSize/2, CY);
+    ctx.moveTo(CX + chSize/2, CY);
+    ctx.lineTo(CX + chSize, CY);
+    ctx.moveTo(CX, CY - chSize);
+    ctx.lineTo(CX, CY - chSize/2);
+    ctx.moveTo(CX, CY + chSize/2);
+    ctx.lineTo(CX, CY + chSize);
+    ctx.stroke();
+
+    ctx.font = '9px Courier New';
+    ctx.fillStyle = `rgba(51,204,255,${glow * 0.5})`;
+    const labels = [
+      {angle: -Math.PI/2, text: 'SYS OK'},
+      {angle: 0, text: '85x'},
+      {angle: Math.PI/2, text: 'STBY'},
+      {angle: Math.PI, text: '3.45'},
+    ];
+    labels.forEach(l => {
+      const lx = CX + Math.cos(l.angle) * (R + 16);
+      const ly = CY + Math.sin(l.angle) * (R + 16);
+      ctx.textAlign = 'center';
+      ctx.fillText(l.text, lx, ly);
+    });
+
+    t += 0.01;
+    requestAnimationFrame(drawReticle);
+  }
+  drawReticle();
+})();
+
+// ── Corner radar sweep ──────────────────────────────────────────────────────
+(function() {
+  const c = document.getElementById('corner-radar-friday');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  let sweepAngle = 0;
+
+  function drawRadar() {
+    ctx.clearRect(0, 0, 80, 80);
+    const CX = 40, CY = 40, R = 32;
+
+    ctx.strokeStyle = 'rgba(0,168,255,0.3)';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.arc(CX, CY, R, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(CX, CY, R * 0.6, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(CX - R, CY); ctx.lineTo(CX + R, CY);
+    ctx.moveTo(CX, CY - R); ctx.lineTo(CX, CY + R);
+    ctx.stroke();
+
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.rotate(sweepAngle);
+    const grad = ctx.createLinearGradient(0, 0, R, 0);
+    grad.addColorStop(0, 'rgba(0,168,255,0.5)');
+    grad.addColorStop(1, 'rgba(0,168,255,0)');
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(R, 0);
+    ctx.stroke();
+    ctx.restore();
+
+    sweepAngle += 0.02;
+    requestAnimationFrame(drawRadar);
+  }
+  drawRadar();
+})();
+
+// ── Toggle + localStorage persistence ───────────────────────────────────────
+let reticleOn = true;
+function toggleReticle() {
+  reticleOn = !reticleOn;
+  localStorage.setItem('helmetViewOn', reticleOn);
+  const display = reticleOn ? 'block' : 'none';
+  document.getElementById('reticle-overlay').style.display = display;
+  document.getElementById('hud-edge-strip').style.display = display;
+  document.getElementById('corner-radar-friday').style.display = display;
+  const btn = document.getElementById('reticle-toggle-btn');
+  btn.style.borderColor = reticleOn
+    ? 'rgba(0,168,255,0.6)' : 'rgba(0,168,255,0.3)';
+}
+(function() {
+  const savedState = localStorage.getItem('helmetViewOn');
+  if (savedState === 'false') {
+    reticleOn = false;
+    document.getElementById('reticle-overlay').style.display = 'none';
+    document.getElementById('hud-edge-strip').style.display = 'none';
+    document.getElementById('corner-radar-friday').style.display = 'none';
+    document.getElementById('reticle-toggle-btn').style.borderColor = 'rgba(0,168,255,0.3)';
+  }
 })();
 </script>
 </body>
