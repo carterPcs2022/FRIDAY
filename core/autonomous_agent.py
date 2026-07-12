@@ -8,6 +8,20 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# EMERGENCY REVERT (2026-07-12): these two go back to reading the local
+# JSON file directly instead of server.get_tasks()/get_bills(). Turso
+# calls from background daemon threads (this class runs 10+ of them)
+# were causing a real production crash loop — a Rust panic inside
+# libsql's tokio runtime ("failed to join thread: Resource deadlock
+# avoided") that survived two different connection-lifecycle fixes,
+# pointing at background-thread access to libsql itself being unsafe,
+# not how the connection object was managed. This stops the bleeding;
+# the real fix (isolating all Turso access to the main Flask thread) is
+# still pending. server.py's own request-thread paths for tasks/bills
+# stay on Turso — only these background monitors are affected.
+TASK_FILE = Path("memory/friday_tasks.json")
+BILLS_FILE = Path("memory/friday_bills.json")
+
 
 class AutonomousAgent:
 
@@ -98,13 +112,13 @@ class AutonomousAgent:
     def _task_staleness(self):
         """FRIDAY flags tasks that have been sitting for 7+ days without progress."""
         try:
-            # See _sunday_brief()'s comment — same call-time-import reasoning,
-            # same fix (was a direct TASK_FILE read that would've silently
-            # diverged from get_tasks() once tasks moved to Turso).
-            from server import get_tasks
-            tasks = get_tasks()
-            if not tasks:
+            # EMERGENCY REVERT — see module docstring. Back to reading
+            # TASK_FILE directly; will diverge from Turso-backed tasks
+            # added via the app until the real fix lands.
+            import json
+            if not TASK_FILE.exists():
                 return
+            tasks = json.loads(TASK_FILE.read_text())
 
             now = datetime.now()
             old_tasks = []
@@ -135,8 +149,28 @@ class AutonomousAgent:
         """FRIDAY notices when you haven't talked to important people in
         too long. Only runs once per day (interval=86400)."""
         try:
-            from services.friday_relationships import relationships
-            overdue = relationships.who_needs_attention()
+            # EMERGENCY REVERT — see module docstring. Reading local JSON
+            # directly instead of the `relationships` singleton, which
+            # would trigger its Turso-backed hydrate() on first touch in
+            # this worker if this background thread got there first.
+            import json
+            people_file = Path("memory/friday_people.json")
+            if not people_file.exists():
+                return
+            people = json.loads(people_file.read_text())
+            now_dt = datetime.now()
+            overdue = []
+            for name, person in people.items():
+                last = person.get("last_contact", "")
+                if not last:
+                    continue
+                try:
+                    days = (now_dt - datetime.fromisoformat(last)).days
+                    if days >= 14:
+                        overdue.append({"name": name, "days_since": days})
+                except Exception:
+                    pass
+            overdue.sort(key=lambda x: x["days_since"], reverse=True)
             if not overdue:
                 return
 
@@ -229,16 +263,10 @@ class AutonomousAgent:
         flag.parent.mkdir(parents=True, exist_ok=True)
         flag.touch()
 
-        # Imported at call time, not module scope — server.py starts this
-        # agent's thread from inside its own startup code, so importing it
-        # back at module scope would be circular (same reason _alert()
-        # imports _FOCUS_SESSION from server this way). Was previously a
-        # local duplicate of server.py's own TASK_FILE-reading logic that
-        # would've silently diverged from get_tasks() once tasks moved to
-        # Turso — this makes both readers the same code path again.
-        from server import get_tasks
-
-        tasks = get_tasks()
+        # EMERGENCY REVERT — see module docstring. Back to reading
+        # TASK_FILE directly.
+        import json
+        tasks = json.loads(TASK_FILE.read_text()) if TASK_FILE.exists() else []
         week_tasks = []
         for t in tasks:
             if not t.get("done"):
@@ -250,17 +278,29 @@ class AutonomousAgent:
                 pass
         pending_tasks = [t for t in tasks if not t.get("done")]
 
+        # EMERGENCY REVERT — see module docstring. Reading local JSON
+        # directly instead of the journal/habits singletons, which would
+        # trigger their Turso-backed hydrate() on first touch in this
+        # worker if this background thread got there first.
         journal_count = 0
         try:
-            from services.friday_journal import journal
-            journal_count = len(journal.recent_entries(7))
+            import json
+            journal_file = Path("memory/friday_journal.json")
+            if journal_file.exists():
+                entries = json.loads(journal_file.read_text())
+                journal_count = sum(
+                    1 for e in entries
+                    if (now - datetime.fromisoformat(e["ts"])).days < 7
+                )
         except Exception:
             pass
 
         streaks = {}
         try:
-            from services.friday_habits import habits
-            streaks = habits.all_streaks()
+            import json
+            habits_file = Path("memory/friday_habits.json")
+            if habits_file.exists():
+                streaks = {h: len(dates) for h, dates in json.loads(habits_file.read_text()).items()}
         except Exception:
             pass
 
@@ -366,11 +406,12 @@ class AutonomousAgent:
         own hour-based dedup keeps this from repeating more than once an
         hour even though this window can span several days."""
         try:
-            # See _sunday_brief()'s comment on call-time imports — same
-            # reasoning, same fix (was a direct BILLS_FILE read that would've
-            # silently diverged from get_bills() once bills moved to Turso).
-            from server import get_bills
-            bills = get_bills()
+            # EMERGENCY REVERT — see module docstring. Back to reading
+            # BILLS_FILE directly.
+            import json
+            if not BILLS_FILE.exists():
+                return
+            bills = json.loads(BILLS_FILE.read_text())
             today = datetime.now().day
             for bill in bills:
                 if abs(bill.get("due_day", 0) - today) <= 2:
@@ -464,9 +505,10 @@ class AutonomousAgent:
         _alert()'s hour-based dedup keeps this from repeating more than
         once an hour."""
         try:
-            # See _sunday_brief()'s comment — same call-time-import reasoning.
-            from server import get_tasks
-            tasks = get_tasks()
+            # EMERGENCY REVERT — see module docstring. Back to reading
+            # TASK_FILE directly.
+            import json
+            tasks = json.loads(TASK_FILE.read_text()) if TASK_FILE.exists() else []
             meeting_tasks = [
                 t for t in tasks
                 if any(w in t.get("task", "").lower()

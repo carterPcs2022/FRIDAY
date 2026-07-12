@@ -446,13 +446,17 @@ def _combined_morning_brief() -> str:
         if news_anchor:
             parts["news"] = news_anchor.morning_brief()
 
+    # EMERGENCY REVERT (2026-07-12): _people/_brain disabled entirely for
+    # now — relationships/second_brain are Turso-backed, and calling them
+    # from this function's background thread (or the ThreadPoolExecutor
+    # workers below) risks the same production crash loop documented in
+    # core/autonomous_agent.py's module docstring. Re-enable once Turso
+    # access is isolated to the main Flask thread.
     def _people():
-        if relationships:
-            parts["relationships"] = relationships.relationship_brief()
+        pass
 
     def _brain():
-        if second_brain:
-            parts["brain"] = second_brain.daily_digest()
+        pass
 
     urgent_emails = []
 
@@ -495,9 +499,19 @@ def _combined_morning_brief() -> str:
 
     combined = "\n".join(f"- {v}" for v in parts.values() if v)
 
-    from core.friday_memory import get_notes
-    pending_tasks = [t for t in get_tasks() if not t.get("done")]
-    recent_notes = get_notes(3)
+    # EMERGENCY REVERT (2026-07-12): reading TASK_FILE/NOTES_FILE directly
+    # instead of get_tasks()/get_notes() — see module-level note above and
+    # core/autonomous_agent.py's docstring for why. This runs on
+    # _morning_brief_loop's background thread.
+    try:
+        pending_tasks = [t for t in json.loads(TASK_FILE.read_text()) if not t.get("done")] if TASK_FILE.exists() else []
+    except Exception:
+        pending_tasks = []
+    try:
+        notes_file = Path("memory/friday_notes.json")
+        recent_notes = json.loads(notes_file.read_text())[-3:] if notes_file.exists() else []
+    except Exception:
+        recent_notes = []
     email_note = f"{len(urgent_emails)} urgent emails need attention." if urgent_emails else ""
     # Always an explicit status line — never leave calendar blank in the
     # prompt. An empty calendar_note gives the LLM zero signal about
