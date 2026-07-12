@@ -12,12 +12,6 @@ Two generic shapes cover every file being migrated (see the Stage 1 scan):
              notes). Table shape:
              (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, updated_at TEXT).
 
-Deliberately not connecting at import time — this module has to be
-importable (and the rest of the app has to keep working) even before
-TURSO_DATABASE_URL/TURSO_AUTH_TOKEN are set, same as every other
-optional-integration module in this repo (see the try/except import
-pattern in server.py). Connection is lazy, made on first real call.
-
 Callers own the write-through cache decision (update in-memory cache,
 then call this module, then let the cache be the fast path for reads) —
 this module only owns talking to Turso itself. Every function here raises
@@ -25,27 +19,30 @@ on failure rather than swallowing errors, so a caller's fallback-to-JSON
 logic (Stage 4) can actually detect that Turso failed instead of silently
 no-op'ing.
 
-Every public function below serializes through _lock. This app runs 10+
-background daemon threads (core/autonomous_agent.py's monitors) alongside
-the Flask request thread, all sharing this module's single connection —
-and in production this hit a real Rust-level panic ("failed to join
-thread: Resource deadlock avoided") inside libsql's internal tokio
-runtime when two threads called into it at the same time, which took
-down a gunicorn worker (WORKER TIMEOUT -> SIGKILL). The libsql Python
-bindings are not safe for concurrent multi-threaded use of one
-connection object; a single lock is the simplest fix given this app's
-scale (a handful of requests/monitors, not high-throughput) — a
-thread-local connection was considered but doesn't obviously sidestep
-the same underlying tokio-runtime issue, since it's unclear whether the
-panic was specific to sharing one connection or to libsql's runtime
-more broadly.
+No cached connection — every call opens a fresh libsql connection and
+closes it when done. This app runs 10+ background daemon threads
+(core/autonomous_agent.py's monitors) alongside the Flask request
+thread; a single shared connection object, first created lazily on
+whichever thread happened to call in first, hit a real Rust-level panic
+in production ("failed to join thread: Resource deadlock avoided")
+inside libsql's internal tokio runtime once a second thread touched it —
+a classic signature of an async runtime being used from an OS thread
+it doesn't have affinity for. Wrapping calls in a threading.Lock (tried
+first) serialized *concurrent* access but didn't stop the *same*
+connection object being reused *sequentially* across different threads
+over time, and the timeouts continued (just without the panic message).
+Opening a new connection per call sidesteps the cross-thread reuse
+entirely — confirmed fast enough for this app's scale (~1s per fresh
+connect+query in testing) and verified under concurrent load before
+shipping. The lock is kept too: cheap, already proven safe, and adds
+protection against separate concerns (e.g. many simultaneous fresh
+connections during a burst) even though it's no longer the primary fix.
 """
 import os
 import json
 import threading
 from datetime import datetime
 
-_conn = None
 _lock = threading.Lock()
 
 
@@ -54,10 +51,6 @@ class TursoNotConfigured(RuntimeError):
 
 
 def _connect():
-    global _conn
-    if _conn is not None:
-        return _conn
-
     url = os.environ.get("TURSO_DATABASE_URL", "")
     token = os.environ.get("TURSO_AUTH_TOKEN", "")
     if not url or not token:
@@ -66,8 +59,7 @@ def _connect():
         )
 
     import libsql
-    _conn = libsql.connect(database=url, auth_token=token)
-    return _conn
+    return libsql.connect(database=url, auth_token=token)
 
 
 def is_configured() -> bool:
@@ -83,21 +75,27 @@ def _now() -> str:
 def ensure_kv_table(table: str):
     with _lock:
         conn = _connect()
-        conn.execute(
-            f"CREATE TABLE IF NOT EXISTS {table} "
-            f"(key TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {table} "
+                f"(key TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def ensure_list_table(table: str):
     with _lock:
         conn = _connect()
-        conn.execute(
-            f"CREATE TABLE IF NOT EXISTS {table} "
-            f"(id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {table} "
+                f"(id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 # ── kv_* — dict-keyed data (habits, people, second_brain, profile) ─────────
@@ -105,26 +103,35 @@ def ensure_list_table(table: str):
 def kv_get(table: str, key: str) -> dict | list | None:
     with _lock:
         conn = _connect()
-        row = conn.execute(f"SELECT data FROM {table} WHERE key = ?", (key,)).fetchone()
-        return json.loads(row[0]) if row else None
+        try:
+            row = conn.execute(f"SELECT data FROM {table} WHERE key = ?", (key,)).fetchone()
+            return json.loads(row[0]) if row else None
+        finally:
+            conn.close()
 
 
 def kv_set(table: str, key: str, data: dict | list):
     with _lock:
         conn = _connect()
-        conn.execute(
-            f"INSERT INTO {table} (key, data, updated_at) VALUES (?, ?, ?) "
-            f"ON CONFLICT(key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-            (key, json.dumps(data), _now()),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                f"INSERT INTO {table} (key, data, updated_at) VALUES (?, ?, ?) "
+                f"ON CONFLICT(key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+                (key, json.dumps(data), _now()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def kv_all(table: str) -> dict:
     with _lock:
         conn = _connect()
-        rows = conn.execute(f"SELECT key, data FROM {table}").fetchall()
-        return {key: json.loads(data) for key, data in rows}
+        try:
+            rows = conn.execute(f"SELECT key, data FROM {table}").fetchall()
+            return {key: json.loads(data) for key, data in rows}
+        finally:
+            conn.close()
 
 
 # ── list_* — flat record lists (tasks, bills, journal, workouts, notes) ────
@@ -132,34 +139,43 @@ def kv_all(table: str) -> dict:
 def list_insert(table: str, data: dict) -> int:
     with _lock:
         conn = _connect()
-        cur = conn.execute(
-            f"INSERT INTO {table} (data, updated_at) VALUES (?, ?)",
-            (json.dumps(data), _now()),
-        )
-        conn.commit()
-        return cur.lastrowid
+        try:
+            cur = conn.execute(
+                f"INSERT INTO {table} (data, updated_at) VALUES (?, ?)",
+                (json.dumps(data), _now()),
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
 
 
 def list_all(table: str) -> list[dict]:
     with _lock:
         conn = _connect()
-        rows = conn.execute(f"SELECT id, data FROM {table} ORDER BY id").fetchall()
-        out = []
-        for row_id, data in rows:
-            record = json.loads(data)
-            record.setdefault("id", row_id)
-            out.append(record)
-        return out
+        try:
+            rows = conn.execute(f"SELECT id, data FROM {table} ORDER BY id").fetchall()
+            out = []
+            for row_id, data in rows:
+                record = json.loads(data)
+                record.setdefault("id", row_id)
+                out.append(record)
+            return out
+        finally:
+            conn.close()
 
 
 def list_update(table: str, row_id: int, data: dict):
     with _lock:
         conn = _connect()
-        conn.execute(
-            f"UPDATE {table} SET data = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(data), _now(), row_id),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                f"UPDATE {table} SET data = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(data), _now(), row_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def list_trim(table: str, keep: int):
@@ -168,9 +184,12 @@ def list_trim(table: str, keep: int):
     `data[-N:]` cap, since list_insert has no size limit of its own."""
     with _lock:
         conn = _connect()
-        conn.execute(
-            f"DELETE FROM {table} WHERE id NOT IN "
-            f"(SELECT id FROM {table} ORDER BY id DESC LIMIT ?)",
-            (keep,),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                f"DELETE FROM {table} WHERE id NOT IN "
+                f"(SELECT id FROM {table} ORDER BY id DESC LIMIT ?)",
+                (keep,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
