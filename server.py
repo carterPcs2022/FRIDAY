@@ -460,10 +460,12 @@ def _combined_morning_brief() -> str:
             energy[0] = voice_memory.predict_energy_now()
 
     todays_events = []
+    calendar_connected = False
 
     def _calendar():
-        nonlocal todays_events
+        nonlocal todays_events, calendar_connected
         if friday_calendar and friday_calendar.is_connected():
+            calendar_connected = True
             todays_events = friday_calendar.get_today()
 
     followup = [""]
@@ -489,10 +491,17 @@ def _combined_morning_brief() -> str:
     pending_tasks = [t for t in get_tasks() if not t.get("done")]
     recent_notes = get_notes(3)
     email_note = f"{len(urgent_emails)} urgent emails need attention." if urgent_emails else ""
-    calendar_note = (
-        f"Today's calendar: {', '.join(e['title'] for e in todays_events[:5])}"
-        if todays_events else ""
-    )
+    # Always an explicit status line — never leave calendar blank in the
+    # prompt. An empty calendar_note gives the LLM zero signal about
+    # *why* it's empty (not connected? connected but nothing today?), and
+    # "combine these into one brief" style prompts otherwise happily fill
+    # that gap with a plausible-sounding invented meeting.
+    if not calendar_connected:
+        calendar_note = "Calendar is not connected. Do not invent or assume any meetings, events, or appointments."
+    elif not todays_events:
+        calendar_note = "No events on calendar today. Do not invent any meetings."
+    else:
+        calendar_note = f"Today's calendar: {', '.join(e['title'] for e in todays_events[:5])}"
 
     extra = (
         f"Pending tasks: {len(pending_tasks)}\n"
@@ -1327,13 +1336,27 @@ def command():
             people = catchup_data.get("people", [])
             tasks_cnt = catchup_data.get("tasks", 0)
 
+            # This brief didn't pull calendar data before, but "brief" style
+            # prompts can still volunteer a plausible-sounding meeting
+            # unprompted — an explicit status line closes that gap the same
+            # way _combined_morning_brief() needed it.
+            if friday_calendar and friday_calendar.is_connected():
+                todays = friday_calendar.get_today()
+                calendar_line = (
+                    f"Today's calendar: {', '.join(e['title'] for e in todays[:5])}"
+                    if todays else "No events on calendar today. Do not invent any meetings."
+                )
+            else:
+                calendar_line = "Calendar is not connected. Do not invent or assume any meetings, events, or appointments."
+
             result = friday_brain.think(
                 f"Catch-up brief:\n"
                 f"Unread emails: {len(emails)}\n"
                 f"Top email: {emails[0].get('subject', '') if emails else 'none'}\n"
                 f"Pending tasks: {tasks_cnt}\n"
                 f"People needing contact: {len(people)}\n"
-                f"News: {news[:100] if news else 'none'}\n\n"
+                f"News: {news[:100] if news else 'none'}\n"
+                f"{calendar_line}\n\n"
                 f"Quick catch-up brief. Most important first. Under 80 words. FRIDAY style."
             )
             response = result["response"]
@@ -2000,8 +2023,84 @@ def friday_voice_transcribe():
         return jsonify({"text": "", "error": "audio file required"}), 400
 
     audio_file = request.files["audio"]
-    result = transcribe_audio(audio_file.read(), filename=audio_file.filename or "audio.webm")
+    audio_bytes = audio_file.read()
+    filename = audio_file.filename or "audio.webm"
+
+    # Speaker-verify before spending a Groq Whisper call — only skip
+    # transcription on a *confirmed* mismatch (verified=True, match=False);
+    # any other outcome (not enrolled, bridge unreachable, internal error)
+    # fails open exactly like bridge.py's own /voice/verify does.
+    mac_url = os.environ.get("MAC_BRIDGE_URL", "")
+    if mac_url:
+        try:
+            import httpx
+            r = httpx.post(
+                f"{mac_url}/voice/verify",
+                files={"audio": (filename, audio_bytes, audio_file.mimetype or "audio/webm")},
+                data={"profile": "default"},
+                headers={"Authorization": f"Bearer {os.environ.get('MAC_BRIDGE_TOKEN', '')}"},
+                timeout=10,
+            )
+            verify_result = r.json()
+            if verify_result.get("verified") is True and verify_result.get("match") is False:
+                return jsonify({
+                    "text": "", "rejected": True, "reason": "voice_mismatch",
+                    "score": verify_result.get("score"),
+                })
+        except Exception:
+            pass
+
+    result = transcribe_audio(audio_bytes, filename=filename)
     return jsonify(result)
+
+
+@app.route("/friday/voice/enroll", methods=["POST"])
+def friday_voice_enroll():
+    """Thin proxy to Mac Bridge's /voice/enroll — the browser never sees
+    MAC_BRIDGE_TOKEN, so enrollment has to go through here rather than the
+    HUD hitting the bridge directly."""
+    mac_url = os.environ.get("MAC_BRIDGE_URL", "")
+    if not mac_url:
+        return jsonify({"error": "Mac Bridge not configured"}), 503
+    if "audio" not in request.files:
+        return jsonify({"error": "audio file required"}), 400
+
+    audio_file = request.files["audio"]
+    profile = request.form.get("profile", "default")
+    try:
+        import httpx
+        r = httpx.post(
+            f"{mac_url}/voice/enroll",
+            files={"audio": (audio_file.filename or "audio.webm", audio_file.read(), audio_file.mimetype or "audio/webm")},
+            data={"profile": profile},
+            headers={"Authorization": f"Bearer {os.environ.get('MAC_BRIDGE_TOKEN', '')}"},
+            timeout=15,
+        )
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": f"Couldn't reach the Mac bridge, boss: {e}"}), 502
+
+
+@app.route("/friday/voice/profile/status", methods=["GET"])
+def friday_voice_profile_status():
+    """Thin proxy to Mac Bridge's /voice/profile/status — same token-hiding
+    rationale as friday_voice_enroll above."""
+    mac_url = os.environ.get("MAC_BRIDGE_URL", "")
+    if not mac_url:
+        return jsonify({"error": "Mac Bridge not configured"}), 503
+
+    profile = request.args.get("profile", "default")
+    try:
+        import httpx
+        r = httpx.get(
+            f"{mac_url}/voice/profile/status",
+            params={"profile": profile},
+            headers={"Authorization": f"Bearer {os.environ.get('MAC_BRIDGE_TOKEN', '')}"},
+            timeout=10,
+        )
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": f"Couldn't reach the Mac bridge, boss: {e}"}), 502
 
 
 # ── JARVIS takeover ────────────────────────────────────────────────────────────
@@ -3229,6 +3328,7 @@ body {
     <div class="top-right">
       <div class="clock-display" id="clock">--:--:--</div>
       <button class="panel-toggle voice-mode-btn" id="voice-mode-btn" onclick="toggleVoiceMode()" title="Hands-free wake-word listening">VOICE OFF</button>
+      <button class="panel-toggle voice-mode-btn" id="enroll-voice-btn" onclick="enrollVoice()" title="Enroll your voice for speaker verification">&#127908; ENROLL MY VOICE</button>
       <button class="panel-toggle" onclick="toggleLeft()" title="Systems">&#9881;</button>
       <button class="panel-toggle" onclick="toggleRight()" title="Intelligence">&#9670;</button>
     </div>
@@ -3659,6 +3759,10 @@ async function sendCommandAudio(blob) {
   try {
     const r = await fetch(`${BASE}/friday/voice/transcribe`, { method: 'POST', body: form });
     const d = await r.json();
+    // Confirmed non-enrolled speaker (TV, another person) — stay silent,
+    // not an error: this is what actually stops background audio from
+    // hijacking the conversation continuity window.
+    if (d.rejected) return;
     let text = (d.text || '').trim();
     if (!text) return;
     // Strip a leading wake word so "friday what's my status" becomes
@@ -3671,6 +3775,60 @@ async function sendCommandAudio(blob) {
   } catch (e) {
     addMsg('sys', 'SYSTEM', 'Voice transcription failed, boss.');
   }
+}
+
+// ── Voice enrollment ─────────────────────────────────────────────────────────
+// Five ~3.5s samples (rather than one) give Resemblyzer enough voiceprint
+// variety to set a usable match threshold on the bridge side.
+async function enrollVoice() {
+  const btn = document.getElementById('enroll-voice-btn');
+  const totalSamples = 5;
+  const sampleMs = 3500;
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    btn.textContent = '⚠ MIC ACCESS DENIED';
+    return;
+  }
+
+  for (let i = 1; i <= totalSamples; i++) {
+    btn.textContent = `🎤 SPEAK NOW (${i}/${totalSamples})`;
+    const chunks = [];
+    const recorder = new MediaRecorder(stream);
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+    const recordingDone = new Promise((resolve) => {
+      recorder.onstop = resolve;
+    });
+    recorder.start();
+    await new Promise((resolve) => setTimeout(resolve, sampleMs));
+    recorder.stop();
+    await recordingDone;
+
+    const blob = new Blob(chunks, { type: 'audio/webm' });
+    const form = new FormData();
+    form.append('audio', blob, 'enroll.webm');
+    form.append('profile', 'default');
+
+    try {
+      const r = await fetch(`${BASE}/friday/voice/enroll`, { method: 'POST', body: form });
+      const d = await r.json();
+      if (!r.ok || d.error) {
+        btn.textContent = '⚠ ERROR — RETRY';
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+    } catch (e) {
+      btn.textContent = '⚠ ERROR — RETRY';
+      stream.getTracks().forEach(t => t.stop());
+      return;
+    }
+  }
+
+  stream.getTracks().forEach(t => t.stop());
+  btn.textContent = '✓ VOICE ENROLLED';
 }
 
 async function setMode(mode) {
