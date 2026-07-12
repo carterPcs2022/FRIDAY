@@ -1427,7 +1427,15 @@ def command():
                 f"Analyze like FRIDAY in Civil War.\n"
                 f"Give:\n1. Probability estimate (X%)\n2. Key factors for/against\n"
                 f"3. What would change the odds\n4. Recommended action\n\n"
-                f"Be specific. Use numbers. FRIDAY tactical style."
+                f"You have no specific project data beyond what's in your actual "
+                f"memory and second brain. If asked about project specifics "
+                f"(manufacturing status, components, timelines) that you don't have "
+                f"real logged information about, say so explicitly — do not invent "
+                f"specific details, percentages, component names, or status updates "
+                f"that aren't grounded in actual stored data. A probability estimate "
+                f"itself is fine to give (that's the nature of the ask), but do NOT "
+                f"list fake specific 'contributing factors' with fabricated precision "
+                f"numbers unless those factors are real and known. FRIDAY tactical style."
             )
             response = result["response"]
 
