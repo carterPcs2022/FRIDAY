@@ -1,11 +1,16 @@
 """services/friday_relationships.py — tracks who you've talked to and
-when, and flags people you haven't been in touch with."""
+when, and flags people you haven't been in touch with. Turso is the
+read source of truth (dict keyed by name); local JSON stays a
+write-through cache and fallback, matching core/friday_bills.py.
+"""
 import json
 from pathlib import Path
 from datetime import datetime
 
+from db import turso_http_client as turso
 
 PEOPLE_FILE = Path("memory/friday_people.json")
+PEOPLE_TABLE = "people"
 
 
 class RelationshipIntel:
@@ -23,7 +28,7 @@ class RelationshipIntel:
         if notes:
             self._people[name]["notes"].append(notes)
             self._people[name]["notes"] = self._people[name]["notes"][-20:]
-        self._save()
+        self._save(name)
         return {"logged": True, "person": name}
 
     def get_intel(self, name: str) -> dict:
@@ -76,6 +81,26 @@ class RelationshipIntel:
         return result["response"]
 
     def _load(self) -> dict:
+        if turso.is_configured():
+            rows = None
+            try:
+                turso.ensure_kv_table(PEOPLE_TABLE)
+                rows = turso.kv_all(PEOPLE_TABLE)
+            except Exception as e:
+                print(f"[Turso] people read failed, falling back to local JSON: {e}")
+            if rows:
+                return rows
+            if rows is not None:
+                local = self._read_local()
+                for name, person in local.items():
+                    try:
+                        turso.kv_set(PEOPLE_TABLE, name, person)
+                    except Exception as e:
+                        print(f"[Turso] people seed failed: {e}")
+                return local
+        return self._read_local()
+
+    def _read_local(self) -> dict:
         if PEOPLE_FILE.exists():
             try:
                 return json.loads(PEOPLE_FILE.read_text())
@@ -83,9 +108,16 @@ class RelationshipIntel:
                 return {}
         return {}
 
-    def _save(self):
+    def _save(self, name: str):
         PEOPLE_FILE.parent.mkdir(parents=True, exist_ok=True)
         PEOPLE_FILE.write_text(json.dumps(self._people, indent=2))
+
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(PEOPLE_TABLE)
+                turso.kv_set(PEOPLE_TABLE, name, self._people[name])
+            except Exception as e:
+                print(f"[Turso] people write failed, local JSON already has it: {e}")
 
 
 relationships = RelationshipIntel()
