@@ -1,18 +1,18 @@
 """services/friday_gmail.py — inbox triage over IMAP + an app password
 (console.cloud.google.com isn't involved here; this is Gmail's supported
 per-app password mechanism, generated under Google Account -> Security ->
-App Passwords with 2FA enabled). Separate from JARVIS_V5's Gmail
-integration (core/tools/gmail.py), which uses OAuth2 instead — two
-different repos, two different credential mechanisms, not meant to share
-state."""
+App Passwords with 2FA enabled). JARVIS_V5's Gmail integration
+(core/tools/gmail.py) uses the same IMAP/app-password mechanism, not
+OAuth2 — two separate repos/deploys, each with its own EMAIL_ADDRESS/
+EMAIL_PASSWORD, not meant to share state."""
 import os
 import json
 import imaplib
 import email
 from email.header import decode_header
 
-GMAIL_USER = os.getenv("GMAIL_ADDRESS", "")
-GMAIL_PASS = os.getenv("GMAIL_APP_PASSWORD", "")
+GMAIL_USER = os.getenv("EMAIL_ADDRESS", "")
+GMAIL_PASS = os.getenv("EMAIL_PASSWORD", "")
 
 
 class FridayGmail:
