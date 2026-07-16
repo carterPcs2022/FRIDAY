@@ -23,6 +23,32 @@ FRIDAY_VISION_STYLE = (
     "full report, unless the question asks for detail."
 )
 
+# Used only by the HUD-style quick-identify path (no question asked) — the
+# default analyze() prompt above stays open-ended for the paperclip button's
+# free-form "ask about this image" use, this one is for "just tell me what
+# it is" in one or two spoken sentences.
+_HUD_IDENTIFY_PROMPT = (
+    "Identify and briefly describe what's in this image, as if speaking to "
+    "someone wearing a HUD who needs a quick answer. Reply in exactly this "
+    "format, nothing else:\n"
+    "LABEL: <2-5 word name for the main subject>\n"
+    "SPOKEN: <1-2 short sentences, spoken out loud, FRIDAY style, calling "
+    "the user 'boss'>"
+)
+
+
+def _parse_identify(text: str) -> tuple[str, str]:
+    """Split a LABEL:/SPOKEN: reply into (label, spoken). Falls back to the
+    whole reply as spoken text if the model didn't follow the format."""
+    label, spoken = "", ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.upper().startswith("LABEL:"):
+            label = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("SPOKEN:"):
+            spoken = line.split(":", 1)[1].strip()
+    return label, spoken or text.strip()
+
 
 class FridayVision:
 
@@ -64,6 +90,16 @@ class FridayVision:
             return {"analysis": r.content[0].text}
         except Exception as e:
             return {"error": str(e)}
+
+    def identify(self, image_b64: str) -> dict:
+        """HUD-style quick identify: 'what am I looking at, in one or two
+        spoken sentences' — distinct from analyze(), which stays open-ended
+        for the paperclip button's free-form questions."""
+        result = self.analyze(image_b64, _HUD_IDENTIFY_PROMPT)
+        if "error" in result:
+            return result
+        label, spoken = _parse_identify(result["analysis"])
+        return {"label": label, "spoken": spoken}
 
     # ── Convenience wrappers — canned prompts for common asks ────────────
 

@@ -299,6 +299,14 @@ except Exception as e:
     LOCKDOWN_OK = False
     logging.warning(f"Suit lockdown failed: {e}")
 
+try:
+    from services.ha_client import home_assistant
+    HA_OK = True
+except Exception as e:
+    home_assistant = None
+    HA_OK = False
+    logging.warning(f"Home Assistant client failed: {e}")
+
 
 def _extract_topic(prompt: str) -> str:
     TOPIC_KEYWORDS = {
@@ -831,6 +839,21 @@ HOMEKIT_TRIGGERS = {
     "i'm home": "shortcuts run 'Arriving Home'",
     "lock the door": "shortcuts run 'Lock Door'",
     "night mode": "shortcuts run 'Night Mode'",
+}
+
+HA_STATUS_TRIGGERS = [
+    "what's on my home assistant", "whats on my home assistant",
+    "what's on home assistant", "home assistant status",
+    "list my devices", "list my home assistant devices",
+]
+
+# Checked only after HOMEKIT_TRIGGERS, so phrases like "turn on lights"
+# keep going through the existing Mac Bridge/Shortcuts path above and
+# never reach here — this dict is for devices HA controls directly.
+HA_DEVICE_TRIGGERS = {
+    "samsung tv": "media_player.livingrm_un50nu6950",
+    "living room tv": "media_player.livingrm_un50nu6950",
+    "tv": "media_player.livingrm_un50nu6950",
 }
 
 
@@ -2009,6 +2032,40 @@ def command():
                 _log(prompt, response, "mac_bridge")
                 return jsonify({"response": response, "mode": "mac_bridge"})
 
+        # ── Home Assistant — status ─────────────────────────────────────────
+        if HA_OK and home_assistant and any(t in p_lower for t in HA_STATUS_TRIGGERS):
+            result = home_assistant.get_states()
+            if "error" in result:
+                response = "Home Assistant isn't reachable right now, boss."
+            else:
+                # "remote" entities duplicate their paired media_player's
+                # friendly name (e.g. the TV's remote.* and media_player.*
+                # both read "LivingRm (UN50NU6950)") — skip them so the
+                # readout doesn't repeat the same device twice.
+                lines = [
+                    f"{e.get('attributes', {}).get('friendly_name', e['entity_id'])} is {e['state']}"
+                    for e in result["states"]
+                    if e["entity_id"].split(".")[0] != "remote"
+                ]
+                response = "Here's what Home Assistant sees, boss: " + "; ".join(lines) + "."
+            _log(prompt, response, "home_assistant")
+            return jsonify({"response": response, "mode": "home_assistant"})
+
+        # ── Home Assistant — generic turn on/off <device> ───────────────────
+        if HA_OK and home_assistant and ("turn on" in p_lower or "turn off" in p_lower):
+            for device_name, entity_id in HA_DEVICE_TRIGGERS.items():
+                if device_name in p_lower:
+                    domain = entity_id.split(".")[0]
+                    service = "turn_on" if "turn on" in p_lower else "turn_off"
+                    result = home_assistant.call_service(domain, service, entity_id)
+                    if "error" in result:
+                        response = "Home Assistant isn't reachable right now, boss."
+                    else:
+                        verb = "on" if service == "turn_on" else "off"
+                        response = f"Done, boss. Turning the {device_name} {verb}."
+                    _log(prompt, response, "home_assistant")
+                    return jsonify({"response": response, "mode": "home_assistant"})
+
         # Proxy to JARVIS if online and not in coverage mode
         if JARVIS_ONLINE and not COVERAGE_MODE:
             try:
@@ -2123,6 +2180,34 @@ def friday_vision_analyze():
     result = friday_vision.analyze(image_b64, question)
     _log(question or "[image]", result.get("analysis", result.get("error", "")), "vision")
     return jsonify(result)
+
+
+@app.route("/friday/vision/identify", methods=["POST"])
+def friday_vision_identify():
+    """HUD-style 'what am I looking at' — same base64 JSON input as
+    /friday/vision/analyze, but a short spoken answer instead of an
+    open-ended description, and it speaks the result (audio_file, same
+    convention as /command's Mayday/normal replies) instead of leaving the
+    caller to display text only."""
+    if not friday_vision:
+        return jsonify({"error": "Vision isn't available, boss."}), 503
+    data = request.get_json(silent=True) or {}
+    image_b64 = data.get("image", "")
+    if not image_b64:
+        return jsonify({"error": "No image provided."}), 400
+
+    result = friday_vision.identify(image_b64)
+    if "error" in result:
+        _log("[image]", result["error"], "vision_identify")
+        return jsonify(result)
+
+    spoken = result["spoken"]
+    audio_file = friday_speak(spoken) if VOICE_OK else None
+    _log("[image]", spoken, "vision_identify")
+    return jsonify({
+        "label": result["label"], "spoken": spoken,
+        "has_audio": bool(audio_file), "audio_file": audio_file,
+    })
 
 
 @app.route("/friday/calibration/score")
