@@ -7,6 +7,8 @@ from pathlib import Path
 from datetime import datetime
 from collections import Counter
 
+from db import turso_http_client as turso
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 MEMORY_DIR = BASE_DIR / "memory"
 FACTS_FILE = MEMORY_DIR / "facts.json"
@@ -172,6 +174,9 @@ def friday_recall(key: str) -> str | None:
 
 # ── Notes ("note that") ──────────────────────────────────────────────────────
 
+NOTES_TABLE = "notes"
+
+
 def save_note(note: dict):
     notes = _load(NOTES_FILE)
     if not isinstance(notes, list):
@@ -180,8 +185,38 @@ def save_note(note: dict):
     notes = notes[-500:]
     _save(NOTES_FILE, notes)
 
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(NOTES_TABLE)
+            turso.list_insert(NOTES_TABLE, note)
+        except Exception as e:
+            print(f"[Turso] note write failed, local JSON already has it: {e}")
+
 
 def get_notes(limit: int = 10) -> list:
+    if turso.is_configured():
+        rows = None
+        try:
+            turso.ensure_list_table(NOTES_TABLE)
+            rows = turso.list_all(NOTES_TABLE)
+        except Exception as e:
+            print(f"[Turso] notes read failed, falling back to local JSON: {e}")
+        if rows:
+            return rows[-limit:]
+        if rows is not None:
+            # Query succeeded but came back empty — either genuinely no
+            # notes yet, or this is the first read since migrating and
+            # Turso hasn't been seeded from the pre-existing local JSON.
+            local = _load(NOTES_FILE)
+            if not isinstance(local, list):
+                local = []
+            for record in local:
+                try:
+                    turso.list_insert(NOTES_TABLE, record)
+                except Exception as e:
+                    print(f"[Turso] notes seed failed: {e}")
+            return local[-limit:]
+
     notes = _load(NOTES_FILE)
     if not isinstance(notes, list):
         return []
