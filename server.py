@@ -3791,7 +3791,9 @@ body {
       <input class="chat-inp" id="chat-inp" placeholder="Say 'FRIDAY' or type here, boss..."
              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}">
       <input type="file" id="vision-file" accept="image/*" style="display:none" onchange="uploadVisionImage(event)">
-      <button class="mic-btn" id="vision-btn" onclick="document.getElementById('vision-file').click()" title="Show FRIDAY something">&#128206;</button>
+      <button class="mic-btn" id="vision-btn" onclick="document.getElementById('vision-file').click()" title="Show FRIDAY something (chat description)">&#128206;</button>
+      <input type="file" id="identify-file" accept="image/*" style="display:none" onchange="uploadIdentifyImage(event)">
+      <button class="mic-btn" id="identify-btn" onclick="document.getElementById('identify-file').click()" title="Quick identify (spawns an AR widget)">&#128065;</button>
       <button class="mic-btn" id="mic-btn" onclick="toggleMic()">&#127908;</button>
       <button class="send-btn" onclick="send()">&#9654;</button>
     </div>
@@ -3972,6 +3974,31 @@ async function uploadVisionImage(event) {
     } catch (e) {
       hideThinking();
       addMsg('sys', 'SYSTEM', 'Vision analysis failed, boss.');
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+async function uploadIdentifyImage(event) {
+  const file = event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const b64 = reader.result.split(',')[1];
+    addMsg('sys', 'SYSTEM', 'Identifying...');
+    try {
+      await fetch(`${BASE}/friday/vision/identify`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ image: b64 }),
+      });
+      // Response intentionally unused here — the server already queued
+      // an AR widget for this result (services/friday_hud.py), and this
+      // page's own pollWidgets() loop picks it up within ~1s and renders
+      // it. Reading/rendering the response here too would just be a
+      // second copy racing the one the poll loop is about to deliver.
+    } catch (e) {
+      addMsg('sys', 'SYSTEM', 'Identify failed, boss.');
     }
   };
   reader.readAsDataURL(file);
