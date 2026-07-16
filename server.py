@@ -307,6 +307,16 @@ except Exception as e:
     HA_OK = False
     logging.warning(f"Home Assistant client failed: {e}")
 
+try:
+    from services.friday_hud import spawn_widget, drain_widgets
+    HUD_OK = True
+except Exception as e:
+    HUD_OK = False
+    logging.warning(f"HUD widget queue failed: {e}")
+
+    def spawn_widget(*a, **k):  # HUD unavailable — spawn calls become no-ops
+        return None
+
 
 def _extract_topic(prompt: str) -> str:
     TOPIC_KEYWORDS = {
@@ -2042,12 +2052,14 @@ def command():
                 # friendly name (e.g. the TV's remote.* and media_player.*
                 # both read "LivingRm (UN50NU6950)") — skip them so the
                 # readout doesn't repeat the same device twice.
-                lines = [
-                    f"{e.get('attributes', {}).get('friendly_name', e['entity_id'])} is {e['state']}"
+                devices = [
+                    {"name": e.get("attributes", {}).get("friendly_name", e["entity_id"]), "state": e["state"]}
                     for e in result["states"]
                     if e["entity_id"].split(".")[0] != "remote"
                 ]
+                lines = [f"{d['name']} is {d['state']}" for d in devices]
                 response = "Here's what Home Assistant sees, boss: " + "; ".join(lines) + "."
+                spawn_widget("data", {"title": "HOME ASSISTANT", "rows": devices})
             _log(prompt, response, "home_assistant")
             return jsonify({"response": response, "mode": "home_assistant"})
 
@@ -2203,6 +2215,7 @@ def friday_vision_identify():
 
     spoken = result["spoken"]
     audio_file = friday_speak(spoken) if VOICE_OK else None
+    spawn_widget("text", {"title": result["label"] or "IDENTIFIED", "body": spoken}, audio_file)
     _log("[image]", spoken, "vision_identify")
     return jsonify({
         "label": result["label"], "spoken": spoken,
@@ -2250,6 +2263,18 @@ def friday_voice_audio():
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
+
+
+@app.route("/friday/hud/poll")
+def friday_hud_poll():
+    """Polled every ~1s by the real /hud page's spawnWidget() system
+    (embedded in FRIDAY_HUD_HTML below). No WebSocket in this Flask
+    process, so widgets sit in an in-memory queue until picked up here —
+    see services/friday_hud.py. Delivered-once: each widget is returned
+    exactly once, to whichever poll happens to catch it."""
+    if not HUD_OK:
+        return jsonify({"widgets": []})
+    return jsonify({"widgets": drain_widgets()})
 
 
 @app.route("/friday/voice/transcribe", methods=["POST"])
@@ -3518,6 +3543,61 @@ body {
 }
 #friday-face.on { opacity: 0.85; }
 
+/* ── AR widget stage — spawnWidget() pops these up top-right, below the
+   status pills, above everything else. Delivered via short-poll (no
+   WebSocket in this Flask process — see services/friday_hud.py). ── */
+.widget-stage {
+  position: fixed; top: 76px; right: 20px; z-index: 40;
+  display: flex; flex-direction: column; gap: 12px;
+  width: 300px; pointer-events: none;
+  perspective: 1200px;
+}
+.ar-widget {
+  pointer-events: auto;
+  background: linear-gradient(160deg, var(--glass2), var(--glass));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  backdrop-filter: blur(14px);
+  box-shadow: 0 0 24px rgba(0,180,216,0.15), inset 0 0 30px rgba(72,202,228,0.03);
+  transform-style: preserve-3d;
+  transform: rotateX(10deg) rotateY(-6deg) scale(0.85) translateZ(-50px);
+  opacity: 0;
+  animation: widget-in 0.5s cubic-bezier(.2,.9,.25,1.1) forwards;
+}
+.ar-widget.exiting { animation: widget-out 0.35s ease-in forwards; }
+@keyframes widget-in {
+  0%   { opacity: 0; transform: rotateX(16deg) rotateY(-12deg) scale(0.78) translateZ(-90px); }
+  60%  { opacity: 1; transform: rotateX(-2deg) rotateY(2deg) scale(1.04) translateZ(10px); }
+  100% { opacity: 1; transform: rotateX(0) rotateY(0) scale(1) translateZ(0); }
+}
+@keyframes widget-out {
+  0%   { opacity: 1; transform: rotateX(0) scale(1) translateZ(0); }
+  100% { opacity: 0; transform: rotateX(8deg) scale(0.85) translateZ(-60px); }
+}
+.ar-widget-title {
+  font-size: 10px; letter-spacing: 3px; color: var(--bright); text-transform: uppercase;
+  margin-bottom: 8px; display: flex; align-items: center; gap: 7px;
+}
+.ar-widget-title::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--glow);
+  box-shadow: 0 0 6px var(--glow); animation: orb-breathe 1.4s ease-in-out infinite;
+}
+.ar-widget-body { font-size: 12.5px; line-height: 1.55; color: var(--text); }
+.ar-widget-rows { display: flex; flex-direction: column; gap: 5px; }
+.ar-widget-row {
+  display: flex; justify-content: space-between; font-size: 11px;
+  padding: 3px 0; border-bottom: 1px solid var(--border2);
+}
+.ar-widget-row-name { color: var(--muted); letter-spacing: 0.5px; }
+.ar-widget-row-val { color: var(--ice); }
+.ar-widget-audio-bar { margin-top: 8px; height: 2px; background: var(--border2); border-radius: 1px; overflow: hidden; }
+.ar-widget-audio-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--bright)); transition: width 0.1s linear; }
+
+@media (max-width: 700px) {
+  .widget-stage { left: 12px; right: 12px; width: auto; top: 64px; }
+}
+
 </style>
 </head>
 <body>
@@ -3553,6 +3633,7 @@ body {
   style="position:fixed;bottom:100px;left:20px;
   opacity:0.5;pointer-events:none;z-index:2">
 </canvas>
+<div class="widget-stage" id="widget-stage"></div>
 <div class="cov-banner" id="cov-banner">COVERAGE MODE - JARVIS OFFLINE</div>
 <div class="backdrop" id="backdrop" onclick="closeAll()"></div>
 
@@ -4337,6 +4418,83 @@ async function pollTrust() {
     document.getElementById('trust-bar').style.width = `${d.trust || 0}%`;
   } catch(e) {}
 }
+
+// ── AR widget system ─────────────────────────────────────────────────────
+// spawnWidget(type, content, audioUrl) is exposed on window so any future
+// caller (console, or a WebSocket upgrade later) can trigger it directly.
+// Backend-initiated spawns arrive via short-poll (pollWidgets below) since
+// this Flask process has no WebSocket — see services/friday_hud.py.
+const WIDGET_LIFETIME_MS = 9000;
+const widgetStage = document.getElementById('widget-stage');
+
+function widgetEscapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : s;
+  return d.innerHTML;
+}
+
+function renderWidgetBody(type, content) {
+  if (type === 'data') {
+    const rows = (content.rows || []).map(r =>
+      `<div class="ar-widget-row"><span class="ar-widget-row-name">${widgetEscapeHtml(r.name)}</span><span class="ar-widget-row-val">${widgetEscapeHtml(String(r.state))}</span></div>`
+    ).join('');
+    return `<div class="ar-widget-rows">${rows || '<span style="color:var(--muted)">No data.</span>'}</div>`;
+  }
+  return `<div class="ar-widget-body">${widgetEscapeHtml(content.body || '')}</div>`;
+}
+
+function spawnWidget(type, content, audioUrl) {
+  const el = document.createElement('div');
+  el.className = 'ar-widget';
+  el.innerHTML = `
+    <div class="ar-widget-title">${widgetEscapeHtml(content.title || type.toUpperCase())}</div>
+    ${renderWidgetBody(type, content)}
+    ${audioUrl ? '<div class="ar-widget-audio-bar"><div class="ar-widget-audio-fill"></div></div>' : ''}
+  `;
+  widgetStage.appendChild(el);
+
+  const remove = () => {
+    el.classList.add('exiting');
+    setTimeout(() => el.remove(), 380);
+  };
+
+  if (audioUrl) {
+    // Own Audio instance (not the shared currentAudio/playAudio()) so a
+    // widget's removal timing is driven by its own line finishing, not
+    // whatever else FRIDAY happens to be saying concurrently — but still
+    // fires the same face-reactivity hooks so she visibly reacts to it.
+    const audio = new Audio(audioUrl);
+    const fill = el.querySelector('.ar-widget-audio-fill');
+    audio.addEventListener('play', () => {
+      if (window.onFridaySpeakFace) window.onFridaySpeakFace();
+    });
+    audio.addEventListener('timeupdate', () => {
+      if (audio.duration) fill.style.width = `${(audio.currentTime / audio.duration) * 100}%`;
+    });
+    audio.addEventListener('ended', () => {
+      if (window.onFridayDoneFace) window.onFridayDoneFace();
+      setTimeout(remove, 600);
+    });
+    audio.addEventListener('error', () => setTimeout(remove, WIDGET_LIFETIME_MS));
+    audio.play().catch(() => {});
+  } else {
+    setTimeout(remove, WIDGET_LIFETIME_MS);
+  }
+}
+window.spawnWidget = spawnWidget;
+
+async function pollWidgets() {
+  try {
+    const r = await fetch(`${BASE}/friday/hud/poll`);
+    const d = await r.json();
+    for (const w of (d.widgets || [])) {
+      const audioUrl = w.audio_file ? `${BASE}/friday/voice/audio?file=${encodeURIComponent(w.audio_file)}&t=${Date.now()}` : null;
+      spawnWidget(w.type, w.content, audioUrl);
+    }
+  } catch (e) { /* transient network blip — next poll retries */ }
+}
+setInterval(pollWidgets, 1000);
+pollWidgets();
 
 pollState();
 pollVeronica();
