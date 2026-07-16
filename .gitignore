@@ -6,3 +6,4 @@ static/
 budget.json
 logs/
 veronica_backups/
+.turso_migration_state.json
