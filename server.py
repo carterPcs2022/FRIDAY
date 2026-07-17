@@ -3072,6 +3072,13 @@ def journal_log():
     return jsonify(journal.log_entry(content))
 
 
+@app.route("/friday/journal")
+def friday_journal():
+    if not journal:
+        return jsonify({"entries": []})
+    return jsonify({"entries": journal.recent_entries(365)})
+
+
 @app.route("/friday/journal/reflection")
 def journal_reflection():
     if not journal:
