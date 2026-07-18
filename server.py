@@ -933,7 +933,10 @@ def get_workouts() -> list:
     return _read_local_workouts()
 
 
-def get_tasks() -> list:
+TASKS_TABLE = "tasks"
+
+
+def _read_local_tasks() -> list:
     if TASK_FILE.exists():
         try:
             return json.loads(TASK_FILE.read_text())
@@ -942,26 +945,82 @@ def get_tasks() -> list:
     return []
 
 
+def _write_local_tasks(tasks: list):
+    TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TASK_FILE.write_text(json.dumps(tasks, indent=2))
+
+
+def get_tasks() -> list:
+    if turso.is_configured():
+        rows = None
+        try:
+            turso.ensure_list_table(TASKS_TABLE)
+            rows = turso.list_all(TASKS_TABLE)
+        except Exception as e:
+            print(f"[Turso] tasks read failed, falling back to local JSON: {e}")
+        if rows:
+            return rows
+        if rows is not None:
+            local = _read_local_tasks()
+            for record in local:
+                try:
+                    turso.list_insert(TASKS_TABLE, {k: v for k, v in record.items() if k != "id"})
+                except Exception as e:
+                    print(f"[Turso] tasks seed failed: {e}")
+            # Unlike the append-only files, tasks are mutated by id
+            # (complete_task), so the ids handed back here must be Turso's
+            # own row ids from this point on -- re-read post-seed instead
+            # of returning the locally-numbered `local` list.
+            try:
+                return turso.list_all(TASKS_TABLE)
+            except Exception as e:
+                print(f"[Turso] tasks re-read after seed failed: {e}")
+            return local
+    return _read_local_tasks()
+
+
 def add_task(task: str, priority: str = "normal") -> dict:
     tasks = get_tasks()
     new_task = {
-        "id": len(tasks) + 1, "task": task, "priority": priority,
+        "task": task, "priority": priority,
         "done": False, "added": datetime.datetime.now().isoformat(),
     }
-    tasks.append(new_task)
-    TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TASK_FILE.write_text(json.dumps(tasks, indent=2))
+
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(TASKS_TABLE)
+            new_task["id"] = turso.list_insert(TASKS_TABLE, new_task)
+        except Exception as e:
+            print(f"[Turso] task write failed, local JSON already has it: {e}")
+
+    if "id" not in new_task:
+        new_task["id"] = len(tasks) + 1
+
+    local_tasks = _read_local_tasks()
+    local_tasks.append(new_task)
+    _write_local_tasks(local_tasks)
     return new_task
 
 
 def complete_task(task_id: int):
-    tasks = get_tasks()
-    for t in tasks:
+    local_tasks = _read_local_tasks()
+    for t in local_tasks:
         if t.get("id") == task_id:
             t["done"] = True
             t["completed"] = datetime.datetime.now().isoformat()
-    TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TASK_FILE.write_text(json.dumps(tasks, indent=2))
+    _write_local_tasks(local_tasks)
+
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(TASKS_TABLE)
+            for t in get_tasks():
+                if t.get("id") == task_id:
+                    t["done"] = True
+                    t["completed"] = datetime.datetime.now().isoformat()
+                    turso.list_update(TASKS_TABLE, task_id, t)
+                    break
+        except Exception as e:
+            print(f"[Turso] task complete write failed, local JSON already has it: {e}")
 
 
 def add_reminder(text: str, minutes: int):

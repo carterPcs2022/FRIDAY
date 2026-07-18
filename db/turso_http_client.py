@@ -139,10 +139,14 @@ def _execute(sql: str, args: list | None = None) -> dict:
     result = first["response"]["result"]
     cols = [c["name"] for c in result.get("cols", [])]
     rows = [[_decode_cell(cell) for cell in row] for row in result.get("rows", [])]
+    raw_rowid = result.get("last_insert_rowid")
     return {
         "cols": cols,
         "rows": rows,
-        "last_insert_rowid": result.get("last_insert_rowid"),
+        # Hrana returns this as a string (avoids JS float precision loss);
+        # cast to int so it's directly comparable to the ids list_all()
+        # decodes via _decode_cell, e.g. for list_update(table, this_id, ...).
+        "last_insert_rowid": int(raw_rowid) if raw_rowid is not None else None,
     }
 
 
