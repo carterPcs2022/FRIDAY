@@ -1297,9 +1297,14 @@ def command():
             response = "Mayday received. What's happening, boss?"
             _log(prompt, response, "MAYDAY")
             if friday_caps:
+                # Emergency-priority (2) — a distress signal that only
+                # pushes once, with no retry-until-acked, defeats its own
+                # purpose if boss's phone is silenced or out of reach.
+                # Same tier as friday_health.py's critical-vitals alert.
                 friday_caps._pushover_alert(
                     "FRIDAY MAYDAY",
                     f"Mayday phrase triggered. Emergency contact on file: {EMERGENCY_CONTACT_PHONE}",
+                    priority=2,
                 )
             if CHECKIN_OK:
                 try:
