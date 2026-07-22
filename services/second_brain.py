@@ -1,12 +1,19 @@
 """services/second_brain.py — stores ingested content with an
-LLM-extracted summary/insights, recallable by keyword later."""
+LLM-extracted summary/insights, recallable by keyword later.
+
+Turso is the read source of truth (dict keyed by entry id); local JSON
+stays a write-through cache and fallback, matching
+services/friday_habits.py and services/friday_relationships.py."""
 import json
 import re
 import hashlib
 from pathlib import Path
 from datetime import datetime
 
+from db import turso_http_client as turso
+
 BRAIN_FILE = Path("memory/second_brain.json")
+BRAIN_TABLE = "second_brain"
 
 
 class SecondBrain:
@@ -42,7 +49,7 @@ class SecondBrain:
         }
 
         self._entries[entry_id] = entry
-        self._save()
+        self._save(entry_id)
         return {"id": entry_id, "summary": entry["summary"], "stored": True}
 
     def recall(self, query: str, limit: int = 5) -> list:
@@ -125,6 +132,26 @@ class SecondBrain:
         return {"entries": len(self._entries)}
 
     def _load(self) -> dict:
+        if turso.is_configured():
+            rows = None
+            try:
+                turso.ensure_kv_table(BRAIN_TABLE)
+                rows = turso.kv_all(BRAIN_TABLE)
+            except Exception as e:
+                print(f"[Turso] second_brain read failed, falling back to local JSON: {e}")
+            if rows:
+                return rows
+            if rows is not None:
+                local = self._read_local()
+                for entry_id, entry in local.items():
+                    try:
+                        turso.kv_set(BRAIN_TABLE, entry_id, entry)
+                    except Exception as e:
+                        print(f"[Turso] second_brain seed failed: {e}")
+                return local
+        return self._read_local()
+
+    def _read_local(self) -> dict:
         if BRAIN_FILE.exists():
             try:
                 return json.loads(BRAIN_FILE.read_text())
@@ -132,9 +159,16 @@ class SecondBrain:
                 return {}
         return {}
 
-    def _save(self):
+    def _save(self, entry_id: str):
         BRAIN_FILE.parent.mkdir(parents=True, exist_ok=True)
         BRAIN_FILE.write_text(json.dumps(self._entries, indent=2))
+
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(BRAIN_TABLE)
+                turso.kv_set(BRAIN_TABLE, entry_id, self._entries[entry_id])
+            except Exception as e:
+                print(f"[Turso] second_brain write failed, local JSON already has it: {e}")
 
 
 second_brain = SecondBrain()
