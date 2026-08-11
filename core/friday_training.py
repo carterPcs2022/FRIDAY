@@ -42,7 +42,11 @@ class FridayTrainer:
         headers = {"Authorization": f"Bearer {JARVIS_TOKEN}"}
 
         try:
-            r = httpx.get(f"{JARVIS_URL}/stark/memory/facts", headers=headers, timeout=10)
+            # n=1000 matches this class's own storage cap (see
+            # _absorb_facts's known[-1000:]) rather than JARVIS's smaller
+            # default (200) — a sync should pull everything FRIDAY can
+            # actually hold, not an arbitrary fraction of it.
+            r = httpx.get(f"{JARVIS_URL}/stark/memory/facts", params={"n": 1000}, headers=headers, timeout=10)
             if r.status_code == 200:
                 jarvis_facts = r.json().get("facts", [])
                 self._absorb_facts(jarvis_facts)
@@ -60,8 +64,10 @@ class FridayTrainer:
 
         try:
             # Real shape: a bare list of {"user": ..., "ai": ...} dicts —
-            # not {"conversations": [...]} with a "response" key.
-            r = httpx.get(f"{JARVIS_URL}/stark/memory/recent", params={"n": 50}, headers=headers, timeout=10)
+            # not {"conversations": [...]} with a "response" key. n=200
+            # (up from 50) for the same "pull everything usable, not a
+            # sliver of it" reason as the facts request above.
+            r = httpx.get(f"{JARVIS_URL}/stark/memory/recent", params={"n": 200}, headers=headers, timeout=10)
             if r.status_code == 200:
                 convos = r.json()
                 if isinstance(convos, list):
@@ -110,7 +116,7 @@ class FridayTrainer:
         ({"user": ..., "ai": ...}) so FRIDAY has a rough sense of how he
         handled similar requests before."""
         patterns = []
-        for convo in convos[-50:]:
+        for convo in convos[-200:]:
             query = convo.get("user", "")
             response = convo.get("ai", "")
             if not query or not response:
