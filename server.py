@@ -25,7 +25,7 @@ import logging
 import threading
 from collections import deque
 from pathlib import Path
-from flask import request, send_file
+from flask import request, send_file, Response
 
 from db import turso_http_client as turso
 
@@ -2239,6 +2239,44 @@ def friday_ask():
         return command()
 
 
+@app.route("/friday/chat/upload", methods=["POST"])
+def friday_chat_upload():
+    """Multipart file (+ optional 'prompt' field) — a general chat
+    attachment endpoint, not just images. FRIDAY had no way for an
+    external client to hand her an arbitrary file at all before this
+    (only /friday/vision/analyze, which is images-as-base64-JSON only).
+
+    Saves the file, runs it through services/documents.py's ingest(), and
+    folds the resulting summary into the prompt as a bracketed note
+    before routing through /command exactly like any other message —
+    same trick JARVIS_V5's core/attachments.py uses, so /command's ~1000
+    lines of routing logic don't need to know attachments exist at all."""
+    from werkzeug.utils import secure_filename
+
+    if "file" not in request.files:
+        return jsonify({"response": "No file attached, boss."}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"response": "Empty file, boss."}), 400
+
+    upload_dir = BASE_DIR / "memory" / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    dest = upload_dir / f"{int(time.time())}_{secure_filename(f.filename)}"
+    f.save(str(dest))
+
+    from services import documents
+    result = documents.ingest(str(dest))
+    if not result.get("ok"):
+        return jsonify({"response": f"Couldn't read that file, boss: {result.get('error', 'unknown error')}"}), 200
+
+    note = f'[Attached file "{f.filename}": {result["summary"]}]'
+    prompt = (request.form.get("prompt") or "").strip()
+    combined_prompt = f"{prompt}\n\n{note}" if prompt else note
+
+    with app.test_request_context("/command", method="POST", json={"prompt": combined_prompt}):
+        return command()
+
+
 @app.route("/friday/vision/analyze", methods=["POST"])
 def friday_vision_analyze():
     """Paperclip-button endpoint — the HUD base64-encodes the image
@@ -2473,6 +2511,58 @@ def friday_voice_reset():
         return jsonify(r.json()), r.status_code
     except Exception as e:
         return jsonify({"error": f"Couldn't reach the Mac bridge, boss: {e}"}), 502
+
+
+# ── Phone (Twilio) ───────────────────────────────────────────────────────────
+# Webhook routes (call/respond/transcribed/sms) are intentionally
+# unauthenticated — Twilio can't send a bearer token, and Twilio's request
+# signature is the only verification available without extra setup, same
+# tradeoff JARVIS_V5 makes for its own phone webhooks.
+
+@app.route("/friday/phone/call", methods=["POST"])
+def friday_phone_call():
+    from services.friday_phone import friday_phone
+    return Response(friday_phone.handle_incoming_call(), mimetype="text/xml")
+
+
+@app.route("/friday/phone/respond", methods=["POST"])
+def friday_phone_respond():
+    from services.friday_phone import friday_phone
+    transcript = request.form.get("TranscriptionText") or "Hey"
+    return Response(friday_phone.handle_response(transcript), mimetype="text/xml")
+
+
+@app.route("/friday/phone/transcribed", methods=["POST"])
+def friday_phone_transcribed():
+    """Twilio's async transcription callback — nothing to do, /respond
+    already handled the turn with its own (faster) transcription."""
+    return Response("", mimetype="text/xml")
+
+
+@app.route("/friday/phone/sms", methods=["POST"])
+def friday_phone_sms():
+    from services.friday_phone import friday_phone
+    friday_phone.handle_sms(request.form.get("From", ""), request.form.get("Body", ""))
+    return Response("<Response/>", mimetype="text/xml")
+
+
+@app.route("/friday/phone/alert", methods=["POST"])
+def friday_phone_alert():
+    """Have FRIDAY place a real call and speak a message — 'call me and
+    tell me Y', not a webhook. Same friday_security.screen_request() IP
+    screening as /command, since this triggers a real outbound Twilio call
+    (billable, and reaches a real phone) rather than just returning data."""
+    from services.friday_phone import friday_phone
+    if SECURITY_OK:
+        screen = friday_security.screen_request(friday_security.client_ip(request), "phone alert")
+        if screen.get("blocked"):
+            return jsonify({"error": "Request blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    to_number = data.get("to") or os.environ.get("MY_PHONE_NUMBER", "")
+    message = data.get("message", "")
+    if not to_number or not message:
+        return jsonify({"error": "Both 'to' and 'message' are required"}), 400
+    return jsonify(friday_phone.send_alert_call(message, to_number))
 
 
 # ── JARVIS takeover ────────────────────────────────────────────────────────────
