@@ -15,6 +15,7 @@ _API_KEYS = [
     "GMAIL_APP_PASSWORD",
     "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET",
     "GOOGLE_CALENDAR_CLIENT_ID", "GOOGLE_CALENDAR_CLIENT_SECRET",
+    "SERPER_API_KEY", "TAVILY_API_KEY", "SERPAPI_KEY",
 ]
 
 # Values people paste in as stand-ins and then forget to swap out.
