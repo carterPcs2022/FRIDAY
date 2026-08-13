@@ -3,7 +3,7 @@ trusts her instincts, less deliberation, a more direct path from input to
 output.
 
 Model cascade:
-1. Groq 8B instant  -> simple/fast queries
+1. Groq gpt-oss-20b -> simple/fast queries
 2. Groq 70B         -> complex reasoning
 3. Claude Haiku     -> emotional/nuanced
 4. Claude Sonnet     -> hardest problems (long/multi-part requests)
@@ -63,8 +63,11 @@ _GROQ_CLIENT = httpx.Client(
 
 # Real, currently-available model IDs — verified against provider docs, not
 # guessed. claude-sonnet-4-6 doesn't exist; claude-sonnet-5 is current.
+# "fast" swapped from llama-3.1-8b-instant to openai/gpt-oss-20b ahead of
+# Groq's 2026-08-16 decommission of the former (Groq's own recommended
+# replacement).
 MODELS = {
-    "fast": "llama-3.1-8b-instant",
+    "fast": "openai/gpt-oss-20b",
     "smart": "llama-3.3-70b-versatile",
     "nuanced": "claude-haiku-4-5-20251001",
     "deep": "claude-sonnet-5",
