@@ -33,7 +33,13 @@ VOICE_SETTINGS = {
 def _clean(text: str) -> str:
     text = re.sub(r"\[.*?\]", "", text or "")
     text = re.sub(r"[*_`#]", "", text)
-    return text.strip()[:400]
+    # friday_brain.think() calls regularly run at max_tokens=600-800 (see
+    # core/friday_brain.py), which is 2000+ characters of English — the
+    # old 400-char cap here silently chopped every such reply off mid-
+    # sentence before it ever reached TTS. This is what "she cuts herself
+    # off" actually was. 2000 covers a normal-length reply with room to
+    # spare while still bounding TTS cost/latency for a genuine outlier.
+    return text.strip()[:2000]
 
 
 def speak(text: str, mode: str = "normal") -> str | None:
@@ -60,7 +66,7 @@ def speak(text: str, mode: str = "normal") -> str | None:
                     "voice_settings": settings,
                 },
                 headers={"xi-api-key": ELEVENLABS_KEY, "Content-Type": "application/json"},
-                timeout=10,
+                timeout=20,  # was 10 — too tight now that _clean() allows up to 2000 chars through
             )
             if r.status_code == 200:
                 out_path.write_bytes(r.content)

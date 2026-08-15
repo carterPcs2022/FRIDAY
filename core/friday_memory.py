@@ -21,6 +21,19 @@ NOTES_FILE = MEMORY_DIR / "friday_notes.json"
 
 _DICT_FILES = (PROFILE_FILE, PERSONAL_FILE)
 
+# Turso table names for the durable copies of conversations/facts/profile.
+# These three back the main conversational memory path (get_context_for()
+# -> friday_brain.think() -> save_turn(), used on every default chat turn)
+# and were local-JSON-only until this migration — fine on a machine with a
+# real disk, but Render's web service filesystem isn't guaranteed to
+# survive a restart or redeploy, so every restart silently reset FRIDAY's
+# memory of every past conversation and fact. notes (below) already had
+# this Turso write-through/fallback/seed pattern; this applies the same
+# one here.
+CONVOS_TABLE = "conversations"
+FACTS_TABLE = "facts"
+PROFILE_TABLE = "profile"
+
 
 def _load(path: Path):
     if path.exists():
@@ -40,38 +53,110 @@ def _save(path: Path, data):
 
 # ── Facts ────────────────────────────────────────────────────────────────────
 
-def save_fact(fact: str):
+def _load_facts() -> list[str]:
+    """Turso first (durable across restarts), local JSON as fallback and
+    as the seed source the first time a Turso table comes up empty —
+    same shape as get_notes() below."""
+    if turso.is_configured():
+        rows = None
+        try:
+            turso.ensure_list_table(FACTS_TABLE)
+            rows = turso.list_all(FACTS_TABLE)
+        except Exception as e:
+            print(f"[Turso] facts read failed, falling back to local JSON: {e}")
+        if rows:
+            return [r["fact"] for r in rows]
+        if rows is not None:
+            local = _load(FACTS_FILE)
+            if not isinstance(local, list):
+                local = []
+            for fact in local:
+                try:
+                    turso.list_insert(FACTS_TABLE, {"fact": fact})
+                except Exception as e:
+                    print(f"[Turso] facts seed failed: {e}")
+            return local
+
     facts = _load(FACTS_FILE)
-    if isinstance(facts, list) and fact not in facts:
-        facts.append(fact)
-        _save(FACTS_FILE, facts[-200:])
+    return facts if isinstance(facts, list) else []
+
+
+def save_fact(fact: str):
+    if fact in _load_facts():
+        return
+    local = _load(FACTS_FILE)
+    if not isinstance(local, list):
+        local = []
+    if fact not in local:
+        local.append(fact)
+        _save(FACTS_FILE, local[-200:])
+
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(FACTS_TABLE)
+            turso.list_insert(FACTS_TABLE, {"fact": fact})
+        except Exception as e:
+            print(f"[Turso] fact write failed, local JSON already has it: {e}")
 
 
 def get_facts(n: int = 10) -> list[str]:
-    facts = _load(FACTS_FILE)
-    return facts[-n:] if isinstance(facts, list) else []
+    return _load_facts()[-n:]
 
 
 # ── Conversations ────────────────────────────────────────────────────────────
 
+def _load_convos() -> list[dict]:
+    """Turso first (durable across restarts), local JSON as fallback/seed —
+    this is the list get_context_for() draws "recent relevant" turns from
+    on every default chat reply, so losing it on every restart is exactly
+    what "FRIDAY forgets conversations" looks like from the outside."""
+    if turso.is_configured():
+        rows = None
+        try:
+            turso.ensure_list_table(CONVOS_TABLE)
+            rows = turso.list_all(CONVOS_TABLE)
+        except Exception as e:
+            print(f"[Turso] conversation read failed, falling back to local JSON: {e}")
+        if rows:
+            return rows
+        if rows is not None:
+            local = _load(CONVO_FILE)
+            if not isinstance(local, list):
+                local = []
+            for record in local:
+                try:
+                    turso.list_insert(CONVOS_TABLE, record)
+                except Exception as e:
+                    print(f"[Turso] conversation seed failed: {e}")
+            return local
+
+    convos = _load(CONVO_FILE)
+    return convos if isinstance(convos, list) else []
+
+
 def save_turn(user: str, friday: str):
+    turn = {"user": user, "friday": friday, "ts": datetime.now().isoformat()}
     convos = _load(CONVO_FILE)
     if not isinstance(convos, list):
         convos = []
-    convos.append({"user": user, "friday": friday, "ts": datetime.now().isoformat()})
+    convos.append(turn)
     _save(CONVO_FILE, convos[-500:])
+
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(CONVOS_TABLE)
+            turso.list_insert(CONVOS_TABLE, turn)
+        except Exception as e:
+            print(f"[Turso] conversation write failed, local JSON already has it: {e}")
 
 
 def get_recent_turns(n: int = 5) -> list[dict]:
-    convos = _load(CONVO_FILE)
-    return convos[-n:] if isinstance(convos, list) else []
+    return _load_convos()[-n:]
 
 
 def recall(query: str, k: int = 3) -> list[str]:
     """Simple keyword recall from conversation history."""
-    convos = _load(CONVO_FILE)
-    if not isinstance(convos, list):
-        return []
+    convos = _load_convos()
     q_words = set(query.lower().split())
     scored = []
     for turn in convos:
@@ -142,6 +227,21 @@ def get_mood_history(days: int = 7) -> dict:
 # ── Profile ──────────────────────────────────────────────────────────────────
 
 def get_profile() -> dict:
+    if turso.is_configured():
+        try:
+            turso.ensure_kv_table(PROFILE_TABLE)
+            data = turso.kv_get(PROFILE_TABLE, "profile")
+            if data is not None:
+                return data
+        except Exception as e:
+            print(f"[Turso] profile read failed, falling back to local JSON: {e}")
+        local = _load(PROFILE_FILE)
+        if isinstance(local, dict) and local:
+            try:
+                turso.kv_set(PROFILE_TABLE, "profile", local)
+            except Exception as e:
+                print(f"[Turso] profile seed failed: {e}")
+        return local if isinstance(local, dict) else {}
     return _load(PROFILE_FILE)
 
 
@@ -149,6 +249,12 @@ def update_profile(key: str, value):
     profile = get_profile()
     profile[key] = value
     _save(PROFILE_FILE, profile)
+    if turso.is_configured():
+        try:
+            turso.ensure_kv_table(PROFILE_TABLE)
+            turso.kv_set(PROFILE_TABLE, "profile", profile)
+        except Exception as e:
+            print(f"[Turso] profile write failed, local JSON already has it: {e}")
 
 
 # ── Personal memory ──────────────────────────────────────────────────────────

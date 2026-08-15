@@ -150,6 +150,14 @@ except Exception as e:
     logging.warning(f"Health monitor failed: {e}")
 
 try:
+    from services.friday_car import friday_car
+    CAR_OK = True
+except Exception as e:
+    friday_car = None
+    CAR_OK = False
+    logging.warning(f"Car telemetry failed: {e}")
+
+try:
     from services.friday_contacts import friday_contacts
     CONTACTS_OK = True
 except Exception as e:
@@ -857,6 +865,12 @@ HA_STATUS_TRIGGERS = [
     "list my devices", "list my home assistant devices",
 ]
 
+CAR_STATUS_TRIGGERS = [
+    "car status", "how's the murano", "hows the murano",
+    "how's the maxima", "hows the maxima", "how's my car", "hows my car",
+    "fuel level", "gas level", "check engine",
+]
+
 # Checked only after HOMEKIT_TRIGGERS, so phrases like "turn on lights"
 # keep going through the existing Mac Bridge/Shortcuts path above and
 # never reach here — this dict is for devices HA controls directly.
@@ -1160,8 +1174,14 @@ def _log(user: str, response: str, mode: str):
 
 
 def safe(text: str) -> str:
+    """Used on every normal FRIDAY reply (main chat, JARVIS proxy, morning
+    brief) before it's shown AND before it's spoken — the old 500-char cap
+    silently chopped ordinary paragraph-length replies off mid-sentence in
+    both the chat UI and the audio, not just voice. friday_brain.think()
+    regularly runs at max_tokens=600-800, comfortably over 2000 characters,
+    so this matches the cap raised in services/friday_voice.py's _clean()."""
     try:
-        return str(text)[:500]
+        return str(text)[:2000]
     except Exception:
         return "FRIDAY safe mode."
 
@@ -2127,6 +2147,25 @@ def command():
             _log(prompt, response, "home_assistant")
             return jsonify({"response": response, "mode": "home_assistant"})
 
+        # ── Car telemetry — status ───────────────────────────────────────────
+        if CAR_OK and friday_car and any(t in p_lower for t in CAR_STATUS_TRIGGERS):
+            vehicle = "Murano" if "murano" in p_lower else ("Maxima" if "maxima" in p_lower else None)
+            status = friday_car.get_status(vehicle)
+            rows = [status] if vehicle else [s for s in (status or {}).values() if s]
+            if not rows:
+                response = "No telemetry from the car yet, boss."
+            else:
+                lines = []
+                for s in rows:
+                    parts = [f"{s['fuel_level']:.0f}% fuel"] if s.get("fuel_level") is not None else []
+                    if s.get("dtc_codes"):
+                        parts.append(f"check engine on ({', '.join(s['dtc_codes'])})")
+                    lines.append(f"{s['vehicle']}: " + (", ".join(parts) if parts else "no data"))
+                response = "Here's the car, boss: " + "; ".join(lines) + "."
+                spawn_widget("data", {"title": "CAR STATUS", "rows": rows})
+            _log(prompt, response, "car_telemetry")
+            return jsonify({"response": response, "mode": "car_telemetry"})
+
         # ── Home Assistant — generic turn on/off <device> ───────────────────
         if HA_OK and home_assistant and ("turn on" in p_lower or "turn off" in p_lower):
             for device_name, entity_id in HA_DEVICE_TRIGGERS.items():
@@ -2671,6 +2710,27 @@ def health_log():
         heart_rate=data.get("heart_rate", 0), hrv=data.get("hrv", 0),
         blood_oxygen=data.get("blood_oxygen", 0), steps=data.get("steps", 0),
         sleep_hours=data.get("sleep_hours", 0), sleep_quality=data.get("sleep_quality", 0),
+    )
+    return jsonify(entry)
+
+
+# ── Car telemetry (OBD-II) ──────────────────────────────────────────────────
+
+@app.route("/friday/car/report", methods=["POST"])
+def car_report():
+    """
+    Pushed by an ESP32 + Bluetooth ELM327 dongle riding in a vehicle —
+    small payload, no auth complexity, same convention as
+    /friday/hud/medicine's device-polling design.
+    """
+    if not CAR_OK:
+        return jsonify({"error": "car telemetry unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    entry = friday_car.log_from_obd(
+        vehicle=data.get("vehicle", ""), fuel_level=data.get("fuel_level"),
+        rpm=data.get("rpm"), speed=data.get("speed"),
+        coolant_temp=data.get("coolant_temp"), dtc_codes=data.get("dtc_codes", []),
+        voltage=data.get("voltage"),
     )
     return jsonify(entry)
 
@@ -4000,15 +4060,18 @@ function playAudio(file) {
   currentAudio.addEventListener('play', () => {
     if (window.onFridaySpeak) window.onFridaySpeak();
     if (window.onFridaySpeakFace) window.onFridaySpeakFace();
+    startBargeInListener();
   });
   currentAudio.addEventListener('ended', () => {
     if (window.onFridayDone) window.onFridayDone();
     if (window.onFridayDoneFace) window.onFridayDoneFace();
+    stopBargeInListener();
     openConversationWindow();
   });
   currentAudio.addEventListener('pause', () => {
     if (window.onFridayDone) window.onFridayDone();
     if (window.onFridayDoneFace) window.onFridayDoneFace();
+    stopBargeInListener();
   });
   currentAudio.play().catch(() => {});
 }
@@ -4222,6 +4285,79 @@ function stopWakeListening() {
     try { commandRecorder.stop(); } catch (e) {}
   }
   clearTimeout(silenceTimer);
+  stopBargeInListener();
+}
+
+// ── Barge-in ("just start talking, she goes quiet") ─────────────────────────
+// The wake-word interrupt in beginCommandCapture() only fires if you say
+// "friday" specifically while she's talking — that's word recognition, not
+// "cut her off like you would on a phone call." This listens for raw mic
+// volume instead of any specific word, only while currentAudio is actually
+// playing, so any speech interrupts her, not just the wake word. It runs on
+// its own getUserMedia stream (separate from wakeRecognition's internal
+// capture) so the two aren't fighting over the same handle.
+const VAD_THRESHOLD = 0.05;    // RMS above this counts as "someone's talking"
+const VAD_TRIGGER_FRAMES = 4;  // consecutive loud frames required — debounces pops/clicks
+// Tuning note: background noise (or her own voice bleeding from speaker
+// into mic) triggering this too easily -> raise VAD_THRESHOLD. Talking
+// over her not interrupting reliably -> lower it. This is inherently more
+// reliable on headphones than open speakers — there's no speaker-to-mic
+// feedback for echoCancellation to fight in the first place.
+let vadStream = null, vadContext = null, vadAnalyser = null, vadData = null, vadRaf = null, vadLoudFrames = 0;
+
+function startBargeInListener() {
+  if (!voiceModeOn || vadStream) return;
+  navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  }).then((stream) => {
+    // voiceModeOn may have been toggled off, or she may have already
+    // finished, while the permission prompt/promise was pending.
+    if (!voiceModeOn || !currentAudio || currentAudio.paused) {
+      stream.getTracks().forEach(t => t.stop());
+      return;
+    }
+    vadStream = stream;
+    vadContext = new (window.AudioContext || window.webkitAudioContext)();
+    const source = vadContext.createMediaStreamSource(vadStream);
+    vadAnalyser = vadContext.createAnalyser();
+    vadAnalyser.fftSize = 512;
+    source.connect(vadAnalyser);
+    vadData = new Uint8Array(vadAnalyser.frequencyBinCount);
+    vadLoudFrames = 0;
+    vadTick();
+  }).catch(() => {});  // no mic permission — barge-in just won't work; rest of the app is unaffected
+}
+
+function vadTick() {
+  if (!vadAnalyser) return;
+  vadAnalyser.getByteTimeDomainData(vadData);
+  let sumSquares = 0;
+  for (let i = 0; i < vadData.length; i++) {
+    const v = (vadData[i] - 128) / 128;
+    sumSquares += v * v;
+  }
+  const rms = Math.sqrt(sumSquares / vadData.length);
+  if (rms > VAD_THRESHOLD) {
+    vadLoudFrames++;
+    if (vadLoudFrames >= VAD_TRIGGER_FRAMES) {
+      stopBargeInListener();
+      if (voiceModeOn && !awaitingCommand) beginCommandCapture(false);
+      return;
+    }
+  } else {
+    vadLoudFrames = 0;
+  }
+  vadRaf = requestAnimationFrame(vadTick);
+}
+
+function stopBargeInListener() {
+  if (vadRaf) cancelAnimationFrame(vadRaf);
+  vadRaf = null;
+  vadAnalyser = null;
+  vadData = null;
+  if (vadContext) { try { vadContext.close(); } catch (e) {} vadContext = null; }
+  if (vadStream) { vadStream.getTracks().forEach(t => t.stop()); vadStream = null; }
+  vadLoudFrames = 0;
 }
 
 async function beginCommandCapture(ambiguous, timeoutMs) {

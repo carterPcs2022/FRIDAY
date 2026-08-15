@@ -4,27 +4,46 @@ actually needs attention, deduped so the same thing doesn't repeat
 within an hour."""
 import os
 import time
+import json
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from db import turso_http_client as turso
+
 TASK_FILE = Path("memory/friday_tasks.json")
+DEDUP_FILE = Path("memory/friday_alert_dedup.json")
+DEDUP_TABLE = "alert_dedup"
 
 
 class AutonomousAgent:
 
     def __init__(self):
         self._running = False
-        self._actions_taken = []
-        # 10 independent monitor threads all call _alert() on their own
+        self._started = False
+        self._start_lock = threading.Lock()
+        # 10+ independent monitor threads all call _alert() on their own
         # schedules and can genuinely overlap in real time — without this,
         # two concurrent alerts racing on the read-slice-reassign below
         # could silently drop one's dedup entry.
         self._actions_lock = threading.Lock()
         self._mac_bridge_failures = 0
+        # Loaded from Turso (falls back to local JSON) rather than starting
+        # empty — an in-memory-only dedup list means every process restart
+        # forgets every alert sent in the last hour and replays all of them
+        # (this is the "200 pushover pings a day" bug: Render's disk isn't
+        # guaranteed to survive a restart/redeploy either, so the flag-file
+        # dedup some monitors used had the same problem).
+        self._actions_taken = self._load_dedup()
 
     def start(self):
-        """Start all autonomous monitors."""
+        """Start all autonomous monitors. Safe to call more than once —
+        only the first call actually spawns monitor threads, so a stray
+        double-call can't double every monitor (and double every alert)."""
+        with self._start_lock:
+            if self._started:
+                return
+            self._started = True
         self._running = True
 
         monitors = [
@@ -627,6 +646,39 @@ class AutonomousAgent:
         except Exception:
             pass
 
+    # ── Alert dedup persistence ──────────────────────────────────────────────
+    def _load_dedup(self) -> list:
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(DEDUP_TABLE)
+                data = turso.kv_get(DEDUP_TABLE, "recent")
+                if isinstance(data, list):
+                    return data
+            except Exception as e:
+                print(f"[Autonomous] dedup load from Turso failed: {e}")
+        if DEDUP_FILE.exists():
+            try:
+                return json.loads(DEDUP_FILE.read_text())
+            except Exception:
+                pass
+        return []
+
+    def _save_dedup(self):
+        """Called with _actions_lock already held. Turso is the durable
+        copy (survives a restart); local JSON is a same-process fallback
+        so dedup still works if Turso isn't configured at all."""
+        DEDUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            DEDUP_FILE.write_text(json.dumps(self._actions_taken))
+        except Exception:
+            pass
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(DEDUP_TABLE)
+                turso.kv_set(DEDUP_TABLE, "recent", self._actions_taken)
+            except Exception as e:
+                print(f"[Autonomous] dedup save to Turso failed: {e}")
+
     # ── Alert dispatcher ─────────────────────────────────────────────────────
     def _alert(self, message: str, priority: str = "normal", title: str = "FRIDAY"):
         """Send alert through all channels."""
@@ -657,6 +709,7 @@ class AutonomousAgent:
                 return
             self._actions_taken.append({"msg": message, "ts": time.time()})
             self._actions_taken = self._actions_taken[-100:]
+            self._save_dedup()
 
         print(f"[FRIDAY Autonomous] {title}: {message}")
 
