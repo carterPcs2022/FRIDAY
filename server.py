@@ -150,6 +150,14 @@ except Exception as e:
     logging.warning(f"Health monitor failed: {e}")
 
 try:
+    from services.friday_car import friday_car
+    CAR_OK = True
+except Exception as e:
+    friday_car = None
+    CAR_OK = False
+    logging.warning(f"Car telemetry failed: {e}")
+
+try:
     from services.friday_contacts import friday_contacts
     CONTACTS_OK = True
 except Exception as e:
@@ -855,6 +863,12 @@ HA_STATUS_TRIGGERS = [
     "what's on my home assistant", "whats on my home assistant",
     "what's on home assistant", "home assistant status",
     "list my devices", "list my home assistant devices",
+]
+
+CAR_STATUS_TRIGGERS = [
+    "car status", "how's the murano", "hows the murano",
+    "how's the maxima", "hows the maxima", "how's my car", "hows my car",
+    "fuel level", "gas level", "check engine",
 ]
 
 # Checked only after HOMEKIT_TRIGGERS, so phrases like "turn on lights"
@@ -2127,6 +2141,25 @@ def command():
             _log(prompt, response, "home_assistant")
             return jsonify({"response": response, "mode": "home_assistant"})
 
+        # ── Car telemetry — status ───────────────────────────────────────────
+        if CAR_OK and friday_car and any(t in p_lower for t in CAR_STATUS_TRIGGERS):
+            vehicle = "Murano" if "murano" in p_lower else ("Maxima" if "maxima" in p_lower else None)
+            status = friday_car.get_status(vehicle)
+            rows = [status] if vehicle else [s for s in (status or {}).values() if s]
+            if not rows:
+                response = "No telemetry from the car yet, boss."
+            else:
+                lines = []
+                for s in rows:
+                    parts = [f"{s['fuel_level']:.0f}% fuel"] if s.get("fuel_level") is not None else []
+                    if s.get("dtc_codes"):
+                        parts.append(f"check engine on ({', '.join(s['dtc_codes'])})")
+                    lines.append(f"{s['vehicle']}: " + (", ".join(parts) if parts else "no data"))
+                response = "Here's the car, boss: " + "; ".join(lines) + "."
+                spawn_widget("data", {"title": "CAR STATUS", "rows": rows})
+            _log(prompt, response, "car_telemetry")
+            return jsonify({"response": response, "mode": "car_telemetry"})
+
         # ── Home Assistant — generic turn on/off <device> ───────────────────
         if HA_OK and home_assistant and ("turn on" in p_lower or "turn off" in p_lower):
             for device_name, entity_id in HA_DEVICE_TRIGGERS.items():
@@ -2671,6 +2704,27 @@ def health_log():
         heart_rate=data.get("heart_rate", 0), hrv=data.get("hrv", 0),
         blood_oxygen=data.get("blood_oxygen", 0), steps=data.get("steps", 0),
         sleep_hours=data.get("sleep_hours", 0), sleep_quality=data.get("sleep_quality", 0),
+    )
+    return jsonify(entry)
+
+
+# ── Car telemetry (OBD-II) ──────────────────────────────────────────────────
+
+@app.route("/friday/car/report", methods=["POST"])
+def car_report():
+    """
+    Pushed by an ESP32 + Bluetooth ELM327 dongle riding in a vehicle —
+    small payload, no auth complexity, same convention as
+    /friday/hud/medicine's device-polling design.
+    """
+    if not CAR_OK:
+        return jsonify({"error": "car telemetry unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    entry = friday_car.log_from_obd(
+        vehicle=data.get("vehicle", ""), fuel_level=data.get("fuel_level"),
+        rpm=data.get("rpm"), speed=data.get("speed"),
+        coolant_temp=data.get("coolant_temp"), dtc_codes=data.get("dtc_codes", []),
+        voltage=data.get("voltage"),
     )
     return jsonify(entry)
 
