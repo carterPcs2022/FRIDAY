@@ -1174,8 +1174,14 @@ def _log(user: str, response: str, mode: str):
 
 
 def safe(text: str) -> str:
+    """Used on every normal FRIDAY reply (main chat, JARVIS proxy, morning
+    brief) before it's shown AND before it's spoken — the old 500-char cap
+    silently chopped ordinary paragraph-length replies off mid-sentence in
+    both the chat UI and the audio, not just voice. friday_brain.think()
+    regularly runs at max_tokens=600-800, comfortably over 2000 characters,
+    so this matches the cap raised in services/friday_voice.py's _clean()."""
     try:
-        return str(text)[:500]
+        return str(text)[:2000]
     except Exception:
         return "FRIDAY safe mode."
 
@@ -4054,15 +4060,18 @@ function playAudio(file) {
   currentAudio.addEventListener('play', () => {
     if (window.onFridaySpeak) window.onFridaySpeak();
     if (window.onFridaySpeakFace) window.onFridaySpeakFace();
+    startBargeInListener();
   });
   currentAudio.addEventListener('ended', () => {
     if (window.onFridayDone) window.onFridayDone();
     if (window.onFridayDoneFace) window.onFridayDoneFace();
+    stopBargeInListener();
     openConversationWindow();
   });
   currentAudio.addEventListener('pause', () => {
     if (window.onFridayDone) window.onFridayDone();
     if (window.onFridayDoneFace) window.onFridayDoneFace();
+    stopBargeInListener();
   });
   currentAudio.play().catch(() => {});
 }
@@ -4276,6 +4285,79 @@ function stopWakeListening() {
     try { commandRecorder.stop(); } catch (e) {}
   }
   clearTimeout(silenceTimer);
+  stopBargeInListener();
+}
+
+// ── Barge-in ("just start talking, she goes quiet") ─────────────────────────
+// The wake-word interrupt in beginCommandCapture() only fires if you say
+// "friday" specifically while she's talking — that's word recognition, not
+// "cut her off like you would on a phone call." This listens for raw mic
+// volume instead of any specific word, only while currentAudio is actually
+// playing, so any speech interrupts her, not just the wake word. It runs on
+// its own getUserMedia stream (separate from wakeRecognition's internal
+// capture) so the two aren't fighting over the same handle.
+const VAD_THRESHOLD = 0.05;    // RMS above this counts as "someone's talking"
+const VAD_TRIGGER_FRAMES = 4;  // consecutive loud frames required — debounces pops/clicks
+// Tuning note: background noise (or her own voice bleeding from speaker
+// into mic) triggering this too easily -> raise VAD_THRESHOLD. Talking
+// over her not interrupting reliably -> lower it. This is inherently more
+// reliable on headphones than open speakers — there's no speaker-to-mic
+// feedback for echoCancellation to fight in the first place.
+let vadStream = null, vadContext = null, vadAnalyser = null, vadData = null, vadRaf = null, vadLoudFrames = 0;
+
+function startBargeInListener() {
+  if (!voiceModeOn || vadStream) return;
+  navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  }).then((stream) => {
+    // voiceModeOn may have been toggled off, or she may have already
+    // finished, while the permission prompt/promise was pending.
+    if (!voiceModeOn || !currentAudio || currentAudio.paused) {
+      stream.getTracks().forEach(t => t.stop());
+      return;
+    }
+    vadStream = stream;
+    vadContext = new (window.AudioContext || window.webkitAudioContext)();
+    const source = vadContext.createMediaStreamSource(vadStream);
+    vadAnalyser = vadContext.createAnalyser();
+    vadAnalyser.fftSize = 512;
+    source.connect(vadAnalyser);
+    vadData = new Uint8Array(vadAnalyser.frequencyBinCount);
+    vadLoudFrames = 0;
+    vadTick();
+  }).catch(() => {});  // no mic permission — barge-in just won't work; rest of the app is unaffected
+}
+
+function vadTick() {
+  if (!vadAnalyser) return;
+  vadAnalyser.getByteTimeDomainData(vadData);
+  let sumSquares = 0;
+  for (let i = 0; i < vadData.length; i++) {
+    const v = (vadData[i] - 128) / 128;
+    sumSquares += v * v;
+  }
+  const rms = Math.sqrt(sumSquares / vadData.length);
+  if (rms > VAD_THRESHOLD) {
+    vadLoudFrames++;
+    if (vadLoudFrames >= VAD_TRIGGER_FRAMES) {
+      stopBargeInListener();
+      if (voiceModeOn && !awaitingCommand) beginCommandCapture(false);
+      return;
+    }
+  } else {
+    vadLoudFrames = 0;
+  }
+  vadRaf = requestAnimationFrame(vadTick);
+}
+
+function stopBargeInListener() {
+  if (vadRaf) cancelAnimationFrame(vadRaf);
+  vadRaf = null;
+  vadAnalyser = null;
+  vadData = null;
+  if (vadContext) { try { vadContext.close(); } catch (e) {} vadContext = null; }
+  if (vadStream) { vadStream.getTracks().forEach(t => t.stop()); vadStream = null; }
+  vadLoudFrames = 0;
 }
 
 async function beginCommandCapture(ambiguous, timeoutMs) {
