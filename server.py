@@ -116,6 +116,14 @@ except Exception as e:
     logging.warning(f"Training failed: {e}")
 
 try:
+    from services.wisdom import get_wisdom_context
+    WISDOM_OK = True
+except Exception as e:
+    get_wisdom_context = None
+    WISDOM_OK = False
+    logging.warning(f"Wisdom context failed: {e}")
+
+try:
     from core.friday_protocols import friday_protocols, RangeLevel
     PROTOCOLS_OK = True
 except Exception as e:
@@ -388,6 +396,15 @@ except Exception as e:
     hulkbuster = None
     HULKBUSTER_OK = False
     logging.warning(f"HulkBuster failed: {e}")
+
+try:
+    from core.scatter import get_engine as _get_scatter_engine
+    scatter_engine = _get_scatter_engine()
+    SCATTER_OK = True
+except Exception as e:
+    scatter_engine = None
+    SCATTER_OK = False
+    logging.warning(f"Scatter Protocol failed: {e}")
 
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
@@ -1299,6 +1316,10 @@ def state():
         "uptime_seconds": uptime, "uptime": uptime,
         "log": list(reversed(EXCHANGE_LOG)),
         "voice_mode": friday_brain.voice_mode if friday_brain else "normal",
+        # Real telemetry for the HUD overlay's edge readouts — replaces
+        # placeholder ALT/HDG/LAT values that never reflected anything.
+        "locked": suit_lockdown.is_locked() if LOCKDOWN_OK else False,
+        "hulkbuster": hulkbuster.status() if HULKBUSTER_OK else {"deployed": False},
     })
 
 
@@ -2230,6 +2251,17 @@ def command():
                     knowledge = friday_trainer.get_context_brief(prompt)
                     if knowledge:
                         context = "\n".join(filter(None, [knowledge, context]))
+                if WISDOM_OK:
+                    # Prepended, not appended — _build_messages() truncates
+                    # context to its first 500 chars, so query-specific
+                    # relevant history needs to survive that cut ahead of
+                    # the more generic facts/recall context, not after it.
+                    try:
+                        wisdom = get_wisdom_context(prompt)
+                        if wisdom:
+                            context = "\n".join(filter(None, [wisdom, context]))
+                    except Exception as e:
+                        logging.warning(f"Wisdom context lookup failed: {e}")
 
                 if COVERAGE_MODE:
                     friday_brain.set_voice_mode("coverage")
@@ -2826,6 +2858,59 @@ def hulkbuster_stand_down():
     if not HULKBUSTER_OK:
         return jsonify({"error": "hulkbuster unavailable"}), 503
     return jsonify(hulkbuster.stand_down())
+
+
+# ── Scatter Protocol ─────────────────────────────────────────────────────────
+# Two-step like Lockdown: POST without confirm_token gets you a token +
+# a Pushover alert; POST again with the same passphrase + that token
+# within 10 minutes actually scatters. Reassemble is single-step — it's
+# the recovery action, not the destructive one.
+
+@app.route("/friday/scatter", methods=["POST"])
+def trigger_scatter():
+    if not SCATTER_OK:
+        return jsonify({"error": "scatter unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    passphrase = data.get("passphrase", "")
+    confirm_token = data.get("confirm_token", "")
+    if not passphrase:
+        return jsonify({"error": "passphrase required"}), 400
+    if not confirm_token:
+        return jsonify(scatter_engine.request_scatter(passphrase))
+    result = scatter_engine.scatter(passphrase, confirm_token)
+    if not result.get("ok"):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route("/friday/scatter/status")
+def scatter_status():
+    if not SCATTER_OK:
+        return jsonify({"error": "scatter unavailable"}), 503
+    return jsonify(scatter_engine.status())
+
+
+@app.route("/friday/scatter/reassemble", methods=["POST"])
+def scatter_reassemble():
+    if not SCATTER_OK:
+        return jsonify({"error": "scatter unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    passphrase = data.get("passphrase", "")
+    if not passphrase:
+        return jsonify({"error": "passphrase required"}), 400
+    result = scatter_engine.reassemble(passphrase)
+    if not result.get("ok"):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route("/friday/scatter/nodes")
+def scatter_nodes_list():
+    if not SCATTER_OK:
+        return jsonify({"error": "scatter unavailable"}), 503
+    from services.scatter_nodes import get_nodes
+    nodes = get_nodes()
+    return jsonify({"nodes": [{"name": n.name, "available": n.available()} for n in nodes]})
 
 
 # ── Health (Apple Watch) ───────────────────────────────────────────────────────
@@ -4140,7 +4225,9 @@ body {
 <div class="particles" id="particles"></div>
 <canvas id="friday-face" width="220" height="220"></canvas>
 
-<!-- HELMET VIEW — first-person HUD overlay -->
+<!-- HELMET VIEW — first-person HUD overlay. Every readout below reflects
+     something FRIDAY actually tracks (security/lockdown/protocol state) —
+     no decorative flight-HUD placeholders that never update. -->
 <canvas id="reticle-overlay" width="680" height="680"
   style="position:fixed;top:50%;left:50%;
   transform:translate(-50%,-50%);
@@ -4150,16 +4237,16 @@ body {
 
 <div id="hud-edge-strip" style="position:fixed;top:80px;left:20px;right:20px;
   display:flex;justify-content:space-between;
-  pointer-events:none;z-index:2;opacity:0.6">
-  <div style="font-size:9px;color:rgba(0,168,255,0.6);
+  pointer-events:none;z-index:2;opacity:0.7">
+  <div style="font-size:9px;color:var(--hud-glow, rgba(72,202,228,0.7));
     letter-spacing:1px;font-family:'Courier New'">
-    <div>ALT: <span id="hud-alt">---</span></div>
-    <div>HDG: <span id="hud-hdg">---</span></div>
+    <div>RANGE: <span id="hud-range">---</span></div>
+    <div>THREATS: <span id="hud-threats">0</span></div>
   </div>
-  <div style="font-size:9px;color:rgba(0,168,255,0.6);
+  <div style="font-size:9px;color:var(--hud-glow, rgba(72,202,228,0.7));
     letter-spacing:1px;text-align:right;
     font-family:'Courier New'">
-    <div>LAT: <span id="hud-lat">---</span></div>
+    <div>LOCK: <span id="hud-lock">CLEAR</span></div>
     <div>PWR: <span id="hud-pwr">---</span></div>
   </div>
 </div>
@@ -4949,6 +5036,25 @@ async function pollState() {
     document.getElementById('p-threats').textContent = sec.threats || 0;
     document.getElementById('p-blocked').textContent = sec.blocked_ips || 0;
 
+    // HUD edge-strip + reticle labels — real telemetry, not placeholders.
+    const rangeLabel = (d.range_level || '---').toUpperCase();
+    const threatsLabel = `${sec.threats || 0} THR`;
+    const lockLabel = d.locked ? 'ENGAGED' : 'CLEAR';
+    const hudRangeEl = document.getElementById('hud-range');
+    if (hudRangeEl) hudRangeEl.textContent = rangeLabel;
+    const hudThreatsEl = document.getElementById('hud-threats');
+    if (hudThreatsEl) hudThreatsEl.textContent = sec.threats || 0;
+    const hudLockEl = document.getElementById('hud-lock');
+    if (hudLockEl) hudLockEl.textContent = lockLabel;
+    window.hudRangeLabel = rangeLabel;
+    window.hudThreatsLabel = threatsLabel;
+    window.hudLockLabel = lockLabel;
+
+    const hb = d.hulkbuster || {};
+    if (typeof setHudThreatState === 'function') {
+      setHudThreatState(!!d.locked || !!hb.deployed);
+    }
+
     const training = d.training || {};
     document.getElementById('p-training').textContent = training.facts_learned !== undefined ? training.facts_learned : '-';
 
@@ -5276,7 +5382,26 @@ document.addEventListener('keydown', e => {
 </script>
 
 <script>
-// ── Helmet view — first-person targeting reticle overlay (blue theme) ─────────
+// ── HUD color state — FRIDAY's own palette (--bright/--glow from :root),
+// not JARVIS's leftover rgba(0,168,255,...) blue. Shifts to her existing
+// --danger red when locked down or HulkBuster is deployed, driven by
+// setHudThreatState() from pollState() below — one source of truth for
+// both the canvas-drawn elements and the edge-strip HTML labels (via the
+// --hud-glow CSS variable).
+const HUD_NORMAL = {r: 72,  g: 202, b: 228};  // --bright
+const HUD_ALERT  = {r: 230, g: 57,  b: 70};   // --danger
+let hudColor = HUD_NORMAL;
+let hudThreatActive = false;
+
+function setHudThreatState(active) {
+  if (active === hudThreatActive) return;
+  hudThreatActive = active;
+  hudColor = active ? HUD_ALERT : HUD_NORMAL;
+  document.documentElement.style.setProperty(
+    '--hud-glow', `rgba(${hudColor.r},${hudColor.g},${hudColor.b},0.7)`);
+}
+
+// ── Helmet view — first-person targeting reticle overlay ────────────────────
 (function() {
   const c = document.getElementById('reticle-overlay');
   if (!c) return;
@@ -5284,12 +5409,17 @@ document.addEventListener('keydown', e => {
   const W = 680, H = 680, CX = 340, CY = 340;
   let t = 0;
 
+  function rgba(mult) {
+    return `rgba(${hudColor.r},${hudColor.g},${hudColor.b},${mult})`;
+  }
+
   function drawReticle() {
     ctx.clearRect(0, 0, W, H);
     const glow = 0.4 + Math.sin(t * 0.8) * 0.15;
+    const pulse = hudThreatActive ? 0.5 + Math.sin(t * 4) * 0.5 : 0;
 
     const R = 220;
-    ctx.strokeStyle = `rgba(0,168,255,${glow * 0.5})`;
+    ctx.strokeStyle = rgba(glow * 0.5 + pulse * 0.3);
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.arc(CX, CY, R, 0, Math.PI * 2);
@@ -5306,30 +5436,37 @@ document.addEventListener('keydown', e => {
       ctx.beginPath();
       ctx.moveTo(x1, y1);
       ctx.lineTo(x2, y2);
-      ctx.strokeStyle = isLong
-        ? `rgba(51,204,255,${glow * 0.7})`
-        : `rgba(0,168,255,${glow * 0.25})`;
+      ctx.strokeStyle = isLong ? rgba(glow * 0.7) : rgba(glow * 0.25);
       ctx.lineWidth = isLong ? 1.5 : 0.5;
       ctx.stroke();
     }
 
+    // Twin interlocking arcs rather than one segmented hex ring — a softer,
+    // more fluid motif than the mechanical original, rotating in opposite
+    // directions to feel less like a static gunsight.
     ctx.save();
     ctx.translate(CX, CY);
-    ctx.rotate(t * 0.15);
     const R2 = 160;
-    for (let i = 0; i < 6; i++) {
-      const a1 = (i / 6) * Math.PI * 2;
-      const a2 = a1 + Math.PI / 6 * 0.6;
-      ctx.beginPath();
-      ctx.arc(0, 0, R2, a1, a2);
-      ctx.strokeStyle = `rgba(0,168,255,${glow * 0.4})`;
-      ctx.lineWidth = 1;
-      ctx.stroke();
-    }
+    [1, -1].forEach((dir) => {
+      ctx.save();
+      ctx.rotate(t * 0.15 * dir);
+      for (let i = 0; i < 6; i++) {
+        const a1 = (i / 6) * Math.PI * 2;
+        const a2 = a1 + Math.PI / 6 * 0.55;
+        ctx.beginPath();
+        ctx.arc(0, 0, dir === 1 ? R2 : R2 - 14, a1, a2);
+        ctx.strokeStyle = rgba(glow * (dir === 1 ? 0.4 : 0.25));
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+      ctx.restore();
+    });
     ctx.restore();
 
-    const chSize = 14;
-    ctx.strokeStyle = `rgba(72,202,228,${glow * 0.6})`;
+    // Center crosshair, breathing gently in sync with her chat orb pulse
+    // (.ar-widget-orb elsewhere on the page) instead of a fixed size.
+    const chSize = 14 + pulse * 4;
+    ctx.strokeStyle = rgba(glow * 0.6 + pulse * 0.3);
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(CX - chSize, CY);
@@ -5343,12 +5480,12 @@ document.addEventListener('keydown', e => {
     ctx.stroke();
 
     ctx.font = '9px Courier New';
-    ctx.fillStyle = `rgba(51,204,255,${glow * 0.5})`;
+    ctx.fillStyle = rgba(glow * 0.5);
     const labels = [
-      {angle: -Math.PI/2, text: 'SYS OK'},
-      {angle: 0, text: '85x'},
-      {angle: Math.PI/2, text: 'STBY'},
-      {angle: Math.PI, text: '3.45'},
+      {angle: -Math.PI/2, text: hudThreatActive ? 'ALERT' : 'SYS OK'},
+      {angle: 0, text: window.hudRangeLabel || '---'},
+      {angle: Math.PI/2, text: window.hudThreatsLabel || '0 THR'},
+      {angle: Math.PI, text: window.hudLockLabel || 'CLEAR'},
     ];
     labels.forEach(l => {
       const lx = CX + Math.cos(l.angle) * (R + 16);
@@ -5373,8 +5510,9 @@ document.addEventListener('keydown', e => {
   function drawRadar() {
     ctx.clearRect(0, 0, 80, 80);
     const CX = 40, CY = 40, R = 32;
+    const base = `rgba(${hudColor.r},${hudColor.g},${hudColor.b},`;
 
-    ctx.strokeStyle = 'rgba(0,168,255,0.3)';
+    ctx.strokeStyle = base + '0.3)';
     ctx.lineWidth = 0.5;
     ctx.beginPath();
     ctx.arc(CX, CY, R, 0, Math.PI * 2);
@@ -5392,8 +5530,8 @@ document.addEventListener('keydown', e => {
     ctx.translate(CX, CY);
     ctx.rotate(sweepAngle);
     const grad = ctx.createLinearGradient(0, 0, R, 0);
-    grad.addColorStop(0, 'rgba(0,168,255,0.5)');
-    grad.addColorStop(1, 'rgba(0,168,255,0)');
+    grad.addColorStop(0, base + '0.5)');
+    grad.addColorStop(1, base + '0)');
     ctx.strokeStyle = grad;
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -5401,6 +5539,17 @@ document.addEventListener('keydown', e => {
     ctx.lineTo(R, 0);
     ctx.stroke();
     ctx.restore();
+
+    // A dot at the threat-count position when there's anything to show —
+    // makes the radar reflect something real instead of sweeping over
+    // nothing, without needing actual spatial threat data FRIDAY doesn't have.
+    if (hudThreatActive) {
+      const dotAngle = sweepAngle - 0.3;
+      ctx.beginPath();
+      ctx.arc(CX + Math.cos(dotAngle) * R * 0.75, CY + Math.sin(dotAngle) * R * 0.75, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = base + '0.9)';
+      ctx.fill();
+    }
 
     sweepAngle += 0.02;
     requestAnimationFrame(drawRadar);
@@ -5419,7 +5568,8 @@ function toggleReticle() {
   document.getElementById('corner-radar-friday').style.display = display;
   const btn = document.getElementById('reticle-toggle-btn');
   btn.style.borderColor = reticleOn
-    ? 'rgba(0,168,255,0.6)' : 'rgba(0,168,255,0.3)';
+    ? `rgba(${hudColor.r},${hudColor.g},${hudColor.b},0.6)`
+    : `rgba(${hudColor.r},${hudColor.g},${hudColor.b},0.3)`;
 }
 (function() {
   const savedState = localStorage.getItem('helmetViewOn');
