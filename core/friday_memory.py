@@ -40,37 +40,108 @@ def _save(path: Path, data):
 
 # ── Facts ────────────────────────────────────────────────────────────────────
 
+FACTS_TABLE = "facts"
+
+
 def save_fact(fact: str):
     facts = _load(FACTS_FILE)
-    if isinstance(facts, list) and fact not in facts:
-        facts.append(fact)
-        _save(FACTS_FILE, facts[-200:])
+    if not isinstance(facts, list):
+        facts = []
+    if fact in facts:
+        return
+    facts.append(fact)
+    facts = facts[-200:]
+    _save(FACTS_FILE, facts)
+
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(FACTS_TABLE)
+            turso.list_insert(FACTS_TABLE, {"fact": fact})
+        except Exception as e:
+            print(f"[Turso] fact write failed, local JSON already has it: {e}")
 
 
 def get_facts(n: int = 10) -> list[str]:
+    if turso.is_configured():
+        rows = None
+        try:
+            turso.ensure_list_table(FACTS_TABLE)
+            rows = turso.list_all(FACTS_TABLE)
+        except Exception as e:
+            print(f"[Turso] facts read failed, falling back to local JSON: {e}")
+        if rows:
+            facts = [r["fact"] for r in rows if "fact" in r]
+            return facts[-n:]
+        if rows is not None:
+            # Query succeeded but came back empty — either genuinely no
+            # facts yet, or this is the first read since migrating and
+            # Turso hasn't been seeded from the pre-existing local JSON.
+            local = _load(FACTS_FILE)
+            local = local if isinstance(local, list) else []
+            for fact in local:
+                try:
+                    turso.list_insert(FACTS_TABLE, {"fact": fact})
+                except Exception as e:
+                    print(f"[Turso] facts seed failed: {e}")
+            return local[-n:]
+
     facts = _load(FACTS_FILE)
     return facts[-n:] if isinstance(facts, list) else []
 
 
 # ── Conversations ────────────────────────────────────────────────────────────
 
+CONVO_TABLE = "conversations"
+
+
 def save_turn(user: str, friday: str):
     convos = _load(CONVO_FILE)
     if not isinstance(convos, list):
         convos = []
-    convos.append({"user": user, "friday": friday, "ts": datetime.now().isoformat()})
-    _save(CONVO_FILE, convos[-500:])
+    turn = {"user": user, "friday": friday, "ts": datetime.now().isoformat()}
+    convos.append(turn)
+    convos = convos[-500:]
+    _save(CONVO_FILE, convos)
+
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(CONVO_TABLE)
+            turso.list_insert(CONVO_TABLE, turn)
+        except Exception as e:
+            print(f"[Turso] conversation write failed, local JSON already has it: {e}")
 
 
 def get_recent_turns(n: int = 5) -> list[dict]:
+    if turso.is_configured():
+        rows = None
+        try:
+            turso.ensure_list_table(CONVO_TABLE)
+            rows = turso.list_all(CONVO_TABLE)
+        except Exception as e:
+            print(f"[Turso] conversations read failed, falling back to local JSON: {e}")
+        if rows:
+            return rows[-n:]
+        if rows is not None:
+            local = _load(CONVO_FILE)
+            local = local if isinstance(local, list) else []
+            for turn in local:
+                try:
+                    turso.list_insert(CONVO_TABLE, turn)
+                except Exception as e:
+                    print(f"[Turso] conversations seed failed: {e}")
+            return local[-n:]
+
     convos = _load(CONVO_FILE)
     return convos[-n:] if isinstance(convos, list) else []
 
 
 def recall(query: str, k: int = 3) -> list[str]:
-    """Simple keyword recall from conversation history."""
-    convos = _load(CONVO_FILE)
-    if not isinstance(convos, list):
+    """Simple keyword recall from conversation history. Goes through
+    get_recent_turns() (not a raw local-file load) so it sees Turso-backed
+    history too — reading CONVO_FILE directly here would show nothing
+    after a Render redeploy wipes it, even though Turso still has it."""
+    convos = get_recent_turns(500)
+    if not convos:
         return []
     q_words = set(query.lower().split())
     scored = []
@@ -96,23 +167,63 @@ def get_context_for(query: str) -> str:
 
 # ── Emotional log ────────────────────────────────────────────────────────────
 
+EMOTIONAL_TABLE = "emotional_log"
+
+
 def log_emotion(emotion: str, intensity: int, context: str):
     log = _load(EMOTIONAL_FILE)
     if not isinstance(log, list):
         log = []
-    log.append({"emotion": emotion, "intensity": intensity, "context": context[:100],
-                "ts": datetime.now().isoformat()})
-    _save(EMOTIONAL_FILE, log[-200:])
+    entry = {"emotion": emotion, "intensity": intensity, "context": context[:100],
+              "ts": datetime.now().isoformat()}
+    log.append(entry)
+    log = log[-200:]
+    _save(EMOTIONAL_FILE, log)
+
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(EMOTIONAL_TABLE)
+            turso.list_insert(EMOTIONAL_TABLE, entry)
+        except Exception as e:
+            print(f"[Turso] emotion write failed, local JSON already has it: {e}")
+
+
+def _get_emotional_log(limit: int = 200) -> list[dict]:
+    """Turso-backed read with local-JSON seed-on-empty fallback, same
+    shape as get_notes()/get_recent_turns(). Both get_emotional_trend()
+    and get_mood_history() go through this instead of loading
+    EMOTIONAL_FILE directly, so both see Turso-backed history too."""
+    if turso.is_configured():
+        rows = None
+        try:
+            turso.ensure_list_table(EMOTIONAL_TABLE)
+            rows = turso.list_all(EMOTIONAL_TABLE)
+        except Exception as e:
+            print(f"[Turso] emotional log read failed, falling back to local JSON: {e}")
+        if rows:
+            return rows[-limit:]
+        if rows is not None:
+            local = _load(EMOTIONAL_FILE)
+            local = local if isinstance(local, list) else []
+            for entry in local:
+                try:
+                    turso.list_insert(EMOTIONAL_TABLE, entry)
+                except Exception as e:
+                    print(f"[Turso] emotional log seed failed: {e}")
+            return local[-limit:]
+
+    log = _load(EMOTIONAL_FILE)
+    return log[-limit:] if isinstance(log, list) else []
 
 
 def get_emotional_trend(days: int = 7) -> dict:
     """What's the emotional trend been recently? (days is accepted for API
     stability but not yet used for filtering — the log isn't large enough
     yet to need date-windowing over the most recent 20 entries.)"""
-    log = _load(EMOTIONAL_FILE)
-    if not isinstance(log, list) or not log:
+    log = _get_emotional_log(20)
+    if not log:
         return {}
-    emotions = [e["emotion"] for e in log[-20:]]
+    emotions = [e["emotion"] for e in log]
     return dict(Counter(emotions))
 
 
@@ -122,8 +233,8 @@ def get_mood_history(days: int = 7) -> dict:
     actually filters by day rather than just taking the most recent 20
     entries regardless of when they happened."""
     from datetime import timedelta
-    log = _load(EMOTIONAL_FILE)
-    if not isinstance(log, list) or not log:
+    log = _get_emotional_log()
+    if not log:
         return {"dominant": "neutral", "avg_intensity": 0, "counts": {}, "entries": 0}
 
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
@@ -140,8 +251,41 @@ def get_mood_history(days: int = 7) -> dict:
 
 
 # ── Profile ──────────────────────────────────────────────────────────────────
+# Read on nearly every request, so this was deliberately saved for last in
+# the migration — a single kv row (whole profile dict under one fixed key)
+# rather than list_* records, since it's inherently one object, not a
+# growing history.
+
+PROFILE_TABLE = "profile"
+PROFILE_KEY = "profile"
+
 
 def get_profile() -> dict:
+    if turso.is_configured():
+        row, query_ok = None, False
+        try:
+            turso.ensure_kv_table(PROFILE_TABLE)
+            row = turso.kv_get(PROFILE_TABLE, PROFILE_KEY)
+            query_ok = True
+        except Exception as e:
+            print(f"[Turso] profile read failed, falling back to local JSON: {e}")
+
+        if row is not None:
+            # Turso has a row — even an empty dict is a real answer, not
+            # "no data yet" (unlike kv_get's None, which unambiguously
+            # means the key was never written).
+            return row
+        if query_ok:
+            # Query succeeded but the key doesn't exist yet — first read
+            # since migrating, seed Turso from local JSON.
+            local = _load(PROFILE_FILE)
+            if isinstance(local, dict) and local:
+                try:
+                    turso.kv_set(PROFILE_TABLE, PROFILE_KEY, local)
+                except Exception as e:
+                    print(f"[Turso] profile seed failed: {e}")
+            return local
+
     return _load(PROFILE_FILE)
 
 
@@ -149,6 +293,13 @@ def update_profile(key: str, value):
     profile = get_profile()
     profile[key] = value
     _save(PROFILE_FILE, profile)
+
+    if turso.is_configured():
+        try:
+            turso.ensure_kv_table(PROFILE_TABLE)
+            turso.kv_set(PROFILE_TABLE, PROFILE_KEY, profile)
+        except Exception as e:
+            print(f"[Turso] profile write failed, local JSON already has it: {e}")
 
 
 # ── Personal memory ──────────────────────────────────────────────────────────
