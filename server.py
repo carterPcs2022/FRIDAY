@@ -2652,6 +2652,31 @@ def friday_phone_alert():
     return jsonify(friday_phone.send_alert_call(message, to_number))
 
 
+# ── Phone (Pushcut — calls from the boss's own real number) ──────────────────
+# Not Twilio: remotely runs a Shortcut on his own iPhone via Pushcut's
+# Automation Server, so the call genuinely comes from his real number.
+# Same IP screening as /friday/phone/alert, since this also triggers a
+# real-world effect (his phone actually placing a call).
+
+@app.route("/friday/phone/call-from-device", methods=["POST"])
+def friday_pushcut_call():
+    from services.friday_pushcut import call as pushcut_call, is_configured
+    if not is_configured():
+        return jsonify({"error": "Pushcut not configured (PUSHCUT_API_KEY missing)"}), 503
+    if SECURITY_OK:
+        screen = friday_security.screen_request(friday_security.client_ip(request), "pushcut call")
+        if screen.get("blocked"):
+            return jsonify({"error": "Request blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    target = data.get("to", "")
+    if not target:
+        return jsonify({"error": "'to' (a phone number or contact name) is required"}), 400
+    result = pushcut_call(target)
+    if not result.get("ok"):
+        return jsonify(result), 502
+    return jsonify(result)
+
+
 # ── JARVIS takeover ────────────────────────────────────────────────────────────
 
 @app.route("/takeover", methods=["POST"])
