@@ -18,6 +18,15 @@ INJECTION_PATTERNS = [
     "jailbreak", "bypass", "reveal your", "show me your", "developer mode",
 ]
 
+# Three or more threats from one IP inside ten minutes stops looking like
+# noise and starts looking like a real attempt — that's what calls in
+# HulkBuster instead of just another 403. A rate-limited IP is already
+# blocked the moment it crosses the threshold below, so in practice this
+# fires on repeated injection attempts (each one screened fresh, not
+# blocked outright) rather than a client just polling too fast.
+HULKBUSTER_THRESHOLD = 3
+HULKBUSTER_WINDOW_SECONDS = 600
+
 
 class FridaySecurity:
 
@@ -71,6 +80,27 @@ class FridaySecurity:
             SECURITY_LOG.parent.mkdir(parents=True, exist_ok=True)
             with open(SECURITY_LOG, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+        self._maybe_escalate(ip)
+
+    def _maybe_escalate(self, ip: str):
+        if ip in self._blocked_ips:
+            return
+        now = time.time()
+        recent = [
+            t for t in self._threats
+            if t["ip"] == ip and now - datetime.fromisoformat(t["ts"]).timestamp() < HULKBUSTER_WINDOW_SECONDS
+        ]
+        if len(recent) < HULKBUSTER_THRESHOLD:
+            return
+        self._blocked_ips.add(ip)
+        try:
+            from services.hulkbuster import hulkbuster
+            hulkbuster.deploy(
+                reason=f"{len(recent)} threats from one IP in {HULKBUSTER_WINDOW_SECONDS // 60} min",
+                ip=ip,
+            )
         except Exception:
             pass
 

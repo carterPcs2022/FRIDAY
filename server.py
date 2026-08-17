@@ -381,6 +381,14 @@ except Exception as e:
     SECURITY_OK = False
     logging.warning(f"Security failed: {e}")
 
+try:
+    from services.hulkbuster import hulkbuster
+    HULKBUSTER_OK = True
+except Exception as e:
+    hulkbuster = None
+    HULKBUSTER_OK = False
+    logging.warning(f"HulkBuster failed: {e}")
+
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
 JARVIS_TOKEN = os.environ.get("JARVIS_API_TOKEN", "")
@@ -2790,6 +2798,34 @@ def trigger_lockdown():
     if not LOCKDOWN_OK:
         return jsonify({"error": "lockdown unavailable"}), 503
     return jsonify(suit_lockdown.activate(reason="remote_trigger"))
+
+
+# ── HulkBuster ───────────────────────────────────────────────────────────────
+# Deploys automatically — friday_security.py after repeated threats from one
+# IP, core/veronica.py if a firewall file (friday_security.py/suit_lockdown.py)
+# itself turns up tampered. These routes are for checking status and for a
+# manual/boss-triggered deployment or stand-down.
+
+@app.route("/friday/hulkbuster/status")
+def hulkbuster_status():
+    if not HULKBUSTER_OK:
+        return jsonify({"error": "hulkbuster unavailable"}), 503
+    return jsonify(hulkbuster.status())
+
+
+@app.route("/friday/hulkbuster/deploy", methods=["POST"])
+def hulkbuster_deploy():
+    if not HULKBUSTER_OK:
+        return jsonify({"error": "hulkbuster unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    return jsonify(hulkbuster.deploy(data.get("reason", "manual"), data.get("ip", "")))
+
+
+@app.route("/friday/hulkbuster/stand-down", methods=["POST"])
+def hulkbuster_stand_down():
+    if not HULKBUSTER_OK:
+        return jsonify({"error": "hulkbuster unavailable"}), 503
+    return jsonify(hulkbuster.stand_down())
 
 
 # ── Health (Apple Watch) ───────────────────────────────────────────────────────
