@@ -76,11 +76,10 @@ class FridayHealthMonitor:
             pass
 
         try:
-            from core.friday_capabilities import friday_caps
-            friday_caps._pushover_alert(
+            from services.notifications import critical
+            critical(
                 "FRIDAY CRITICAL HEALTH ALERT",
                 f"{reason}. Respond immediately or FRIDAY will notify your emergency contact.",
-                priority=2, retry=60, expire=1800,
             )
         except Exception:
             pass
@@ -100,8 +99,8 @@ class FridayHealthMonitor:
             if not phone:
                 return
             try:
-                from core.friday_capabilities import friday_caps
-                friday_caps._pushover_alert(
+                from services.notifications import critical
+                critical(
                     "FRIDAY — No Response",
                     f"No response to critical health alert ({reason}). "
                     f"Emergency contact on file: {phone}.",

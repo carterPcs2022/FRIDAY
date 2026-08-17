@@ -15,7 +15,6 @@ needs ENDGAME_PASSPHRASE either way; HulkBuster doesn't get a bypass any
 more than a manual lockdown would.
 """
 import json
-import os
 from pathlib import Path
 from datetime import datetime
 
@@ -86,17 +85,8 @@ class HulkBuster:
         except Exception:
             pass
         try:
-            import httpx
-            httpx.post(
-                "https://api.pushover.net/1/messages.json",
-                data={
-                    "token": os.getenv("PUSHOVER_APP_TOKEN", ""),
-                    "user": os.getenv("PUSHOVER_USER_KEY", ""),
-                    "title": "FRIDAY — HULKBUSTER DEPLOYED",
-                    "message": message,
-                    "priority": 2, "retry": 60, "expire": 3600,
-                }, timeout=5,
-            )
+            from services.notifications import critical
+            critical("FRIDAY — HULKBUSTER DEPLOYED", message, expire=3600)
         except Exception:
             pass
         print(f"[HulkBuster] {message}")

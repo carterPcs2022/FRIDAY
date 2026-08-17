@@ -697,21 +697,18 @@ class AutonomousAgent:
         except Exception:
             pass
 
-        pushover_user = os.getenv("PUSHOVER_USER_KEY", "")
-        pushover_token = os.getenv("PUSHOVER_APP_TOKEN", "")
-        if pushover_user and pushover_token:
-            try:
-                import httpx
-                httpx.post(
-                    "https://api.pushover.net/1/messages.json",
-                    data={
-                        "token": pushover_token, "user": pushover_user,
-                        "title": title, "message": message,
-                        "priority": 1 if priority == "high" else 0,
-                    }, timeout=5
-                )
-            except Exception:
-                pass
+        # Routed through services/notifications.py rather than a raw
+        # Pushover call: "high" (battery critical, Mac Bridge down, health
+        # check failing) still pushes to the phone; "normal" (weekly
+        # review, urgent email, meeting prep, news, goal nudges) and "low"
+        # (hydration/break/meal reminders) now go to the HUD only, not a
+        # push notification for every routine nudge.
+        try:
+            from services.notifications import notify, Priority
+            level = {"high": Priority.HIGH, "normal": Priority.WARNING, "low": Priority.INFO}.get(priority, Priority.WARNING)
+            notify(title, message, level)
+        except Exception as e:
+            print(f"[FRIDAY Autonomous] notify failed: {e}")
 
 
 autonomous = AutonomousAgent()

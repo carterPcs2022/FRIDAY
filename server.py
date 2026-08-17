@@ -464,18 +464,11 @@ def _monitor_jarvis():
 
 
 def _notify_jarvis_down():
-    pushover_user = os.environ.get("PUSHOVER_USER_KEY", "")
-    pushover_token = os.environ.get("PUSHOVER_APP_TOKEN", "")
-    if pushover_user and pushover_token:
-        try:
-            import requests as req
-            req.post("https://api.pushover.net/1/messages.json", data={
-                "token": pushover_token, "user": pushover_user,
-                "title": "JARVIS Offline", "message": "FRIDAY has assumed control.",
-                "priority": 1,
-            }, timeout=5)
-        except Exception:
-            pass
+    try:
+        from services.notifications import alert
+        alert("JARVIS Offline", "FRIDAY has assumed control.")
+    except Exception as e:
+        logging.warning(f"JARVIS-down notify failed: {e}")
 
 
 def _start_thread(target, name: str):
@@ -643,7 +636,8 @@ def _morning_brief_loop():
                 if response:
                     save_turn("FRIDAY run a morning brief", response)
                     _log("FRIDAY run a morning brief", response, "morning-brief")
-                    _push("Morning Brief", response)
+                    from services.notifications import Priority
+                    _push("Morning Brief", response, Priority.WARNING)
                     if VOICE_OK and friday_brain:
                         friday_speak(response, mode=friday_brain.voice_mode)
         except Exception as e:
@@ -679,19 +673,19 @@ _CHECKIN_INTERVAL = 4 * 3600
 _LAST_CHECKIN_EMOTION = None
 
 
-def _push(title: str, message: str, priority: int = 0):
-    pushover_user = os.environ.get("PUSHOVER_USER_KEY", "")
-    pushover_token = os.environ.get("PUSHOVER_APP_TOKEN", "")
-    if not (pushover_user and pushover_token):
-        return
+def _push(title: str, message: str, priority=None):
+    """Routes through services/notifications.py. priority accepts a
+    notifications.Priority value; defaults to HIGH (still reaches
+    Pushover) since every real caller here is either time-sensitive (a
+    reminder the boss explicitly set, a focus-session timer) or
+    deliberately rate-limited and personally relevant (the proactive
+    emotional check-in) — Morning Brief is the one routine exception and
+    passes WARNING explicitly (HUD only, not a push notification)."""
     try:
-        import requests as req
-        req.post("https://api.pushover.net/1/messages.json", data={
-            "token": pushover_token, "user": pushover_user,
-            "title": title, "message": message, "priority": priority,
-        }, timeout=5)
-    except Exception:
-        pass
+        from services.notifications import notify, Priority
+        notify(title, message, priority if priority is not None else Priority.HIGH)
+    except Exception as e:
+        logging.warning(f"Push notify failed: {e}")
 
 
 # ── Assistant features: caller ID, notes, reminders, tasks ───────────────────
@@ -1373,16 +1367,21 @@ def command():
         if MAYDAY_PHRASE in prompt.lower():
             response = "Mayday received. What's happening, boss?"
             _log(prompt, response, "MAYDAY")
-            if friday_caps:
-                # Emergency-priority (2) — a distress signal that only
-                # pushes once, with no retry-until-acked, defeats its own
-                # purpose if boss's phone is silenced or out of reach.
-                # Same tier as friday_health.py's critical-vitals alert.
-                friday_caps._pushover_alert(
+            try:
+                # CRITICAL -> Pushover priority 2 (emergency) -> notify()'s
+                # _pushover() path -> friday_caps._pushover_alert(), which
+                # applies retry/expire itself for priority 2 — a distress
+                # signal that only pushes once, with no retry-until-acked,
+                # defeats its own purpose if boss's phone is silenced or
+                # out of reach. Same tier as friday_health.py's
+                # critical-vitals alert.
+                from services.notifications import critical
+                critical(
                     "FRIDAY MAYDAY",
                     f"Mayday phrase triggered. Emergency contact on file: {EMERGENCY_CONTACT_PHONE}",
-                    priority=2,
                 )
+            except Exception as e:
+                logging.warning(f"MAYDAY notify failed: {e}")
             if CHECKIN_OK:
                 try:
                     from services.checkin_system import emergency_pending

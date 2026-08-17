@@ -111,11 +111,8 @@ def check_and_alert():
     if result["ok"]:
         return result
     try:
-        from core.friday_capabilities import friday_caps
-        friday_caps._pushover_alert(
-            "FRIDAY Config Check Failed",
-            "; ".join(result["issues"])[:1024],
-        )
+        from services.notifications import alert
+        alert("FRIDAY Config Check Failed", "; ".join(result["issues"])[:1024])
     except Exception:
         pass
     return result

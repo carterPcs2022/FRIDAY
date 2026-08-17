@@ -64,7 +64,11 @@ class FridayMCUCapabilities:
             speak(f"Emergency services contacted. Dispatching to {location or 'your location'}.")
         except Exception:
             pass
-        self._pushover_alert("FRIDAY Emergency", f"{nature} at {location}")
+        try:
+            from services.notifications import critical
+            critical("FRIDAY Emergency", f"{nature} at {location}")
+        except Exception:
+            pass
         return {"contacted": True}
 
     def government_intel(self, query: str) -> dict:

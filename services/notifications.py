@@ -1,11 +1,14 @@
-"""services/notifications.py — a single place for new code to send
+"""services/notifications.py — the single place FRIDAY sends
 notifications through, with priority tiers and a digest queue for
-non-urgent signal. FRIDAY already has several independent raw Pushover
-call sites (server.py, core/autonomous_agent.py, core/friday_capabilities.py,
-services/suit_lockdown.py, services/checkin_system.py) — this doesn't
-replace those (a real refactor of five call sites is its own careful
-change, not bundled into this one), it's the canonical path for
-everything built from here on, starting with services/scheduler.py.
+non-urgent signal. Every formerly-independent raw Pushover call site
+(server.py, core/autonomous_agent.py, core/friday_capabilities.py,
+core/config_validator.py, core/scatter.py, services/suit_lockdown.py,
+services/checkin_system.py, services/friday_health.py,
+services/hulkbuster.py) now routes through here — only priority >= HIGH
+actually reaches Pushover, so routine nudges (weekly review, news,
+hydration reminders) surface on the HUD without buzzing the phone, while
+genuinely urgent things (battery critical, lockdown, HulkBuster, MAYDAY,
+health emergencies) still do.
 
 Reuses core/friday_capabilities.py's friday_caps._pushover_alert() for
 the actual Pushover HTTP call rather than re-implementing it, and routes
@@ -32,10 +35,12 @@ class Priority(IntEnum):
 _PUSHOVER_PRIORITY = {Priority.INFO: -1, Priority.WARNING: 0, Priority.HIGH: 1, Priority.CRITICAL: 2}
 
 
-def _pushover(title: str, message: str, priority: Priority):
+def _pushover(title: str, message: str, priority: Priority, retry: int | None = None, expire: int | None = None):
     try:
         from core.friday_capabilities import friday_caps
-        friday_caps._pushover_alert(title, message, priority=_PUSHOVER_PRIORITY[priority])
+        friday_caps._pushover_alert(
+            title, message, priority=_PUSHOVER_PRIORITY[priority], retry=retry, expire=expire,
+        )
     except Exception as e:
         log.warning("Pushover notify failed: %s", e)
 
@@ -48,13 +53,19 @@ def _hud_notify(title: str, message: str, priority: Priority):
         pass
 
 
-def notify(title: str, message: str, priority: Priority = Priority.INFO, channels: list[str] | None = None):
+def notify(title: str, message: str, priority: Priority = Priority.INFO, channels: list[str] | None = None,
+           retry: int | None = None, expire: int | None = None):
     """Send a notification to all configured channels.
 
     channels: subset of ["pushover", "hud"] — defaults to both. Pushover
     only actually fires at priority >= HIGH (matches Pushover's own free-tier
     good manners — you don't want a push notification for every INFO event);
     HUD always queues regardless of priority, since it's local and free.
+
+    retry/expire only apply at CRITICAL (Pushover's own emergency-priority
+    retry-until-acked mechanism) — passed through to
+    friday_caps._pushover_alert(), which supplies its own defaults
+    (60s/1800s) when not given.
     """
     if channels is None:
         channels = ["pushover", "hud"]
@@ -65,13 +76,14 @@ def notify(title: str, message: str, priority: Priority = Priority.INFO, channel
         _hud_notify(title, message, priority)
 
     if priority >= Priority.HIGH and "pushover" in channels:
-        _pushover(title, message, priority)
+        _pushover(title, message, priority, retry, expire)
 
 
 def info(title: str, msg: str):     notify(title, msg, Priority.INFO)
 def warning(title: str, msg: str):  notify(title, msg, Priority.WARNING)
 def alert(title: str, msg: str):    notify(title, msg, Priority.HIGH)
-def critical(title: str, msg: str): notify(title, msg, Priority.CRITICAL)
+def critical(title: str, msg: str, retry: int | None = None, expire: int | None = None):
+    notify(title, msg, Priority.CRITICAL, retry=retry, expire=expire)
 
 
 # ── Digest queue ─────────────────────────────────────────────────────────────
