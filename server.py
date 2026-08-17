@@ -246,6 +246,12 @@ except Exception as e:
     logging.warning(f"Tutor failed: {e}")
 
 try:
+    from services.hierarchical_planning import hierarchical
+except Exception as e:
+    hierarchical = None
+    logging.warning(f"Hierarchical planning failed: {e}")
+
+try:
     from services.friday_medicine import medicine_tracker
 except Exception as e:
     medicine_tracker = None
@@ -3813,6 +3819,30 @@ def tutor_explain_error():
         return jsonify({"error": "unavailable"}), 503
     return jsonify({"explanation": tutor.explain_error(
         data.get("error_message", ""), data.get("language", "python"))})
+
+
+# ── Hierarchical planning ────────────────────────────────────────────────────
+
+@app.route("/friday/plan", methods=["POST"])
+def hierarchical_plan():
+    data = request.get_json(silent=True) or {}
+    if not hierarchical:
+        return jsonify({"error": "unavailable"}), 503
+    goal = data.get("goal", "")
+    if not goal:
+        return jsonify({"error": "goal required"}), 400
+    return jsonify(hierarchical.plan(goal, data.get("depth", 4)))
+
+
+@app.route("/friday/plan/track", methods=["POST"])
+def hierarchical_plan_and_track():
+    data = request.get_json(silent=True) or {}
+    if not hierarchical:
+        return jsonify({"error": "unavailable"}), 503
+    goal = data.get("goal", "")
+    if not goal:
+        return jsonify({"error": "goal required"}), 400
+    return jsonify(hierarchical.plan_and_track(goal, data.get("depth", 4)))
 
 
 # ── Budget ─────────────────────────────────────────────────────────────────────
