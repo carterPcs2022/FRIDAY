@@ -18,6 +18,89 @@ def health():
     return "OK", 200
 
 
+from core import access_auth
+
+_LOGIN_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F.R.I.D.A.Y — Access</title>
+<style>
+  body { background:#000814; color:#caf0f8; font-family:-apple-system,'SF Pro Display','Helvetica Neue',sans-serif;
+    height:100vh; height:100dvh; display:flex; align-items:center; justify-content:center; margin:0; }
+  form { background:rgba(0,150,199,0.06); border:1px solid rgba(72,202,228,0.2); border-radius:16px;
+    padding:32px 28px; width:min(320px, 88vw); backdrop-filter:blur(20px); }
+  h1 { font-size:14px; letter-spacing:6px; color:#48cae4; margin:0 0 20px; text-align:center; }
+  input { width:100%; box-sizing:border-box; background:rgba(0,150,199,0.12); border:1px solid rgba(72,202,228,0.2);
+    border-radius:10px; padding:12px 14px; color:#caf0f8; font-size:15px; outline:none; margin-bottom:14px; }
+  input:focus { border-color:rgba(72,202,228,0.5); }
+  button { width:100%; background:linear-gradient(135deg,#0096c7,#48cae4); color:#000814; border:none;
+    border-radius:10px; padding:12px; font-size:14px; font-weight:600; letter-spacing:1px; cursor:pointer; }
+  .err { color:#e63946; font-size:12px; margin:-6px 0 14px; text-align:center; }
+</style></head>
+<body>
+<form method="POST" action="/login?next=__NEXT_PATH__">
+  <h1>F.R.I.D.A.Y</h1>
+  __ERROR_HTML__
+  <input type="password" name="token" placeholder="Access token" autofocus autocomplete="current-password">
+  <button type="submit">Enter</button>
+</form>
+</body></html>"""
+
+
+def _render_login_page(next_path: str, error_html: str = "") -> str:
+    # .format() would choke on every literal `{...}` in the <style>
+    # block above (it's not just my two placeholders) — plain .replace()
+    # on unique tokens sidesteps that instead of escaping every CSS brace.
+    return _LOGIN_PAGE_HTML.replace("__NEXT_PATH__", next_path).replace("__ERROR_HTML__", error_html)
+
+
+@app.before_request
+def _check_access():
+    if not access_auth.is_configured():
+        return  # not set up yet — config_validator flags this; don't lock the boss out before he's configured it
+    if access_auth.is_exempt(request.path):
+        return
+    if access_auth.has_valid_session(request.cookies.get(access_auth.SESSION_COOKIE, "")):
+        return
+    header_token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if access_auth.check_token(header_token) or access_auth.check_token(request.args.get("token", "")):
+        return
+    if request.path == "/hud":
+        return redirect(f"/login?next={request.path}")
+    return jsonify({"error": "Unauthorized"}), 401
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not access_auth.is_configured():
+        return jsonify({"error": "FRIDAY_ACCESS_TOKEN not configured"}), 503
+
+    next_path = request.args.get("next", "/hud")
+    # "//evil.com" passes a bare startswith("/") check but browsers treat
+    # it as a protocol-relative external URL — the actual open-redirect
+    # shape to guard against, not just a non-leading-slash value.
+    if not next_path.startswith("/") or next_path.startswith("//"):
+        next_path = "/hud"
+
+    if request.method == "GET":
+        return Response(_render_login_page(next_path), mimetype="text/html")
+
+    data = request.form or request.get_json(silent=True) or {}
+    token = data.get("token", "")
+    if not access_auth.check_token(token):
+        return Response(
+            _render_login_page(next_path, '<div class="err">Wrong token, boss.</div>'),
+            mimetype="text/html",
+        ), 401
+
+    resp = redirect(next_path)
+    resp.set_cookie(
+        access_auth.SESSION_COOKIE, access_auth.session_cookie_value(),
+        httponly=True, secure=True, samesite="Lax", max_age=60 * 60 * 24 * 30,
+    )
+    return resp
+
+
 import os
 import json
 import datetime

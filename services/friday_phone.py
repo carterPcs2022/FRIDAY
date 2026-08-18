@@ -43,11 +43,19 @@ def _clean_for_speech(text: str) -> str:
 
 
 def _ask_friday(prompt: str) -> str:
-    """Loopback call to her own /command — see module docstring for why."""
+    """Loopback call to her own /command — see module docstring for why.
+    Carries FRIDAY_ACCESS_TOKEN if set — core/access_auth.py gates
+    /command like everything else now, and a loopback call is still an
+    external HTTP request from that gate's point of view."""
     try:
+        headers = {}
+        access_token = os.getenv("FRIDAY_ACCESS_TOKEN", "")
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
         r = requests.post(
             f"http://127.0.0.1:{_INTERNAL_PORT}/command",
             json={"prompt": prompt},
+            headers=headers,
             timeout=20,
         )
         return r.json().get("response", "I'm here, but something went wrong on my end.")
