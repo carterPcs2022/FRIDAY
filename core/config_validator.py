@@ -12,9 +12,12 @@ _API_KEYS = [
     "ANTHROPIC_API_KEY", "GROQ_API_KEY", "ELEVENLABS_API_KEY",
     "PUSHOVER_USER_KEY", "PUSHOVER_APP_TOKEN",
     "JARVIS_API_TOKEN", "MAC_BRIDGE_TOKEN",
-    "GMAIL_APP_PASSWORD",
+    "EMAIL_ADDRESS", "EMAIL_PASSWORD",
     "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET",
     "GOOGLE_CALENDAR_CLIENT_ID", "GOOGLE_CALENDAR_CLIENT_SECRET",
+    "SERPER_API_KEY", "TAVILY_API_KEY", "SERPAPI_KEY",
+    "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE",
+    "TURSO_AUTH_TOKEN", "HA_TOKEN", "PUSHCUT_API_KEY", "FRIDAY_ACCESS_TOKEN",
 ]
 
 # Values people paste in as stand-ins and then forget to swap out.
@@ -27,7 +30,7 @@ _PLACEHOLDER_STRINGS = [
 # URL-shaped env vars that must actually be reachable off this box in
 # production — a Render deploy pointing at localhost/127.0.0.1 means
 # whoever set it never updated it after copying from a local .env.
-_URL_KEYS = ["MAC_BRIDGE_URL", "JARVIS_URL", "GOOGLE_CALENDAR_REDIRECT_URI"]
+_URL_KEYS = ["MAC_BRIDGE_URL", "JARVIS_URL", "GOOGLE_CALENDAR_REDIRECT_URI", "HA_URL", "PUSHCUT_MOM_WEBHOOK_URL"]
 
 # (url_key, token_key) pairs — one configured without the other is
 # always a mistake, since either FRIDAY has no bridge to call or it has
@@ -35,6 +38,13 @@ _URL_KEYS = ["MAC_BRIDGE_URL", "JARVIS_URL", "GOOGLE_CALENDAR_REDIRECT_URI"]
 _PAIRED_KEYS = [
     ("MAC_BRIDGE_URL", "MAC_BRIDGE_TOKEN"),
     ("PUSHOVER_USER_KEY", "PUSHOVER_APP_TOKEN"),
+    ("JARVIS_URL", "JARVIS_API_TOKEN"),
+    ("SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"),
+    ("GOOGLE_CALENDAR_CLIENT_ID", "GOOGLE_CALENDAR_CLIENT_SECRET"),
+    ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"),
+    ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"),
+    ("HA_URL", "HA_TOKEN"),
+    ("EMAIL_ADDRESS", "EMAIL_PASSWORD"),
 ]
 
 
@@ -88,6 +98,17 @@ def check() -> dict:
             if has_url != has_token:
                 present, missing = (url_key, token_key) if has_url else (token_key, url_key)
                 issues.append(f"{present} is set but {missing} isn't — that pair only works together")
+
+        # Unlike every other key above, FRIDAY_ACCESS_TOKEN being unset
+        # isn't "that integration is disabled" — it means /command and
+        # every other data-touching route has zero authentication, not a
+        # degraded feature. Worth its own explicit flag, not just silence.
+        if not os.environ.get("FRIDAY_ACCESS_TOKEN", ""):
+            issues.append(
+                "FRIDAY_ACCESS_TOKEN is not set — /command and other routes are "
+                "completely unauthenticated; anyone with the URL can talk to FRIDAY "
+                "and read personal data"
+            )
     except Exception as e:
         issues.append(f"config validator itself failed: {e}")
 
@@ -101,11 +122,8 @@ def check_and_alert():
     if result["ok"]:
         return result
     try:
-        from core.friday_capabilities import friday_caps
-        friday_caps._pushover_alert(
-            "FRIDAY Config Check Failed",
-            "; ".join(result["issues"])[:1024],
-        )
+        from services.notifications import alert
+        alert("FRIDAY Config Check Failed", "; ".join(result["issues"])[:1024])
     except Exception:
         pass
     return result

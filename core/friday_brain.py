@@ -3,8 +3,8 @@ trusts her instincts, less deliberation, a more direct path from input to
 output.
 
 Model cascade:
-1. Groq 8B instant  -> simple/fast queries
-2. Groq 70B         -> complex reasoning
+1. Groq gpt-oss-20b  -> simple/fast queries
+2. Groq gpt-oss-120b -> complex reasoning
 3. Claude Haiku     -> emotional/nuanced
 4. Claude Sonnet     -> hardest problems (long/multi-part requests)
 5. Offline fallback -> always responds
@@ -63,9 +63,15 @@ _GROQ_CLIENT = httpx.Client(
 
 # Real, currently-available model IDs — verified against provider docs, not
 # guessed. claude-sonnet-4-6 doesn't exist; claude-sonnet-5 is current.
+# "fast" swapped from llama-3.1-8b-instant to openai/gpt-oss-20b, and
+# "smart" from llama-3.3-70b-versatile to openai/gpt-oss-120b, ahead of
+# Groq's 2026-08-16 decommission of both. Groq offered gpt-oss-120b or
+# qwen/qwen3.6-27b as "smart"'s replacement; picked gpt-oss-120b as the
+# closer match in size/generality to the 70B model it's replacing (same
+# choice made in JARVIS_V5's core/llm/router.py, for consistency).
 MODELS = {
-    "fast": "llama-3.1-8b-instant",
-    "smart": "llama-3.3-70b-versatile",
+    "fast": "openai/gpt-oss-20b",
+    "smart": "openai/gpt-oss-120b",
     "nuanced": "claude-haiku-4-5-20251001",
     "deep": "claude-sonnet-5",
     "maximum": "claude-opus-4-8",

@@ -18,6 +18,89 @@ def health():
     return "OK", 200
 
 
+from core import access_auth
+
+_LOGIN_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F.R.I.D.A.Y — Access</title>
+<style>
+  body { background:#000814; color:#caf0f8; font-family:-apple-system,'SF Pro Display','Helvetica Neue',sans-serif;
+    height:100vh; height:100dvh; display:flex; align-items:center; justify-content:center; margin:0; }
+  form { background:rgba(0,150,199,0.06); border:1px solid rgba(72,202,228,0.2); border-radius:16px;
+    padding:32px 28px; width:min(320px, 88vw); backdrop-filter:blur(20px); }
+  h1 { font-size:14px; letter-spacing:6px; color:#48cae4; margin:0 0 20px; text-align:center; }
+  input { width:100%; box-sizing:border-box; background:rgba(0,150,199,0.12); border:1px solid rgba(72,202,228,0.2);
+    border-radius:10px; padding:12px 14px; color:#caf0f8; font-size:15px; outline:none; margin-bottom:14px; }
+  input:focus { border-color:rgba(72,202,228,0.5); }
+  button { width:100%; background:linear-gradient(135deg,#0096c7,#48cae4); color:#000814; border:none;
+    border-radius:10px; padding:12px; font-size:14px; font-weight:600; letter-spacing:1px; cursor:pointer; }
+  .err { color:#e63946; font-size:12px; margin:-6px 0 14px; text-align:center; }
+</style></head>
+<body>
+<form method="POST" action="/login?next=__NEXT_PATH__">
+  <h1>F.R.I.D.A.Y</h1>
+  __ERROR_HTML__
+  <input type="password" name="token" placeholder="Access token" autofocus autocomplete="current-password">
+  <button type="submit">Enter</button>
+</form>
+</body></html>"""
+
+
+def _render_login_page(next_path: str, error_html: str = "") -> str:
+    # .format() would choke on every literal `{...}` in the <style>
+    # block above (it's not just my two placeholders) — plain .replace()
+    # on unique tokens sidesteps that instead of escaping every CSS brace.
+    return _LOGIN_PAGE_HTML.replace("__NEXT_PATH__", next_path).replace("__ERROR_HTML__", error_html)
+
+
+@app.before_request
+def _check_access():
+    if not access_auth.is_configured():
+        return  # not set up yet — config_validator flags this; don't lock the boss out before he's configured it
+    if access_auth.is_exempt(request.path):
+        return
+    if access_auth.has_valid_session(request.cookies.get(access_auth.SESSION_COOKIE, "")):
+        return
+    header_token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if access_auth.check_token(header_token) or access_auth.check_token(request.args.get("token", "")):
+        return
+    if request.path == "/hud":
+        return redirect(f"/login?next={request.path}")
+    return jsonify({"error": "Unauthorized"}), 401
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not access_auth.is_configured():
+        return jsonify({"error": "FRIDAY_ACCESS_TOKEN not configured"}), 503
+
+    next_path = request.args.get("next", "/hud")
+    # "//evil.com" passes a bare startswith("/") check but browsers treat
+    # it as a protocol-relative external URL — the actual open-redirect
+    # shape to guard against, not just a non-leading-slash value.
+    if not next_path.startswith("/") or next_path.startswith("//"):
+        next_path = "/hud"
+
+    if request.method == "GET":
+        return Response(_render_login_page(next_path), mimetype="text/html")
+
+    data = request.form or request.get_json(silent=True) or {}
+    token = data.get("token", "")
+    if not access_auth.check_token(token):
+        return Response(
+            _render_login_page(next_path, '<div class="err">Wrong token, boss.</div>'),
+            mimetype="text/html",
+        ), 401
+
+    resp = redirect(next_path)
+    resp.set_cookie(
+        access_auth.SESSION_COOKIE, access_auth.session_cookie_value(),
+        httponly=True, secure=True, samesite="Lax", max_age=60 * 60 * 24 * 30,
+    )
+    return resp
+
+
 import os
 import json
 import datetime
@@ -25,7 +108,7 @@ import logging
 import threading
 from collections import deque
 from pathlib import Path
-from flask import request, send_file
+from flask import request, send_file, Response
 
 from db import turso_http_client as turso
 
@@ -39,6 +122,25 @@ EXCHANGE_LOG = deque(maxlen=10)
 BASE_DIR = Path(__file__).resolve().parent
 
 logging.basicConfig(level=logging.INFO, format='[FRIDAY] %(message)s')
+
+
+@app.errorhandler(Exception)
+def _handle_uncaught_error(e):
+    """Before this, an uncaught bug just disappeared into Render's logs
+    with nothing surfacing it — the only way to learn something crashed
+    was to notice FRIDAY acting wrong. Werkzeug's own HTTPException
+    subclasses (404s, a stray 405) pass through untouched — those are
+    normal HTTP responses, not bugs worth an alert."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    logging.exception(f"Unhandled error on {request.path}")
+    try:
+        from core.error_alerts import report
+        report(request.path, e)
+    except Exception:
+        pass
+    return jsonify({"error": "Something went wrong, boss."}), 500
 
 
 def _ensure_memory():
@@ -114,6 +216,14 @@ except Exception as e:
     friday_trainer = None
     TRAINING_OK = False
     logging.warning(f"Training failed: {e}")
+
+try:
+    from services.wisdom import get_wisdom_context
+    WISDOM_OK = True
+except Exception as e:
+    get_wisdom_context = None
+    WISDOM_OK = False
+    logging.warning(f"Wisdom context failed: {e}")
 
 try:
     from core.friday_protocols import friday_protocols, RangeLevel
@@ -194,6 +304,54 @@ try:
 except Exception as e:
     translator = None
     logging.warning(f"Translator failed: {e}")
+
+try:
+    from services.career import career
+except Exception as e:
+    career = None
+    logging.warning(f"Career assistant failed: {e}")
+
+try:
+    from services.decisions import decisions
+except Exception as e:
+    decisions = None
+    logging.warning(f"Decision support failed: {e}")
+
+try:
+    from services.finance import finance
+except Exception as e:
+    finance = None
+    logging.warning(f"Finance intelligence failed: {e}")
+
+try:
+    from services.legal import legal
+except Exception as e:
+    legal = None
+    logging.warning(f"Legal analyzer failed: {e}")
+
+try:
+    from services.reading_memory import reading_mem
+except Exception as e:
+    reading_mem = None
+    logging.warning(f"Reading memory failed: {e}")
+
+try:
+    from services.social_intel import social
+except Exception as e:
+    social = None
+    logging.warning(f"Social intelligence failed: {e}")
+
+try:
+    from services.tutor import tutor
+except Exception as e:
+    tutor = None
+    logging.warning(f"Tutor failed: {e}")
+
+try:
+    from services.hierarchical_planning import hierarchical
+except Exception as e:
+    hierarchical = None
+    logging.warning(f"Hierarchical planning failed: {e}")
 
 try:
     from services.friday_medicine import medicine_tracker
@@ -339,6 +497,23 @@ except Exception as e:
     SECURITY_OK = False
     logging.warning(f"Security failed: {e}")
 
+try:
+    from services.hulkbuster import hulkbuster
+    HULKBUSTER_OK = True
+except Exception as e:
+    hulkbuster = None
+    HULKBUSTER_OK = False
+    logging.warning(f"HulkBuster failed: {e}")
+
+try:
+    from core.scatter import get_engine as _get_scatter_engine
+    scatter_engine = _get_scatter_engine()
+    SCATTER_OK = True
+except Exception as e:
+    scatter_engine = None
+    SCATTER_OK = False
+    logging.warning(f"Scatter Protocol failed: {e}")
+
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
 JARVIS_TOKEN = os.environ.get("JARVIS_API_TOKEN", "")
@@ -391,18 +566,11 @@ def _monitor_jarvis():
 
 
 def _notify_jarvis_down():
-    pushover_user = os.environ.get("PUSHOVER_USER_KEY", "")
-    pushover_token = os.environ.get("PUSHOVER_APP_TOKEN", "")
-    if pushover_user and pushover_token:
-        try:
-            import requests as req
-            req.post("https://api.pushover.net/1/messages.json", data={
-                "token": pushover_token, "user": pushover_user,
-                "title": "JARVIS Offline", "message": "FRIDAY has assumed control.",
-                "priority": 1,
-            }, timeout=5)
-        except Exception:
-            pass
+    try:
+        from services.notifications import alert
+        alert("JARVIS Offline", "FRIDAY has assumed control.")
+    except Exception as e:
+        logging.warning(f"JARVIS-down notify failed: {e}")
 
 
 def _start_thread(target, name: str):
@@ -570,7 +738,8 @@ def _morning_brief_loop():
                 if response:
                     save_turn("FRIDAY run a morning brief", response)
                     _log("FRIDAY run a morning brief", response, "morning-brief")
-                    _push("Morning Brief", response)
+                    from services.notifications import Priority
+                    _push("Morning Brief", response, Priority.WARNING)
                     if VOICE_OK and friday_brain:
                         friday_speak(response, mode=friday_brain.voice_mode)
         except Exception as e:
@@ -606,19 +775,19 @@ _CHECKIN_INTERVAL = 4 * 3600
 _LAST_CHECKIN_EMOTION = None
 
 
-def _push(title: str, message: str, priority: int = 0):
-    pushover_user = os.environ.get("PUSHOVER_USER_KEY", "")
-    pushover_token = os.environ.get("PUSHOVER_APP_TOKEN", "")
-    if not (pushover_user and pushover_token):
-        return
+def _push(title: str, message: str, priority=None):
+    """Routes through services/notifications.py. priority accepts a
+    notifications.Priority value; defaults to HIGH (still reaches
+    Pushover) since every real caller here is either time-sensitive (a
+    reminder the boss explicitly set, a focus-session timer) or
+    deliberately rate-limited and personally relevant (the proactive
+    emotional check-in) — Morning Brief is the one routine exception and
+    passes WARNING explicitly (HUD only, not a push notification)."""
     try:
-        import requests as req
-        req.post("https://api.pushover.net/1/messages.json", data={
-            "token": pushover_token, "user": pushover_user,
-            "title": title, "message": message, "priority": priority,
-        }, timeout=5)
-    except Exception:
-        pass
+        from services.notifications import notify, Priority
+        notify(title, message, priority if priority is not None else Priority.HIGH)
+    except Exception as e:
+        logging.warning(f"Push notify failed: {e}")
 
 
 # ── Assistant features: caller ID, notes, reminders, tasks ───────────────────
@@ -1249,6 +1418,10 @@ def state():
         "uptime_seconds": uptime, "uptime": uptime,
         "log": list(reversed(EXCHANGE_LOG)),
         "voice_mode": friday_brain.voice_mode if friday_brain else "normal",
+        # Real telemetry for the HUD overlay's edge readouts — replaces
+        # placeholder ALT/HDG/LAT values that never reflected anything.
+        "locked": suit_lockdown.is_locked() if LOCKDOWN_OK else False,
+        "hulkbuster": hulkbuster.status() if HULKBUSTER_OK else {"deployed": False},
     })
 
 
@@ -1296,16 +1469,21 @@ def command():
         if MAYDAY_PHRASE in prompt.lower():
             response = "Mayday received. What's happening, boss?"
             _log(prompt, response, "MAYDAY")
-            if friday_caps:
-                # Emergency-priority (2) — a distress signal that only
-                # pushes once, with no retry-until-acked, defeats its own
-                # purpose if boss's phone is silenced or out of reach.
-                # Same tier as friday_health.py's critical-vitals alert.
-                friday_caps._pushover_alert(
+            try:
+                # CRITICAL -> Pushover priority 2 (emergency) -> notify()'s
+                # _pushover() path -> friday_caps._pushover_alert(), which
+                # applies retry/expire itself for priority 2 — a distress
+                # signal that only pushes once, with no retry-until-acked,
+                # defeats its own purpose if boss's phone is silenced or
+                # out of reach. Same tier as friday_health.py's
+                # critical-vitals alert.
+                from services.notifications import critical
+                critical(
                     "FRIDAY MAYDAY",
                     f"Mayday phrase triggered. Emergency contact on file: {EMERGENCY_CONTACT_PHONE}",
-                    priority=2,
                 )
+            except Exception as e:
+                logging.warning(f"MAYDAY notify failed: {e}")
             if CHECKIN_OK:
                 try:
                     from services.checkin_system import emergency_pending
@@ -2180,6 +2358,17 @@ def command():
                     knowledge = friday_trainer.get_context_brief(prompt)
                     if knowledge:
                         context = "\n".join(filter(None, [knowledge, context]))
+                if WISDOM_OK:
+                    # Prepended, not appended — _build_messages() truncates
+                    # context to its first 500 chars, so query-specific
+                    # relevant history needs to survive that cut ahead of
+                    # the more generic facts/recall context, not after it.
+                    try:
+                        wisdom = get_wisdom_context(prompt)
+                        if wisdom:
+                            context = "\n".join(filter(None, [wisdom, context]))
+                    except Exception as e:
+                        logging.warning(f"Wisdom context lookup failed: {e}")
 
                 if COVERAGE_MODE:
                     friday_brain.set_voice_mode("coverage")
@@ -2236,6 +2425,44 @@ def friday_ask():
     if not message:
         return jsonify({"response": "Didn't catch that, boss."})
     with app.test_request_context("/command", method="POST", json={"prompt": message}):
+        return command()
+
+
+@app.route("/friday/chat/upload", methods=["POST"])
+def friday_chat_upload():
+    """Multipart file (+ optional 'prompt' field) — a general chat
+    attachment endpoint, not just images. FRIDAY had no way for an
+    external client to hand her an arbitrary file at all before this
+    (only /friday/vision/analyze, which is images-as-base64-JSON only).
+
+    Saves the file, runs it through services/documents.py's ingest(), and
+    folds the resulting summary into the prompt as a bracketed note
+    before routing through /command exactly like any other message —
+    same trick JARVIS_V5's core/attachments.py uses, so /command's ~1000
+    lines of routing logic don't need to know attachments exist at all."""
+    from werkzeug.utils import secure_filename
+
+    if "file" not in request.files:
+        return jsonify({"response": "No file attached, boss."}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"response": "Empty file, boss."}), 400
+
+    upload_dir = BASE_DIR / "memory" / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    dest = upload_dir / f"{int(time.time())}_{secure_filename(f.filename)}"
+    f.save(str(dest))
+
+    from services import documents
+    result = documents.ingest(str(dest))
+    if not result.get("ok"):
+        return jsonify({"response": f"Couldn't read that file, boss: {result.get('error', 'unknown error')}"}), 200
+
+    note = f'[Attached file "{f.filename}": {result["summary"]}]'
+    prompt = (request.form.get("prompt") or "").strip()
+    combined_prompt = f"{prompt}\n\n{note}" if prompt else note
+
+    with app.test_request_context("/command", method="POST", json={"prompt": combined_prompt}):
         return command()
 
 
@@ -2475,6 +2702,100 @@ def friday_voice_reset():
         return jsonify({"error": f"Couldn't reach the Mac bridge, boss: {e}"}), 502
 
 
+# ── Phone (Twilio) ───────────────────────────────────────────────────────────
+# Webhook routes (call/respond/transcribed/sms) are intentionally
+# unauthenticated — Twilio can't send a bearer token, and Twilio's request
+# signature is the only verification available without extra setup, same
+# tradeoff JARVIS_V5 makes for its own phone webhooks.
+
+@app.route("/friday/phone/call", methods=["POST"])
+def friday_phone_call():
+    from services.friday_phone import friday_phone
+    return Response(friday_phone.handle_incoming_call(), mimetype="text/xml")
+
+
+@app.route("/friday/phone/respond", methods=["POST"])
+def friday_phone_respond():
+    from services.friday_phone import friday_phone
+    transcript = request.form.get("TranscriptionText") or "Hey"
+    return Response(friday_phone.handle_response(transcript), mimetype="text/xml")
+
+
+@app.route("/friday/phone/transcribed", methods=["POST"])
+def friday_phone_transcribed():
+    """Twilio's async transcription callback — nothing to do, /respond
+    already handled the turn with its own (faster) transcription."""
+    return Response("", mimetype="text/xml")
+
+
+@app.route("/friday/phone/sms", methods=["POST"])
+def friday_phone_sms():
+    from services.friday_phone import friday_phone
+    friday_phone.handle_sms(request.form.get("From", ""), request.form.get("Body", ""))
+    return Response("<Response/>", mimetype="text/xml")
+
+
+@app.route("/friday/phone/alert", methods=["POST"])
+def friday_phone_alert():
+    """Have FRIDAY place a real call and speak a message — 'call me and
+    tell me Y', not a webhook. Same friday_security.screen_request() IP
+    screening as /command, since this triggers a real outbound Twilio call
+    (billable, and reaches a real phone) rather than just returning data."""
+    from services.friday_phone import friday_phone
+    if SECURITY_OK:
+        screen = friday_security.screen_request(friday_security.client_ip(request), "phone alert")
+        if screen.get("blocked"):
+            return jsonify({"error": "Request blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    to_number = data.get("to") or os.environ.get("MY_PHONE_NUMBER", "")
+    message = data.get("message", "")
+    if not to_number or not message:
+        return jsonify({"error": "Both 'to' and 'message' are required"}), 400
+    return jsonify(friday_phone.send_alert_call(message, to_number))
+
+
+# ── Phone (Pushcut — calls from the boss's own real number) ──────────────────
+# Not Twilio: remotely runs a Shortcut on his own iPhone via Pushcut's
+# Automation Server, so the call genuinely comes from his real number.
+# Same IP screening as /friday/phone/alert, since this also triggers a
+# real-world effect (his phone actually placing a call).
+
+@app.route("/friday/phone/call-from-device", methods=["POST"])
+def friday_pushcut_call():
+    from services.friday_pushcut import call as pushcut_call, is_configured
+    if not is_configured():
+        return jsonify({"error": "Pushcut not configured (PUSHCUT_API_KEY missing)"}), 503
+    if SECURITY_OK:
+        screen = friday_security.screen_request(friday_security.client_ip(request), "pushcut call")
+        if screen.get("blocked"):
+            return jsonify({"error": "Request blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    target = data.get("to", "")
+    if not target:
+        return jsonify({"error": "'to' (a phone number or contact name) is required"}), 400
+    result = pushcut_call(target)
+    if not result.get("ok"):
+        return jsonify(result), 502
+    return jsonify(result)
+
+
+@app.route("/friday/phone/call-mom", methods=["POST"])
+def friday_pushcut_call_mom():
+    """Free-tier stopgap until Pushcut Pro/Plus is active — see
+    services/friday_pushcut.py's module docstring. Fixed target, no body
+    needed; fires a static notification that still needs a tap on his
+    phone to actually place the call."""
+    from services.friday_pushcut import call_mom
+    if SECURITY_OK:
+        screen = friday_security.screen_request(friday_security.client_ip(request), "pushcut call mom")
+        if screen.get("blocked"):
+            return jsonify({"error": "Request blocked"}), 403
+    result = call_mom()
+    if not result.get("ok"):
+        return jsonify(result), 502
+    return jsonify(result)
+
+
 # ── JARVIS takeover ────────────────────────────────────────────────────────────
 
 @app.route("/takeover", methods=["POST"])
@@ -2658,6 +2979,87 @@ def trigger_lockdown():
     if not LOCKDOWN_OK:
         return jsonify({"error": "lockdown unavailable"}), 503
     return jsonify(suit_lockdown.activate(reason="remote_trigger"))
+
+
+# ── HulkBuster ───────────────────────────────────────────────────────────────
+# Deploys automatically — friday_security.py after repeated threats from one
+# IP, core/veronica.py if a firewall file (friday_security.py/suit_lockdown.py)
+# itself turns up tampered. These routes are for checking status and for a
+# manual/boss-triggered deployment or stand-down.
+
+@app.route("/friday/hulkbuster/status")
+def hulkbuster_status():
+    if not HULKBUSTER_OK:
+        return jsonify({"error": "hulkbuster unavailable"}), 503
+    return jsonify(hulkbuster.status())
+
+
+@app.route("/friday/hulkbuster/deploy", methods=["POST"])
+def hulkbuster_deploy():
+    if not HULKBUSTER_OK:
+        return jsonify({"error": "hulkbuster unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    return jsonify(hulkbuster.deploy(data.get("reason", "manual"), data.get("ip", "")))
+
+
+@app.route("/friday/hulkbuster/stand-down", methods=["POST"])
+def hulkbuster_stand_down():
+    if not HULKBUSTER_OK:
+        return jsonify({"error": "hulkbuster unavailable"}), 503
+    return jsonify(hulkbuster.stand_down())
+
+
+# ── Scatter Protocol ─────────────────────────────────────────────────────────
+# Two-step like Lockdown: POST without confirm_token gets you a token +
+# a Pushover alert; POST again with the same passphrase + that token
+# within 10 minutes actually scatters. Reassemble is single-step — it's
+# the recovery action, not the destructive one.
+
+@app.route("/friday/scatter", methods=["POST"])
+def trigger_scatter():
+    if not SCATTER_OK:
+        return jsonify({"error": "scatter unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    passphrase = data.get("passphrase", "")
+    confirm_token = data.get("confirm_token", "")
+    if not passphrase:
+        return jsonify({"error": "passphrase required"}), 400
+    if not confirm_token:
+        return jsonify(scatter_engine.request_scatter(passphrase))
+    result = scatter_engine.scatter(passphrase, confirm_token)
+    if not result.get("ok"):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route("/friday/scatter/status")
+def scatter_status():
+    if not SCATTER_OK:
+        return jsonify({"error": "scatter unavailable"}), 503
+    return jsonify(scatter_engine.status())
+
+
+@app.route("/friday/scatter/reassemble", methods=["POST"])
+def scatter_reassemble():
+    if not SCATTER_OK:
+        return jsonify({"error": "scatter unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    passphrase = data.get("passphrase", "")
+    if not passphrase:
+        return jsonify({"error": "passphrase required"}), 400
+    result = scatter_engine.reassemble(passphrase)
+    if not result.get("ok"):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route("/friday/scatter/nodes")
+def scatter_nodes_list():
+    if not SCATTER_OK:
+        return jsonify({"error": "scatter unavailable"}), 503
+    from services.scatter_nodes import get_nodes
+    nodes = get_nodes()
+    return jsonify({"nodes": [{"name": n.name, "available": n.available()} for n in nodes]})
 
 
 # ── Health (Apple Watch) ───────────────────────────────────────────────────────
@@ -3266,6 +3668,326 @@ def friday_system_cleanup():
     return jsonify(disk_cleanup.clean())
 
 
+# ── Career ─────────────────────────────────────────────────────────────────────
+
+@app.route("/friday/career/resume", methods=["POST"])
+def career_resume():
+    data = request.get_json(silent=True) or {}
+    if not career:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(career.optimize_resume(data.get("resume", ""), data.get("job_description", "")))
+
+
+@app.route("/friday/career/cover-letter", methods=["POST"])
+def career_cover_letter():
+    data = request.get_json(silent=True) or {}
+    if not career:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"cover_letter": career.cover_letter(
+        data.get("resume", ""), data.get("job_description", ""), data.get("company", ""))})
+
+
+@app.route("/friday/career/interview-prep", methods=["POST"])
+def career_interview_prep():
+    data = request.get_json(silent=True) or {}
+    if not career:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(career.interview_prep(data.get("job_description", ""), data.get("company", "")))
+
+
+@app.route("/friday/career/salary", methods=["POST"])
+def career_salary():
+    data = request.get_json(silent=True) or {}
+    if not career:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(career.salary_research(data.get("role", ""), data.get("location", "")))
+
+
+# ── Decisions ──────────────────────────────────────────────────────────────────
+
+@app.route("/friday/decisions/analyze", methods=["POST"])
+def decisions_analyze():
+    data = request.get_json(silent=True) or {}
+    if not decisions:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(decisions.analyze(data.get("decision", ""), data.get("options")))
+
+
+@app.route("/friday/decisions/pros-cons", methods=["POST"])
+def decisions_pros_cons():
+    data = request.get_json(silent=True) or {}
+    if not decisions:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(decisions.pros_cons(data.get("topic", "")))
+
+
+@app.route("/friday/decisions/devil-advocate", methods=["POST"])
+def decisions_devil_advocate():
+    data = request.get_json(silent=True) or {}
+    if not decisions:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"response": decisions.devil_advocate(
+        data.get("decision", ""), data.get("chosen_option", ""))})
+
+
+@app.route("/friday/decisions/risk", methods=["POST"])
+def decisions_risk():
+    data = request.get_json(silent=True) or {}
+    if not decisions:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(decisions.risk_analysis(data.get("plan", "")))
+
+
+@app.route("/friday/decisions/swot", methods=["POST"])
+def decisions_swot():
+    data = request.get_json(silent=True) or {}
+    if not decisions:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(decisions.swot(data.get("subject", "")))
+
+
+@app.route("/friday/decisions/log", methods=["POST"])
+def decisions_log_decision():
+    data = request.get_json(silent=True) or {}
+    if not decisions:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(decisions.log_decision(
+        data.get("decision", ""), data.get("chosen_option", ""), data.get("notes", "")))
+
+
+@app.route("/friday/decisions/outcome", methods=["POST"])
+def decisions_record_outcome():
+    data = request.get_json(silent=True) or {}
+    if not decisions:
+        return jsonify({"error": "unavailable"}), 503
+    decision_id = data.get("decision_id")
+    if decision_id is None:
+        return jsonify({"error": "decision_id required"}), 400
+    return jsonify(decisions.record_outcome(decision_id, data.get("outcome", "")))
+
+
+@app.route("/friday/decisions/history")
+def decisions_history():
+    if not decisions:
+        return jsonify({"decisions": []})
+    return jsonify({"decisions": decisions.decision_log()})
+
+
+@app.route("/friday/decisions/followups")
+def decisions_followups():
+    if not decisions:
+        return jsonify({"followups": []})
+    days = request.args.get("days", 30, type=int)
+    return jsonify({"followups": decisions.pending_followups(days)})
+
+
+# ── Finance ────────────────────────────────────────────────────────────────────
+
+@app.route("/friday/finance/stock", methods=["POST"])
+def finance_stock():
+    data = request.get_json(silent=True) or {}
+    if not finance:
+        return jsonify({"error": "unavailable"}), 503
+    symbol = data.get("symbol", "")
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    return jsonify(finance.get_stock_price(symbol))
+
+
+@app.route("/friday/finance/portfolio", methods=["POST"])
+def finance_portfolio():
+    data = request.get_json(silent=True) or {}
+    if not finance:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(finance.portfolio_check(data.get("symbols", [])))
+
+
+@app.route("/friday/finance/crypto", methods=["POST"])
+def finance_crypto():
+    data = request.get_json(silent=True) or {}
+    if not finance:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(finance.crypto_prices(data.get("coins", [])))
+
+
+@app.route("/friday/finance/brief")
+def finance_brief():
+    if not finance:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"brief": finance.finance_brief()})
+
+
+# ── Legal ──────────────────────────────────────────────────────────────────────
+
+@app.route("/friday/legal/analyze", methods=["POST"])
+def legal_analyze():
+    data = request.get_json(silent=True) or {}
+    if not legal:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(legal.analyze_contract(data.get("text", "")))
+
+
+@app.route("/friday/legal/red-flags", methods=["POST"])
+def legal_red_flags():
+    data = request.get_json(silent=True) or {}
+    if not legal:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"red_flags": legal.find_red_flags(data.get("text", ""))})
+
+
+@app.route("/friday/legal/simplify", methods=["POST"])
+def legal_simplify():
+    data = request.get_json(silent=True) or {}
+    if not legal:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"simplified": legal.simplify_clause(data.get("clause", ""))})
+
+
+# ── Reading memory ─────────────────────────────────────────────────────────────
+
+@app.route("/friday/reading/index", methods=["POST"])
+def reading_index():
+    data = request.get_json(silent=True) or {}
+    if not reading_mem:
+        return jsonify({"error": "unavailable"}), 503
+    url = data.get("url", "")
+    if not url:
+        return jsonify({"error": "url required"}), 400
+    return jsonify(reading_mem.index_url(url, data.get("title", "")))
+
+
+@app.route("/friday/reading/search")
+def reading_search():
+    if not reading_mem:
+        return jsonify({"results": []})
+    query = request.args.get("q", "")
+    return jsonify({"results": reading_mem.search_reading(query)})
+
+
+# ── Social intelligence ─────────────────────────────────────────────────────────
+
+@app.route("/friday/social/person", methods=["POST"])
+def social_person():
+    data = request.get_json(silent=True) or {}
+    if not social:
+        return jsonify({"error": "unavailable"}), 503
+    name = data.get("name", "")
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    return jsonify(social.person_brief(name, data.get("company", ""), data.get("context", "")))
+
+
+@app.route("/friday/social/company", methods=["POST"])
+def social_company():
+    data = request.get_json(silent=True) or {}
+    if not social:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(social.company_brief(data.get("company", "")))
+
+
+# ── Tutor ──────────────────────────────────────────────────────────────────────
+
+@app.route("/friday/tutor/explain", methods=["POST"])
+def tutor_explain():
+    data = request.get_json(silent=True) or {}
+    if not tutor:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"explanation": tutor.explain(data.get("topic", ""), data.get("level", "auto"))})
+
+
+@app.route("/friday/tutor/socratic", methods=["POST"])
+def tutor_socratic():
+    data = request.get_json(silent=True) or {}
+    if not tutor:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"response": tutor.socratic_mode(
+        data.get("topic", ""), data.get("prior_exchange", ""))})
+
+
+@app.route("/friday/tutor/flashcards", methods=["POST"])
+def tutor_flashcards():
+    data = request.get_json(silent=True) or {}
+    if not tutor:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"cards": tutor.flashcard_session(data.get("topic", ""), data.get("n_cards", 10))})
+
+
+@app.route("/friday/tutor/review-card", methods=["POST"])
+def tutor_review_card():
+    data = request.get_json(silent=True) or {}
+    if not tutor:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(tutor.review_card(
+        data.get("topic", ""), data.get("question", ""), bool(data.get("correct", False))))
+
+
+@app.route("/friday/tutor/due-cards")
+def tutor_due_cards():
+    if not tutor:
+        return jsonify({"cards": []})
+    topic = request.args.get("topic", "")
+    limit = request.args.get("limit", 10, type=int)
+    return jsonify({"cards": tutor.due_cards(topic, limit)})
+
+
+@app.route("/friday/tutor/quiz", methods=["POST"])
+def tutor_quiz():
+    data = request.get_json(silent=True) or {}
+    if not tutor:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(tutor.quiz_me(data.get("topic", ""), data.get("difficulty", "medium")))
+
+
+@app.route("/friday/tutor/language-lesson", methods=["POST"])
+def tutor_language_lesson():
+    data = request.get_json(silent=True) or {}
+    if not tutor:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(tutor.language_lesson(data.get("language", ""), data.get("lesson_type", "vocabulary")))
+
+
+@app.route("/friday/tutor/study-plan", methods=["POST"])
+def tutor_study_plan():
+    data = request.get_json(silent=True) or {}
+    if not tutor:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify(tutor.study_plan(
+        data.get("subject", ""), data.get("goal", ""), data.get("weeks", 4)))
+
+
+@app.route("/friday/tutor/explain-error", methods=["POST"])
+def tutor_explain_error():
+    data = request.get_json(silent=True) or {}
+    if not tutor:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"explanation": tutor.explain_error(
+        data.get("error_message", ""), data.get("language", "python"))})
+
+
+# ── Hierarchical planning ────────────────────────────────────────────────────
+
+@app.route("/friday/plan", methods=["POST"])
+def hierarchical_plan():
+    data = request.get_json(silent=True) or {}
+    if not hierarchical:
+        return jsonify({"error": "unavailable"}), 503
+    goal = data.get("goal", "")
+    if not goal:
+        return jsonify({"error": "goal required"}), 400
+    return jsonify(hierarchical.plan(goal, data.get("depth", 4)))
+
+
+@app.route("/friday/plan/track", methods=["POST"])
+def hierarchical_plan_and_track():
+    data = request.get_json(silent=True) or {}
+    if not hierarchical:
+        return jsonify({"error": "unavailable"}), 503
+    goal = data.get("goal", "")
+    if not goal:
+        return jsonify({"error": "goal required"}), 400
+    return jsonify(hierarchical.plan_and_track(goal, data.get("depth", 4)))
+
+
 # ── Budget ─────────────────────────────────────────────────────────────────────
 
 @app.route("/budget")
@@ -3325,7 +4047,13 @@ body {
     radial-gradient(ellipse at 80% 20%, rgba(0,150,199,0.1) 0%, transparent 50%);
   color: var(--text);
   font-family: -apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif;
+  /* 100vh on iOS Safari is the viewport with the address bar hidden, not
+     the visible one — content gets cut off behind the toolbar/home
+     indicator, or leaves a scrollable gap, depending on scroll state.
+     100dvh (dynamic viewport height) tracks the actual visible area;
+     100vh stays as a fallback for browsers that don't support dvh. */
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   position: relative;
 }
@@ -3666,7 +4394,25 @@ body {
 .ar-widget-audio-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--bright)); transition: width 0.1s linear; }
 
 @media (max-width: 700px) {
-  .widget-stage { left: 12px; right: 12px; width: auto; top: 64px; }
+  /* .top-bar packs a logo, 3 status pills, a clock, and 6 buttons into
+     one row — fine on a desktop-width viewport, but nothing stops it
+     overflowing/clipping on a phone. Wrapping (not shrinking text) keeps
+     every control reachable rather than guessing at which ones to hide —
+     but wrapping also makes it roughly twice as tall, so the fixed-
+     position HUD layers below it (widget-stage, hud-edge-strip) need
+     more clearance than their desktop top offsets give them, or they'd
+     sit under the wrapped second row instead of below it. These are
+     estimates for a typical 2-row wrap, not measured against a real
+     device — may want a pixel nudge once seen on an actual phone. */
+  .top-bar { flex-wrap: wrap; padding: 10px 12px; gap: 8px 10px; }
+  .top-pills { flex-wrap: wrap; }
+  .top-right { flex-wrap: wrap; justify-content: flex-end; gap: 6px 8px; margin-left: 0; width: 100%; }
+  .clock-display { font-size: 15px; }
+
+  .widget-stage { left: 12px; right: 12px; width: auto; top: 112px; }
+  #hud-edge-strip { top: 120px !important; }
+
+  .slide-panel { width: min(320px, 88vw); }
 }
 
 </style>
@@ -3676,7 +4422,9 @@ body {
 <div class="particles" id="particles"></div>
 <canvas id="friday-face" width="220" height="220"></canvas>
 
-<!-- HELMET VIEW — first-person HUD overlay -->
+<!-- HELMET VIEW — first-person HUD overlay. Every readout below reflects
+     something FRIDAY actually tracks (security/lockdown/protocol state) —
+     no decorative flight-HUD placeholders that never update. -->
 <canvas id="reticle-overlay" width="680" height="680"
   style="position:fixed;top:50%;left:50%;
   transform:translate(-50%,-50%);
@@ -3686,16 +4434,16 @@ body {
 
 <div id="hud-edge-strip" style="position:fixed;top:80px;left:20px;right:20px;
   display:flex;justify-content:space-between;
-  pointer-events:none;z-index:2;opacity:0.6">
-  <div style="font-size:9px;color:rgba(0,168,255,0.6);
+  pointer-events:none;z-index:2;opacity:0.7">
+  <div style="font-size:9px;color:var(--hud-glow, rgba(72,202,228,0.7));
     letter-spacing:1px;font-family:'Courier New'">
-    <div>ALT: <span id="hud-alt">---</span></div>
-    <div>HDG: <span id="hud-hdg">---</span></div>
+    <div>RANGE: <span id="hud-range">---</span></div>
+    <div>THREATS: <span id="hud-threats">0</span></div>
   </div>
-  <div style="font-size:9px;color:rgba(0,168,255,0.6);
+  <div style="font-size:9px;color:var(--hud-glow, rgba(72,202,228,0.7));
     letter-spacing:1px;text-align:right;
     font-family:'Courier New'">
-    <div>LAT: <span id="hud-lat">---</span></div>
+    <div>LOCK: <span id="hud-lock">CLEAR</span></div>
     <div>PWR: <span id="hud-pwr">---</span></div>
   </div>
 </div>
@@ -3836,8 +4584,8 @@ body {
       <button class="panel-toggle" onclick="toggleRight()" title="Intelligence">&#9670;</button>
       <button id="reticle-toggle-btn" onclick="toggleReticle()"
         style="padding:4px 12px;border-radius:2px;
-        border:1px solid rgba(0,168,255,0.6);
-        background:transparent;color:#00a8ff;
+        border:1px solid rgba(72,202,228,0.6);
+        background:transparent;color:#48cae4;
         font-size:9px;letter-spacing:2px;cursor:pointer">
         &#9678; HELMET VIEW
       </button>
@@ -4485,6 +5233,25 @@ async function pollState() {
     document.getElementById('p-threats').textContent = sec.threats || 0;
     document.getElementById('p-blocked').textContent = sec.blocked_ips || 0;
 
+    // HUD edge-strip + reticle labels — real telemetry, not placeholders.
+    const rangeLabel = (d.range_level || '---').toUpperCase();
+    const threatsLabel = `${sec.threats || 0} THR`;
+    const lockLabel = d.locked ? 'ENGAGED' : 'CLEAR';
+    const hudRangeEl = document.getElementById('hud-range');
+    if (hudRangeEl) hudRangeEl.textContent = rangeLabel;
+    const hudThreatsEl = document.getElementById('hud-threats');
+    if (hudThreatsEl) hudThreatsEl.textContent = sec.threats || 0;
+    const hudLockEl = document.getElementById('hud-lock');
+    if (hudLockEl) hudLockEl.textContent = lockLabel;
+    window.hudRangeLabel = rangeLabel;
+    window.hudThreatsLabel = threatsLabel;
+    window.hudLockLabel = lockLabel;
+
+    const hb = d.hulkbuster || {};
+    if (typeof setHudThreatState === 'function') {
+      setHudThreatState(!!d.locked || !!hb.deployed);
+    }
+
     const training = d.training || {};
     document.getElementById('p-training').textContent = training.facts_learned !== undefined ? training.facts_learned : '-';
 
@@ -4812,20 +5579,63 @@ document.addEventListener('keydown', e => {
 </script>
 
 <script>
-// ── Helmet view — first-person targeting reticle overlay (blue theme) ─────────
+// ── HUD color state — FRIDAY's own palette (--bright/--glow from :root),
+// not JARVIS's leftover rgba(0,168,255,...) blue. Shifts to her existing
+// --danger red when locked down or HulkBuster is deployed, driven by
+// setHudThreatState() from pollState() below — one source of truth for
+// both the canvas-drawn elements and the edge-strip HTML labels (via the
+// --hud-glow CSS variable).
+const HUD_NORMAL = {r: 72,  g: 202, b: 228};  // --bright
+const HUD_ALERT  = {r: 230, g: 57,  b: 70};   // --danger
+let hudColor = HUD_NORMAL;
+let hudThreatActive = false;
+
+function setHudThreatState(active) {
+  if (active === hudThreatActive) return;
+  hudThreatActive = active;
+  hudColor = active ? HUD_ALERT : HUD_NORMAL;
+  document.documentElement.style.setProperty(
+    '--hud-glow', `rgba(${hudColor.r},${hudColor.g},${hudColor.b},0.7)`);
+  const btn = document.getElementById('reticle-toggle-btn');
+  if (btn) btn.style.color = `rgb(${hudColor.r},${hudColor.g},${hudColor.b})`;
+}
+
+// ── Helmet view — first-person targeting reticle overlay ────────────────────
+// Sized from the viewport, not a fixed 680x680 — that was fine on a
+// desktop window but dwarfed any phone screen, so most of the ring/labels
+// rendered off-screen. Every radius/offset below scales off `scale`
+// (relative to the original 340px reference half-size) instead of being
+// hardcoded, so resizing the canvas keeps the whole design proportional
+// rather than just cropping a fixed-size drawing.
 (function() {
   const c = document.getElementById('reticle-overlay');
   if (!c) return;
   const ctx = c.getContext('2d');
-  const W = 680, H = 680, CX = 340, CY = 340;
   let t = 0;
 
+  function sizeCanvas() {
+    const size = Math.max(240, Math.min(window.innerWidth, window.innerHeight, 680) * 0.85);
+    c.width = size;
+    c.height = size;
+  }
+  sizeCanvas();
+  window.addEventListener('resize', sizeCanvas);
+  window.addEventListener('orientationchange', sizeCanvas);
+
+  function rgba(mult) {
+    return `rgba(${hudColor.r},${hudColor.g},${hudColor.b},${mult})`;
+  }
+
   function drawReticle() {
+    const W = c.width, H = c.height;
+    const CX = W / 2, CY = H / 2;
+    const scale = CX / 340;
     ctx.clearRect(0, 0, W, H);
     const glow = 0.4 + Math.sin(t * 0.8) * 0.15;
+    const pulse = hudThreatActive ? 0.5 + Math.sin(t * 4) * 0.5 : 0;
 
-    const R = 220;
-    ctx.strokeStyle = `rgba(0,168,255,${glow * 0.5})`;
+    const R = 220 * scale;
+    ctx.strokeStyle = rgba(glow * 0.5 + pulse * 0.3);
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.arc(CX, CY, R, 0, Math.PI * 2);
@@ -4834,7 +5644,7 @@ document.addEventListener('keydown', e => {
     for (let i = 0; i < 72; i++) {
       const angle = (i / 72) * Math.PI * 2;
       const isLong = i % 6 === 0;
-      const inner = R - (isLong ? 12 : 5);
+      const inner = R - (isLong ? 12 : 5) * scale;
       const x1 = CX + Math.cos(angle) * inner;
       const y1 = CY + Math.sin(angle) * inner;
       const x2 = CX + Math.cos(angle) * R;
@@ -4842,30 +5652,37 @@ document.addEventListener('keydown', e => {
       ctx.beginPath();
       ctx.moveTo(x1, y1);
       ctx.lineTo(x2, y2);
-      ctx.strokeStyle = isLong
-        ? `rgba(51,204,255,${glow * 0.7})`
-        : `rgba(0,168,255,${glow * 0.25})`;
+      ctx.strokeStyle = isLong ? rgba(glow * 0.7) : rgba(glow * 0.25);
       ctx.lineWidth = isLong ? 1.5 : 0.5;
       ctx.stroke();
     }
 
+    // Twin interlocking arcs rather than one segmented hex ring — a softer,
+    // more fluid motif than the mechanical original, rotating in opposite
+    // directions to feel less like a static gunsight.
     ctx.save();
     ctx.translate(CX, CY);
-    ctx.rotate(t * 0.15);
-    const R2 = 160;
-    for (let i = 0; i < 6; i++) {
-      const a1 = (i / 6) * Math.PI * 2;
-      const a2 = a1 + Math.PI / 6 * 0.6;
-      ctx.beginPath();
-      ctx.arc(0, 0, R2, a1, a2);
-      ctx.strokeStyle = `rgba(0,168,255,${glow * 0.4})`;
-      ctx.lineWidth = 1;
-      ctx.stroke();
-    }
+    const R2 = 160 * scale;
+    [1, -1].forEach((dir) => {
+      ctx.save();
+      ctx.rotate(t * 0.15 * dir);
+      for (let i = 0; i < 6; i++) {
+        const a1 = (i / 6) * Math.PI * 2;
+        const a2 = a1 + Math.PI / 6 * 0.55;
+        ctx.beginPath();
+        ctx.arc(0, 0, dir === 1 ? R2 : R2 - 14 * scale, a1, a2);
+        ctx.strokeStyle = rgba(glow * (dir === 1 ? 0.4 : 0.25));
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+      ctx.restore();
+    });
     ctx.restore();
 
-    const chSize = 14;
-    ctx.strokeStyle = `rgba(72,202,228,${glow * 0.6})`;
+    // Center crosshair, breathing gently in sync with her chat orb pulse
+    // (.ar-widget-orb elsewhere on the page) instead of a fixed size.
+    const chSize = (14 + pulse * 4) * scale;
+    ctx.strokeStyle = rgba(glow * 0.6 + pulse * 0.3);
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(CX - chSize, CY);
@@ -4878,17 +5695,17 @@ document.addEventListener('keydown', e => {
     ctx.lineTo(CX, CY + chSize);
     ctx.stroke();
 
-    ctx.font = '9px Courier New';
-    ctx.fillStyle = `rgba(51,204,255,${glow * 0.5})`;
+    ctx.font = `${Math.max(8, 9 * scale)}px Courier New`;
+    ctx.fillStyle = rgba(glow * 0.5);
     const labels = [
-      {angle: -Math.PI/2, text: 'SYS OK'},
-      {angle: 0, text: '85x'},
-      {angle: Math.PI/2, text: 'STBY'},
-      {angle: Math.PI, text: '3.45'},
+      {angle: -Math.PI/2, text: hudThreatActive ? 'ALERT' : 'SYS OK'},
+      {angle: 0, text: window.hudRangeLabel || '---'},
+      {angle: Math.PI/2, text: window.hudThreatsLabel || '0 THR'},
+      {angle: Math.PI, text: window.hudLockLabel || 'CLEAR'},
     ];
     labels.forEach(l => {
-      const lx = CX + Math.cos(l.angle) * (R + 16);
-      const ly = CY + Math.sin(l.angle) * (R + 16);
+      const lx = CX + Math.cos(l.angle) * (R + 16 * scale);
+      const ly = CY + Math.sin(l.angle) * (R + 16 * scale);
       ctx.textAlign = 'center';
       ctx.fillText(l.text, lx, ly);
     });
@@ -4909,8 +5726,9 @@ document.addEventListener('keydown', e => {
   function drawRadar() {
     ctx.clearRect(0, 0, 80, 80);
     const CX = 40, CY = 40, R = 32;
+    const base = `rgba(${hudColor.r},${hudColor.g},${hudColor.b},`;
 
-    ctx.strokeStyle = 'rgba(0,168,255,0.3)';
+    ctx.strokeStyle = base + '0.3)';
     ctx.lineWidth = 0.5;
     ctx.beginPath();
     ctx.arc(CX, CY, R, 0, Math.PI * 2);
@@ -4928,8 +5746,8 @@ document.addEventListener('keydown', e => {
     ctx.translate(CX, CY);
     ctx.rotate(sweepAngle);
     const grad = ctx.createLinearGradient(0, 0, R, 0);
-    grad.addColorStop(0, 'rgba(0,168,255,0.5)');
-    grad.addColorStop(1, 'rgba(0,168,255,0)');
+    grad.addColorStop(0, base + '0.5)');
+    grad.addColorStop(1, base + '0)');
     ctx.strokeStyle = grad;
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -4937,6 +5755,17 @@ document.addEventListener('keydown', e => {
     ctx.lineTo(R, 0);
     ctx.stroke();
     ctx.restore();
+
+    // A dot at the threat-count position when there's anything to show —
+    // makes the radar reflect something real instead of sweeping over
+    // nothing, without needing actual spatial threat data FRIDAY doesn't have.
+    if (hudThreatActive) {
+      const dotAngle = sweepAngle - 0.3;
+      ctx.beginPath();
+      ctx.arc(CX + Math.cos(dotAngle) * R * 0.75, CY + Math.sin(dotAngle) * R * 0.75, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = base + '0.9)';
+      ctx.fill();
+    }
 
     sweepAngle += 0.02;
     requestAnimationFrame(drawRadar);
@@ -4955,7 +5784,9 @@ function toggleReticle() {
   document.getElementById('corner-radar-friday').style.display = display;
   const btn = document.getElementById('reticle-toggle-btn');
   btn.style.borderColor = reticleOn
-    ? 'rgba(0,168,255,0.6)' : 'rgba(0,168,255,0.3)';
+    ? `rgba(${hudColor.r},${hudColor.g},${hudColor.b},0.6)`
+    : `rgba(${hudColor.r},${hudColor.g},${hudColor.b},0.3)`;
+  btn.style.color = `rgb(${hudColor.r},${hudColor.g},${hudColor.b})`;
 }
 (function() {
   const savedState = localStorage.getItem('helmetViewOn');

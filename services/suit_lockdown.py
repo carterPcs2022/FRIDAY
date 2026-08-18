@@ -43,17 +43,8 @@ class SuitLockdown:
         self._save()
 
         try:
-            import httpx
-            httpx.post(
-                "https://api.pushover.net/1/messages.json",
-                data={
-                    "token": os.getenv("PUSHOVER_APP_TOKEN", ""),
-                    "user": os.getenv("PUSHOVER_USER_KEY", ""),
-                    "title": "FRIDAY — LOCKDOWN ACTIVE",
-                    "message": f"System locked. Reason: {reason}. Re-authenticate to restore access.",
-                    "priority": 1,
-                }, timeout=5,
-            )
+            from services.notifications import alert
+            alert("FRIDAY — LOCKDOWN ACTIVE", f"System locked. Reason: {reason}. Re-authenticate to restore access.")
         except Exception:
             pass
 

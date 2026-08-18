@@ -64,7 +64,11 @@ class FridayMCUCapabilities:
             speak(f"Emergency services contacted. Dispatching to {location or 'your location'}.")
         except Exception:
             pass
-        self._pushover_alert("FRIDAY Emergency", f"{nature} at {location}")
+        try:
+            from services.notifications import critical
+            critical("FRIDAY Emergency", f"{nature} at {location}")
+        except Exception:
+            pass
         return {"contacted": True}
 
     def government_intel(self, query: str) -> dict:
@@ -211,6 +215,21 @@ class FridayMCUCapabilities:
 
 friday_caps = FridayMCUCapabilities()
 
+
+def _call_mom(query: str) -> dict:
+    """Fires services.friday_pushcut.call_mom() — see that module's
+    docstring for the free-tier-vs-Pro distinction. Lazy import, same
+    convention as every other handler here.
+
+    Normalizes call_mom()'s {"ok"/"error"} shape into a "message" key —
+    server.py's CAPABILITY_MAP dispatcher does
+    result.get(response_key) or "Done, boss.", so an error dict with no
+    "message" key would silently read as success otherwise."""
+    from services.friday_pushcut import call_mom
+    result = call_mom()
+    return {"message": result.get("message") or f"Couldn't reach Pushcut, boss — {result.get('error', 'unknown error')}."}
+
+
 # Trigger phrase -> (handler, response-key to surface). Checked in
 # server.py's /command before deciding whether to proxy to JARVIS or let
 # FRIDAY's general reasoning handle it — these are meant to fire
@@ -231,4 +250,6 @@ CAPABILITY_MAP = {
     "physics calculation": (lambda q: friday_caps.physics_calculation(q), "analysis"),
     "monitor internet": (lambda q: friday_caps.internet_monitor(q), "brief"),
     "deploy veronica": (lambda q: friday_caps.deploy_veronica(), "status"),
+    "call mom": (_call_mom, "message"),
+    "call my mom": (_call_mom, "message"),
 }

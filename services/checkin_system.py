@@ -5,7 +5,6 @@ whether *some* escalation is still awaiting confirmation, not which one,
 so a SAFE_TRIGGERS reply stands down whatever's pending rather than
 needing to be matched back to a specific incident id.
 """
-import os
 import threading
 
 # Set when an escalation fires, cleared by confirm_safe(). Any pending
@@ -17,22 +16,9 @@ emergency_pending = threading.Event()
 class CheckinSystem:
 
     def request_checkin(self, reason: str = "") -> dict:
-        user = os.environ.get("PUSHOVER_USER_KEY", "")
-        token = os.environ.get("PUSHOVER_APP_TOKEN", "")
-        if not (user and token):
-            return {"error": "Pushover not configured"}
         try:
-            import httpx
-            httpx.post(
-                "https://api.pushover.net/1/messages.json",
-                data={
-                    "token": token, "user": user,
-                    "title": "FRIDAY Check-In",
-                    "message": reason or "Boss, checking in — are you safe?",
-                    "priority": 1,
-                },
-                timeout=5,
-            )
+            from services.notifications import critical
+            critical("FRIDAY Check-In", reason or "Boss, checking in — are you safe?")
             emergency_pending.set()
             return {"ok": True}
         except Exception as e:

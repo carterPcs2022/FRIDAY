@@ -37,7 +37,16 @@ FRIDAY_COMPONENTS = {
     "protocols": "core/friday_protocols.py",
     "emotional": "core/emotional_intel.py",
     "server": "server.py",
+    "security": "services/friday_security.py",
+    "lockdown": "services/suit_lockdown.py",
 }
+
+# The two watched components that are themselves firewalls. Getting these
+# stripped down file-by-file is the exact "taken apart piece by piece"
+# scenario HulkBuster exists for — so unlike every other component, a
+# MODIFIED hash here counts as damage worth repairing and escalating on,
+# not just a status line (see monitor() below).
+FIREWALL_COMPONENTS = {"security", "lockdown"}
 
 
 class Veronica:
@@ -71,7 +80,10 @@ class Veronica:
 
             current_hash = self._hash_file(rel_path)
             baseline = self._baselines.get(name)
-            status[name] = "MODIFIED" if (baseline and current_hash != baseline) else "NOMINAL"
+            modified = bool(baseline and current_hash != baseline)
+            status[name] = "MODIFIED" if modified else "NOMINAL"
+            if modified and name in FIREWALL_COMPONENTS:
+                damaged.append((name, "tampered"))
 
         repairs = []
         alerts = []
@@ -94,6 +106,18 @@ class Veronica:
         if alerts:
             self._alert(f"{len(alerts)} component(s) damaged with no backup available — "
                         f"needs manual attention: {'; '.join(alerts)}.")
+
+        # A firewall file getting hit — whether or not the restore above
+        # actually succeeded — is HulkBuster's cue, independent of Veronica's
+        # own repair/alert path.
+        firewall_hits = [(name, dtype) for name, dtype in damaged if name in FIREWALL_COMPONENTS]
+        if firewall_hits:
+            try:
+                from services.hulkbuster import hulkbuster
+                names = ", ".join(f"{n} ({t})" for n, t in firewall_hits)
+                hulkbuster.deploy(reason=f"firewall component(s) compromised: {names}")
+            except Exception:
+                pass
 
         return self._health
 

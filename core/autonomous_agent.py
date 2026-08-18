@@ -46,6 +46,8 @@ class AutonomousAgent:
             ("mac_bridge_check", self._mac_bridge_check, 1800),
             ("disk_cleanup", self._disk_cleanup, 43200),
             ("medicine_check", self._medicine_check, 300),
+            ("memory_backup", self._memory_backup, 86400),
+            ("system_health_check", self._system_health_check, 3600),
         ]
 
         for name, fn, interval in monitors:
@@ -627,6 +629,35 @@ class AutonomousAgent:
         except Exception:
             pass
 
+    # ── Memory backup ────────────────────────────────────────────────────────
+    def _memory_backup(self):
+        """FRIDAY had no backup of her own memory files at all before this —
+        see services/backup.py. Only worth a log line, not an alert; a
+        failed backup isn't urgent enough to page over, and the next run
+        24h later will just try again."""
+        try:
+            from services import backup
+            result = backup.backup_all()
+            print(f"[FRIDAY Autonomous] memory_backup: {len(result.get('backed_up', []))} files -> "
+                  f"memory/backups/ ({result.get('ts', '')})")
+        except Exception as e:
+            print(f"[Autonomous:memory_backup] {e}")
+
+    # ── System health check ──────────────────────────────────────────────────
+    def _system_health_check(self):
+        """Hourly sweep over services/system_doctor.full_check() (APIs, Mac
+        Bridge, disk, memory files, config) — alerts only when something's
+        actually unhealthy, same pattern as every other monitor here."""
+        try:
+            from services import system_doctor
+            result = system_doctor.full_check()
+            if not result.get("healthy", True):
+                failing = [name for name, check in result.get("checks", {}).items()
+                          if check.get("ok") is False]
+                self._alert(f"System health check found an issue: {', '.join(failing)}, boss.", priority="high")
+        except Exception as e:
+            print(f"[Autonomous:system_health_check] {e}")
+
     # ── Alert dispatcher ─────────────────────────────────────────────────────
     def _alert(self, message: str, priority: str = "normal", title: str = "FRIDAY"):
         """Send alert through all channels."""
@@ -666,21 +697,18 @@ class AutonomousAgent:
         except Exception:
             pass
 
-        pushover_user = os.getenv("PUSHOVER_USER_KEY", "")
-        pushover_token = os.getenv("PUSHOVER_APP_TOKEN", "")
-        if pushover_user and pushover_token:
-            try:
-                import httpx
-                httpx.post(
-                    "https://api.pushover.net/1/messages.json",
-                    data={
-                        "token": pushover_token, "user": pushover_user,
-                        "title": title, "message": message,
-                        "priority": 1 if priority == "high" else 0,
-                    }, timeout=5
-                )
-            except Exception:
-                pass
+        # Routed through services/notifications.py rather than a raw
+        # Pushover call: "high" (battery critical, Mac Bridge down, health
+        # check failing) still pushes to the phone; "normal" (weekly
+        # review, urgent email, meeting prep, news, goal nudges) and "low"
+        # (hydration/break/meal reminders) now go to the HUD only, not a
+        # push notification for every routine nudge.
+        try:
+            from services.notifications import notify, Priority
+            level = {"high": Priority.HIGH, "normal": Priority.WARNING, "low": Priority.INFO}.get(priority, Priority.WARNING)
+            notify(title, message, level)
+        except Exception as e:
+            print(f"[FRIDAY Autonomous] notify failed: {e}")
 
 
 autonomous = AutonomousAgent()
