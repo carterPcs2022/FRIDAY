@@ -13,7 +13,11 @@ import httpx
 from pathlib import Path
 from urllib.parse import urlencode
 
+from db import turso_http_client as turso
+
 SPOTIFY_TOKEN_FILE = Path("memory/friday_spotify_token.json")
+SPOTIFY_TOKEN_TABLE = "friday_spotify_token"
+SPOTIFY_TOKEN_KEY = "token"
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "")
@@ -39,6 +43,29 @@ print(
 class FridaySpotify:
 
     def _load_token_data(self) -> dict:
+        if turso.is_configured():
+            row, query_ok = None, False
+            try:
+                turso.ensure_kv_table(SPOTIFY_TOKEN_TABLE)
+                row = turso.kv_get(SPOTIFY_TOKEN_TABLE, SPOTIFY_TOKEN_KEY)
+                query_ok = True
+            except Exception as e:
+                print(f"[Turso] Spotify token read failed, falling back to local JSON: {e}")
+
+            if row is not None:
+                return row
+            if query_ok:
+                local = self._read_local_token_data()
+                if local:
+                    try:
+                        turso.kv_set(SPOTIFY_TOKEN_TABLE, SPOTIFY_TOKEN_KEY, local)
+                    except Exception as e:
+                        print(f"[Turso] Spotify token seed failed: {e}")
+                return local
+
+        return self._read_local_token_data()
+
+    def _read_local_token_data(self) -> dict:
         if SPOTIFY_TOKEN_FILE.exists():
             try:
                 return json.loads(SPOTIFY_TOKEN_FILE.read_text())
@@ -49,6 +76,13 @@ class FridaySpotify:
     def _save_token_data(self, data: dict):
         SPOTIFY_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         SPOTIFY_TOKEN_FILE.write_text(json.dumps(data, indent=2))
+
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(SPOTIFY_TOKEN_TABLE)
+                turso.kv_set(SPOTIFY_TOKEN_TABLE, SPOTIFY_TOKEN_KEY, data)
+            except Exception as e:
+                print(f"[Turso] Spotify token write failed, local JSON already has it: {e}")
 
     def _get_token(self) -> str:
         """Returns a valid access token, refreshing it first if expired."""

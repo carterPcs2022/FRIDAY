@@ -6,7 +6,11 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta
 
+from db import turso_http_client as turso
+
 GOALS_FILE = Path("memory/friday_goals.json")
+GOALS_TABLE = "friday_goals"
+GOALS_KEY = "goals"
 
 
 class GoalTracker:
@@ -154,6 +158,29 @@ class GoalTracker:
         return ""
 
     def _load(self) -> dict:
+        if turso.is_configured():
+            row, query_ok = None, False
+            try:
+                turso.ensure_kv_table(GOALS_TABLE)
+                row = turso.kv_get(GOALS_TABLE, GOALS_KEY)
+                query_ok = True
+            except Exception as e:
+                print(f"[Turso] goals read failed, falling back to local JSON: {e}")
+
+            if row is not None:
+                return row
+            if query_ok:
+                local = self._read_local()
+                if local:
+                    try:
+                        turso.kv_set(GOALS_TABLE, GOALS_KEY, local)
+                    except Exception as e:
+                        print(f"[Turso] goals seed failed: {e}")
+                return local
+
+        return self._read_local()
+
+    def _read_local(self) -> dict:
         if GOALS_FILE.exists():
             try:
                 return json.loads(GOALS_FILE.read_text())
@@ -164,6 +191,13 @@ class GoalTracker:
     def _save(self):
         GOALS_FILE.parent.mkdir(parents=True, exist_ok=True)
         GOALS_FILE.write_text(json.dumps(self._goals, indent=2))
+
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(GOALS_TABLE)
+                turso.kv_set(GOALS_TABLE, GOALS_KEY, self._goals)
+            except Exception as e:
+                print(f"[Turso] goals write failed, local JSON already has it: {e}")
 
 
 goals = GoalTracker()

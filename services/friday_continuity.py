@@ -5,7 +5,11 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta
 
+from db import turso_http_client as turso
+
 CONTINUITY_FILE = Path("memory/friday_continuity.json")
+CONTINUITY_TABLE = "friday_continuity"
+CONTINUITY_KEY = "continuity"
 
 FOLLOWUP_EMOTIONS = [
     "stressed", "anxious", "sad", "frustrated",
@@ -111,6 +115,29 @@ class EmotionalContinuity:
         ]
 
     def _load(self) -> dict:
+        if turso.is_configured():
+            row, query_ok = None, False
+            try:
+                turso.ensure_kv_table(CONTINUITY_TABLE)
+                row = turso.kv_get(CONTINUITY_TABLE, CONTINUITY_KEY)
+                query_ok = True
+            except Exception as e:
+                print(f"[Turso] continuity read failed, falling back to local JSON: {e}")
+
+            if row is not None:
+                return row
+            if query_ok:
+                local = self._read_local()
+                if local:
+                    try:
+                        turso.kv_set(CONTINUITY_TABLE, CONTINUITY_KEY, local)
+                    except Exception as e:
+                        print(f"[Turso] continuity seed failed: {e}")
+                return local
+
+        return self._read_local()
+
+    def _read_local(self) -> dict:
         if CONTINUITY_FILE.exists():
             try:
                 return json.loads(CONTINUITY_FILE.read_text())
@@ -121,6 +148,13 @@ class EmotionalContinuity:
     def _save(self):
         CONTINUITY_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONTINUITY_FILE.write_text(json.dumps(self._state, indent=2))
+
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(CONTINUITY_TABLE)
+                turso.kv_set(CONTINUITY_TABLE, CONTINUITY_KEY, self._state)
+            except Exception as e:
+                print(f"[Turso] continuity write failed, local JSON already has it: {e}")
 
     def status(self) -> dict:
         return {
