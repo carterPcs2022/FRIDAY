@@ -3945,7 +3945,13 @@ body {
     radial-gradient(ellipse at 80% 20%, rgba(0,150,199,0.1) 0%, transparent 50%);
   color: var(--text);
   font-family: -apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif;
+  /* 100vh on iOS Safari is the viewport with the address bar hidden, not
+     the visible one — content gets cut off behind the toolbar/home
+     indicator, or leaves a scrollable gap, depending on scroll state.
+     100dvh (dynamic viewport height) tracks the actual visible area;
+     100vh stays as a fallback for browsers that don't support dvh. */
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   position: relative;
 }
@@ -4286,7 +4292,25 @@ body {
 .ar-widget-audio-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--bright)); transition: width 0.1s linear; }
 
 @media (max-width: 700px) {
-  .widget-stage { left: 12px; right: 12px; width: auto; top: 64px; }
+  /* .top-bar packs a logo, 3 status pills, a clock, and 6 buttons into
+     one row — fine on a desktop-width viewport, but nothing stops it
+     overflowing/clipping on a phone. Wrapping (not shrinking text) keeps
+     every control reachable rather than guessing at which ones to hide —
+     but wrapping also makes it roughly twice as tall, so the fixed-
+     position HUD layers below it (widget-stage, hud-edge-strip) need
+     more clearance than their desktop top offsets give them, or they'd
+     sit under the wrapped second row instead of below it. These are
+     estimates for a typical 2-row wrap, not measured against a real
+     device — may want a pixel nudge once seen on an actual phone. */
+  .top-bar { flex-wrap: wrap; padding: 10px 12px; gap: 8px 10px; }
+  .top-pills { flex-wrap: wrap; }
+  .top-right { flex-wrap: wrap; justify-content: flex-end; gap: 6px 8px; margin-left: 0; width: 100%; }
+  .clock-display { font-size: 15px; }
+
+  .widget-stage { left: 12px; right: 12px; width: auto; top: 112px; }
+  #hud-edge-strip { top: 120px !important; }
+
+  .slide-panel { width: min(320px, 88vw); }
 }
 
 </style>
@@ -4458,8 +4482,8 @@ body {
       <button class="panel-toggle" onclick="toggleRight()" title="Intelligence">&#9670;</button>
       <button id="reticle-toggle-btn" onclick="toggleReticle()"
         style="padding:4px 12px;border-radius:2px;
-        border:1px solid rgba(0,168,255,0.6);
-        background:transparent;color:#00a8ff;
+        border:1px solid rgba(72,202,228,0.6);
+        background:transparent;color:#48cae4;
         font-size:9px;letter-spacing:2px;cursor:pointer">
         &#9678; HELMET VIEW
       </button>
@@ -5470,26 +5494,45 @@ function setHudThreatState(active) {
   hudColor = active ? HUD_ALERT : HUD_NORMAL;
   document.documentElement.style.setProperty(
     '--hud-glow', `rgba(${hudColor.r},${hudColor.g},${hudColor.b},0.7)`);
+  const btn = document.getElementById('reticle-toggle-btn');
+  if (btn) btn.style.color = `rgb(${hudColor.r},${hudColor.g},${hudColor.b})`;
 }
 
 // ── Helmet view — first-person targeting reticle overlay ────────────────────
+// Sized from the viewport, not a fixed 680x680 — that was fine on a
+// desktop window but dwarfed any phone screen, so most of the ring/labels
+// rendered off-screen. Every radius/offset below scales off `scale`
+// (relative to the original 340px reference half-size) instead of being
+// hardcoded, so resizing the canvas keeps the whole design proportional
+// rather than just cropping a fixed-size drawing.
 (function() {
   const c = document.getElementById('reticle-overlay');
   if (!c) return;
   const ctx = c.getContext('2d');
-  const W = 680, H = 680, CX = 340, CY = 340;
   let t = 0;
+
+  function sizeCanvas() {
+    const size = Math.max(240, Math.min(window.innerWidth, window.innerHeight, 680) * 0.85);
+    c.width = size;
+    c.height = size;
+  }
+  sizeCanvas();
+  window.addEventListener('resize', sizeCanvas);
+  window.addEventListener('orientationchange', sizeCanvas);
 
   function rgba(mult) {
     return `rgba(${hudColor.r},${hudColor.g},${hudColor.b},${mult})`;
   }
 
   function drawReticle() {
+    const W = c.width, H = c.height;
+    const CX = W / 2, CY = H / 2;
+    const scale = CX / 340;
     ctx.clearRect(0, 0, W, H);
     const glow = 0.4 + Math.sin(t * 0.8) * 0.15;
     const pulse = hudThreatActive ? 0.5 + Math.sin(t * 4) * 0.5 : 0;
 
-    const R = 220;
+    const R = 220 * scale;
     ctx.strokeStyle = rgba(glow * 0.5 + pulse * 0.3);
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -5499,7 +5542,7 @@ function setHudThreatState(active) {
     for (let i = 0; i < 72; i++) {
       const angle = (i / 72) * Math.PI * 2;
       const isLong = i % 6 === 0;
-      const inner = R - (isLong ? 12 : 5);
+      const inner = R - (isLong ? 12 : 5) * scale;
       const x1 = CX + Math.cos(angle) * inner;
       const y1 = CY + Math.sin(angle) * inner;
       const x2 = CX + Math.cos(angle) * R;
@@ -5517,7 +5560,7 @@ function setHudThreatState(active) {
     // directions to feel less like a static gunsight.
     ctx.save();
     ctx.translate(CX, CY);
-    const R2 = 160;
+    const R2 = 160 * scale;
     [1, -1].forEach((dir) => {
       ctx.save();
       ctx.rotate(t * 0.15 * dir);
@@ -5525,7 +5568,7 @@ function setHudThreatState(active) {
         const a1 = (i / 6) * Math.PI * 2;
         const a2 = a1 + Math.PI / 6 * 0.55;
         ctx.beginPath();
-        ctx.arc(0, 0, dir === 1 ? R2 : R2 - 14, a1, a2);
+        ctx.arc(0, 0, dir === 1 ? R2 : R2 - 14 * scale, a1, a2);
         ctx.strokeStyle = rgba(glow * (dir === 1 ? 0.4 : 0.25));
         ctx.lineWidth = 1;
         ctx.stroke();
@@ -5536,7 +5579,7 @@ function setHudThreatState(active) {
 
     // Center crosshair, breathing gently in sync with her chat orb pulse
     // (.ar-widget-orb elsewhere on the page) instead of a fixed size.
-    const chSize = 14 + pulse * 4;
+    const chSize = (14 + pulse * 4) * scale;
     ctx.strokeStyle = rgba(glow * 0.6 + pulse * 0.3);
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -5550,7 +5593,7 @@ function setHudThreatState(active) {
     ctx.lineTo(CX, CY + chSize);
     ctx.stroke();
 
-    ctx.font = '9px Courier New';
+    ctx.font = `${Math.max(8, 9 * scale)}px Courier New`;
     ctx.fillStyle = rgba(glow * 0.5);
     const labels = [
       {angle: -Math.PI/2, text: hudThreatActive ? 'ALERT' : 'SYS OK'},
@@ -5559,8 +5602,8 @@ function setHudThreatState(active) {
       {angle: Math.PI, text: window.hudLockLabel || 'CLEAR'},
     ];
     labels.forEach(l => {
-      const lx = CX + Math.cos(l.angle) * (R + 16);
-      const ly = CY + Math.sin(l.angle) * (R + 16);
+      const lx = CX + Math.cos(l.angle) * (R + 16 * scale);
+      const ly = CY + Math.sin(l.angle) * (R + 16 * scale);
       ctx.textAlign = 'center';
       ctx.fillText(l.text, lx, ly);
     });
@@ -5641,6 +5684,7 @@ function toggleReticle() {
   btn.style.borderColor = reticleOn
     ? `rgba(${hudColor.r},${hudColor.g},${hudColor.b},0.6)`
     : `rgba(${hudColor.r},${hudColor.g},${hudColor.b},0.3)`;
+  btn.style.color = `rgb(${hudColor.r},${hudColor.g},${hudColor.b})`;
 }
 (function() {
   const savedState = localStorage.getItem('helmetViewOn');
