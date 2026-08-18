@@ -6,16 +6,29 @@ App Passwords with 2FA enabled). JARVIS_V5's Gmail integration
 OAuth2 — two separate repos/deploys, each with its own EMAIL_ADDRESS/
 EMAIL_PASSWORD, not meant to share state."""
 import os
+import re
 import json
 import imaplib
+import smtplib
 import email
 from email.header import decode_header
+from email.mime.text import MIMEText
 
 GMAIL_USER = os.getenv("EMAIL_ADDRESS", "")
 GMAIL_PASS = os.getenv("EMAIL_PASSWORD", "")
 
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
 
 class FridayGmail:
+
+    def __init__(self):
+        # Set by draft_reply(), consumed (and cleared) by send_draft() —
+        # lets "send it" refer back to whatever FRIDAY last drafted
+        # without the caller having to repeat subject/body/recipient.
+        # In-memory only, like checkin_system's emergency_pending: one
+        # process, one pending draft at a time is all this needs.
+        self._last_draft = {}
 
     def connect(self):
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -116,8 +129,9 @@ class FridayGmail:
 
     def draft_reply(self, email_subject: str = "", email_from: str = "",
                     email_body: str = "", instruction: str = "") -> dict:
-        """Draft a reply — FRIDAY writes it, the boss approves before
-        anything actually sends (this never calls send_email() itself)."""
+        """Draft a reply — FRIDAY writes it, the boss approves before it
+        actually sends. This never sends by itself; approval happens as a
+        separate step (send_draft(), after the boss says "send it")."""
         from core.friday_brain import friday_brain
 
         result = friday_brain.think(
@@ -130,10 +144,64 @@ class FridayGmail:
             f"Keep it concise and clear."
         )
 
-        return {
+        draft = {
             "draft": result["response"], "subject": f"Re: {email_subject}",
             "to": email_from, "ready": True,
         }
+        self._last_draft = draft
+        return draft
+
+    def extract_address(self, raw: str) -> str:
+        """Pulls a bare address out of an RFC 2822 'Name <addr>' string
+        (or a plain address, or free text containing one)."""
+        match = _EMAIL_RE.search(raw or "")
+        return match.group(0) if match else ""
+
+    def send_email(self, to: str = "", subject: str = "", body: str = "") -> dict:
+        """Actually sends, via the same SMTP app-password credentials the
+        IMAP side uses. No approval step here — the caller (a "send it"
+        confirmation, or an explicit compose-and-send request) is the
+        approval; this is the action, not another draft."""
+        if not GMAIL_USER or not GMAIL_PASS:
+            return {"ok": False, "error": "Gmail not configured"}
+
+        address = self.extract_address(to)
+        if not address:
+            return {"ok": False, "error": f"'{to}' doesn't look like an email address"}
+        if not (body or "").strip():
+            return {"ok": False, "error": "Nothing to send — the body is empty"}
+
+        msg = MIMEText(body)
+        msg["Subject"] = subject or "(no subject)"
+        msg["From"] = GMAIL_USER
+        msg["To"] = address
+
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+                smtp.login(GMAIL_USER, GMAIL_PASS)
+                smtp.send_message(msg)
+        except Exception as e:
+            print(f"[FRIDAY Gmail] send failed: {e}")
+            return {"ok": False, "error": str(e)}
+
+        return {"ok": True, "to": address, "subject": msg["Subject"]}
+
+    def send_draft(self, to: str = "", body: str = "") -> dict:
+        """Sends whatever draft_reply() last produced. `to`/`body` let the
+        boss redirect or tweak it in the same breath ("send it to her
+        personal address instead") without redrafting."""
+        if not self._last_draft:
+            return {"ok": False, "error": "Nothing drafted yet, boss"}
+
+        draft = self._last_draft
+        result = self.send_email(
+            to=to or draft.get("to", ""),
+            subject=draft.get("subject", ""),
+            body=body or draft.get("draft", ""),
+        )
+        if result.get("ok"):
+            self._last_draft = {}
+        return result
 
     def find_email(self, search: str = "") -> dict:
         """Finds a specific email to reply to — scoped to the last 20

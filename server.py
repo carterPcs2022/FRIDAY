@@ -906,6 +906,28 @@ DRAFT_TRIGGERS = [
     "draft email", "write email to",
 ]
 
+# Confirms and actually sends whatever draft_reply() last produced —
+# checked ahead of DRAFT_TRIGGERS's "reply to"/"respond to" would never
+# match these short confirmation phrases anyway, but it belongs in the
+# same neighborhood: this is step two of that flow, not a new one.
+SEND_TRIGGERS = [
+    "send it", "send that", "go ahead and send",
+    "yes send it", "yes, send it", "send the reply",
+    "send that email", "send this email", "send the draft",
+]
+
+# Compose-and-send in one shot, no draft/approval step first — distinct
+# from DRAFT_TRIGGERS's "write email to" (which only ever drafts). Every
+# phrase here starts with "send"/"email" + an explicit target, so none of
+# them collide with EMAIL_TRIGGERS' inbox-summary phrases ("check my
+# email", "what emails") — still checked first regardless, same reasoning
+# as TRIAGE_TRIGGERS below.
+COMPOSE_SEND_TRIGGERS = [
+    "send an email to", "send email to",
+    "compose an email to", "shoot an email to",
+    "fire off an email to",
+]
+
 # "inbox"/"what emails" (EMAIL_TRIGGERS) are substrings of "triage my
 # inbox"/"organize my inbox"/"what emails need attention" — this list
 # must be checked BEFORE EMAIL_TRIGGERS in command() or the narrower
@@ -2078,6 +2100,59 @@ def command():
                 response = "I couldn't find that email, boss. Try 'FRIDAY draft a reply to [exact name or subject]'."
             _log(prompt, response, "email_draft")
             return jsonify({"response": response, "mode": "email_draft"})
+
+        # ── Email: send the pending draft ("send it") ───────────────────────
+        if any(t in p_lower for t in SEND_TRIGGERS) and friday_gmail:
+            result = friday_gmail.send_draft()
+            if result.get("ok"):
+                response = f"Sent, boss. On its way to {result.get('to', '')}."
+            else:
+                response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
+            _log(prompt, response, "email_send")
+            return jsonify({"response": response, "mode": "email_send", **result})
+
+        # ── Email: compose and send directly, no draft step ─────────────────
+        if any(t in p_lower for t in COMPOSE_SEND_TRIGGERS) and friday_gmail and friday_brain:
+            import re as rex
+            extract = friday_brain.think(
+                f"From this: '{prompt}'\n"
+                f"Extract who to email and what to say.\n"
+                f'JSON: {{"to": str, "subject": str, "body": str}}\n'
+                f"'to' should be the raw email address if one appears in the "
+                f"text, otherwise the name/description as given. 'subject' "
+                f"should be short and inferred from the message if none is "
+                f"stated. 'body' should be the message to send, written out "
+                f"in full sentences."
+            )
+            try:
+                clean = rex.sub(r"```json|```", "", extract["response"]).strip()
+                data = json.loads(clean)
+                to = data.get("to", "")
+                subject = data.get("subject", "")
+                body = data.get("body", "")
+            except Exception:
+                to, subject, body = "", "", ""
+
+            if not friday_gmail.extract_address(to):
+                # No bare address in the prompt or the extraction — fall
+                # back to matching it against a recent sender by name, the
+                # same lookup the reply-draft flow uses.
+                found = friday_gmail.find_email(to)
+                if found:
+                    to = found.get("from", "")
+
+            if not to or not body:
+                response = "Who's it going to, and what should it say, boss?"
+                _log(prompt, response, "email_compose_send")
+                return jsonify({"response": response, "mode": "email_compose_send"})
+
+            result = friday_gmail.send_email(to=to, subject=subject, body=body)
+            if result.get("ok"):
+                response = f"Sent, boss. On its way to {result.get('to', '')}."
+            else:
+                response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
+            _log(prompt, response, "email_compose_send")
+            return jsonify({"response": response, "mode": "email_compose_send", **result})
 
         if any(t in p_lower for t in TRIAGE_TRIGGERS) and friday_gmail:
             triage = friday_gmail.smart_triage()
@@ -3413,6 +3488,25 @@ def email_triage():
     if not friday_gmail:
         return jsonify({"error": "Gmail not configured"}), 503
     return jsonify(friday_gmail.smart_triage())
+
+
+@app.route("/friday/email/send", methods=["POST"])
+def email_send():
+    """Sends directly when to/body are given; sends the last draft_reply()
+    output otherwise. Same auth gate as every other data route (see
+    core/access_auth.py) — this isn't exempt, and it's the one email route
+    that actually puts a message in someone's inbox."""
+    data = request.get_json(silent=True) or {}
+    if not friday_gmail:
+        return jsonify({"error": "Gmail not configured"}), 503
+    to = data.get("to", "")
+    subject = data.get("subject", "")
+    body = data.get("body", "")
+    if to or body:
+        result = friday_gmail.send_email(to=to, subject=subject, body=body)
+    else:
+        result = friday_gmail.send_draft(to=to, body=body)
+    return jsonify(result), (200 if result.get("ok") else 400)
 
 
 # ── Goals ────────────────────────────────────────────────────────────────────
