@@ -30,7 +30,7 @@ _PLACEHOLDER_STRINGS = [
 # URL-shaped env vars that must actually be reachable off this box in
 # production — a Render deploy pointing at localhost/127.0.0.1 means
 # whoever set it never updated it after copying from a local .env.
-_URL_KEYS = ["MAC_BRIDGE_URL", "JARVIS_URL", "GOOGLE_CALENDAR_REDIRECT_URI", "HA_URL"]
+_URL_KEYS = ["MAC_BRIDGE_URL", "JARVIS_URL", "GOOGLE_CALENDAR_REDIRECT_URI", "HA_URL", "PUSHCUT_MOM_WEBHOOK_URL"]
 
 # (url_key, token_key) pairs — one configured without the other is
 # always a mistake, since either FRIDAY has no bridge to call or it has

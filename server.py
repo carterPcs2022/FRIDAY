@@ -2677,6 +2677,23 @@ def friday_pushcut_call():
     return jsonify(result)
 
 
+@app.route("/friday/phone/call-mom", methods=["POST"])
+def friday_pushcut_call_mom():
+    """Free-tier stopgap until Pushcut Pro/Plus is active — see
+    services/friday_pushcut.py's module docstring. Fixed target, no body
+    needed; fires a static notification that still needs a tap on his
+    phone to actually place the call."""
+    from services.friday_pushcut import call_mom
+    if SECURITY_OK:
+        screen = friday_security.screen_request(friday_security.client_ip(request), "pushcut call mom")
+        if screen.get("blocked"):
+            return jsonify({"error": "Request blocked"}), 403
+    result = call_mom()
+    if not result.get("ok"):
+        return jsonify(result), 502
+    return jsonify(result)
+
+
 # ── JARVIS takeover ────────────────────────────────────────────────────────────
 
 @app.route("/takeover", methods=["POST"])
