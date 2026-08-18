@@ -124,6 +124,25 @@ BASE_DIR = Path(__file__).resolve().parent
 logging.basicConfig(level=logging.INFO, format='[FRIDAY] %(message)s')
 
 
+@app.errorhandler(Exception)
+def _handle_uncaught_error(e):
+    """Before this, an uncaught bug just disappeared into Render's logs
+    with nothing surfacing it — the only way to learn something crashed
+    was to notice FRIDAY acting wrong. Werkzeug's own HTTPException
+    subclasses (404s, a stray 405) pass through untouched — those are
+    normal HTTP responses, not bugs worth an alert."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    logging.exception(f"Unhandled error on {request.path}")
+    try:
+        from core.error_alerts import report
+        report(request.path, e)
+    except Exception:
+        pass
+    return jsonify({"error": "Something went wrong, boss."}), 500
+
+
 def _ensure_memory():
     """Render's filesystem is ephemeral — a fresh deploy or cold start can
     land on a box with none of these directories. Most modules already
