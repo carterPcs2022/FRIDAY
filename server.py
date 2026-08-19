@@ -2,6 +2,7 @@
 monitoring + green HUD + voice-mode control."""
 import time
 from flask import Flask, jsonify, redirect
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # app + /health come before anything else that could fail to import or
 # block — Railway's healthcheck needs a fast 200 from this path to keep
@@ -10,6 +11,21 @@ from flask import Flask, jsonify, redirect
 # further down (or in a nested core/ module) previously meant the whole
 # app never came up, independent of how fast /health's own handler is.
 app = Flask(__name__)
+
+# Render/Railway both put exactly one reverse proxy in front of this app,
+# so request.remote_addr (and request.scheme) would otherwise always
+# report the proxy, not the real client — which is why
+# services/friday_security.py used to hand-parse X-Forwarded-For itself,
+# trusting whatever IP showed up first. That's spoofable: a client can
+# set their own X-Forwarded-For with a fake address prepended, and if the
+# proxy appends rather than replaces the header, the fake entry — not
+# Render/Railway's real one — is what "first" picks up. ProxyFix(x_for=1)
+# instead trusts exactly one hop counted from the right (the proxy's own
+# addition), which a client can't forge from outside it. x_for/x_proto
+# only — x_host/x_port/x_prefix stay at 0 since nothing here needs the
+# Host header rewritten.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=0, x_port=0, x_prefix=0)
+
 BOOT_TIME = time.time()
 
 
