@@ -5,20 +5,27 @@ non-urgent signal. Every formerly-independent raw Pushover call site
 core/config_validator.py, core/scatter.py, services/suit_lockdown.py,
 services/checkin_system.py, services/friday_health.py,
 services/hulkbuster.py) now routes through here — only priority >= HIGH
-actually reaches Pushover, so routine nudges (weekly review, news,
-hydration reminders) surface on the HUD without buzzing the phone, while
-genuinely urgent things (battery critical, lockdown, HulkBuster, MAYDAY,
-health emergencies) still do.
+actually reaches Pushover/email/SMS, so routine nudges (weekly review,
+news, hydration reminders) surface on the HUD without buzzing the phone,
+while genuinely urgent things (battery critical, lockdown, HulkBuster,
+MAYDAY, health emergencies) reach the boss directly instead of waiting
+for Pushover's app or the HUD tab to be open — which is the whole point
+of core/autonomous_agent.py deciding to speak up unprompted in the first
+place: it doesn't help if nothing carries that past the machine it's
+running on.
 
 Reuses core/friday_capabilities.py's friday_caps._pushover_alert() for
 the actual Pushover HTTP call rather than re-implementing it, and routes
 through services/friday_hud.spawn_widget() for the HUD channel — FRIDAY
 has no event bus (JARVIS's core/event_bus.py has no equivalent here), so
 "HUD channel" means literally queuing a widget for the next poll, not a
-pub/sub broadcast.
+pub/sub broadcast. Email/SMS reuse services/friday_gmail.py and
+services/friday_phone.py the same way — both already no-op cleanly when
+unconfigured, so email/sms need no extra "is this set up" gating here.
 """
 from __future__ import annotations
 import logging
+import os
 from datetime import datetime as _dt
 from enum import IntEnum
 
@@ -53,14 +60,42 @@ def _hud_notify(title: str, message: str, priority: Priority):
         pass
 
 
+def _email(title: str, message: str):
+    # Self-addressed — same convention as scatter.py's EmailDraftNode:
+    # EMAIL_ADDRESS is the boss's own mailbox, used for both reading
+    # (IMAP) and sending (SMTP), so an alert email is FRIDAY mailing the
+    # boss's own inbox, not a third-party address.
+    try:
+        from services.friday_gmail import friday_gmail, GMAIL_USER
+        if not GMAIL_USER:
+            return
+        friday_gmail.send_email(to=GMAIL_USER, subject=f"FRIDAY: {title}", body=message)
+    except Exception as e:
+        log.warning("Email notify failed: %s", e)
+
+
+def _sms(title: str, message: str):
+    try:
+        from services.friday_phone import friday_phone
+        to_number = os.environ.get("MY_PHONE_NUMBER", "")
+        if not to_number:
+            return
+        friday_phone.send_sms(to_number, f"{title}: {message}"[:1500])
+    except Exception as e:
+        log.warning("SMS notify failed: %s", e)
+
+
 def notify(title: str, message: str, priority: Priority = Priority.INFO, channels: list[str] | None = None,
            retry: int | None = None, expire: int | None = None):
     """Send a notification to all configured channels.
 
-    channels: subset of ["pushover", "hud"] — defaults to both. Pushover
-    only actually fires at priority >= HIGH (matches Pushover's own free-tier
-    good manners — you don't want a push notification for every INFO event);
-    HUD always queues regardless of priority, since it's local and free.
+    channels: subset of ["pushover", "hud", "email", "sms"] — defaults to
+    all four. Pushover/email/SMS only actually fire at priority >= HIGH
+    (matches Pushover's own free-tier good manners — you don't want a
+    text for every INFO event); HUD always queues regardless of priority,
+    since it's local and free. Email/SMS silently no-op if EMAIL_ADDRESS
+    or MY_PHONE_NUMBER/Twilio aren't configured — same "does nothing until
+    set up" convention as everywhere else optional in this repo.
 
     retry/expire only apply at CRITICAL (Pushover's own emergency-priority
     retry-until-acked mechanism) — passed through to
@@ -68,15 +103,20 @@ def notify(title: str, message: str, priority: Priority = Priority.INFO, channel
     (60s/1800s) when not given.
     """
     if channels is None:
-        channels = ["pushover", "hud"]
+        channels = ["pushover", "hud", "email", "sms"]
 
     log.info("[NOTIFY][%s] %s — %s", priority.name, title, message)
 
     if "hud" in channels:
         _hud_notify(title, message, priority)
 
-    if priority >= Priority.HIGH and "pushover" in channels:
-        _pushover(title, message, priority, retry, expire)
+    if priority >= Priority.HIGH:
+        if "pushover" in channels:
+            _pushover(title, message, priority, retry, expire)
+        if "email" in channels:
+            _email(title, message)
+        if "sms" in channels:
+            _sms(title, message)
 
 
 def info(title: str, msg: str):     notify(title, msg, Priority.INFO)
