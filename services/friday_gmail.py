@@ -4,18 +4,50 @@ per-app password mechanism, generated under Google Account -> Security ->
 App Passwords with 2FA enabled). JARVIS_V5's Gmail integration
 (core/tools/gmail.py) uses the same IMAP/app-password mechanism, not
 OAuth2 — two separate repos/deploys, each with its own EMAIL_ADDRESS/
-EMAIL_PASSWORD, not meant to share state."""
+EMAIL_PASSWORD, not meant to share state.
+
+Accepted tradeoff, not an oversight: an app password is full-mailbox
+access (read, send, delete — everything this account can do), with no
+OAuth-style scope limiting (no restricting it to send-only, for
+instance) and no fine-grained revocation beyond regenerating the whole
+password. That's a real difference from OAuth2, and worth knowing if
+EMAIL_PASSWORD ever leaks. What keeps it reasonable for a single-user
+personal deploy: generating one requires 2FA already being enabled on
+the account, it's independently revocable from the actual Google
+password, and it's read from EMAIL_PASSWORD via env var only — never
+committed (.env is gitignored). A full OAuth2 migration would close
+that scope gap, but it's a materially bigger lift (consent screen,
+token storage/refresh, a redirect flow like services/friday_calendar.py
+already has for Google Calendar) for marginal gain here; if this ever
+stops being a single-user deploy, that tradeoff is worth revisiting."""
 import os
+import re
 import json
 import imaplib
+import smtplib
 import email
+from email import encoders
 from email.header import decode_header
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from pathlib import Path
 
 GMAIL_USER = os.getenv("EMAIL_ADDRESS", "")
 GMAIL_PASS = os.getenv("EMAIL_PASSWORD", "")
 
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
 
 class FridayGmail:
+
+    def __init__(self):
+        # Set by draft_reply(), consumed (and cleared) by send_draft() —
+        # lets "send it" refer back to whatever FRIDAY last drafted
+        # without the caller having to repeat subject/body/recipient.
+        # In-memory only, like checkin_system's emergency_pending: one
+        # process, one pending draft at a time is all this needs.
+        self._last_draft = {}
 
     def connect(self):
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -78,7 +110,7 @@ class FridayGmail:
 
         return {
             "subject": subject, "from": sender, "body": body,
-            "id": eid.decode(),
+            "id": eid.decode(), "message_id": msg.get("Message-ID", ""),
         }
 
     def summarize_inbox(self) -> str:
@@ -115,9 +147,11 @@ class FridayGmail:
         return urgent
 
     def draft_reply(self, email_subject: str = "", email_from: str = "",
-                    email_body: str = "", instruction: str = "") -> dict:
-        """Draft a reply — FRIDAY writes it, the boss approves before
-        anything actually sends (this never calls send_email() itself)."""
+                    email_body: str = "", instruction: str = "",
+                    message_id: str = "") -> dict:
+        """Draft a reply — FRIDAY writes it, the boss approves before it
+        actually sends. This never sends by itself; approval happens as a
+        separate step (send_draft(), after the boss says "send it")."""
         from core.friday_brain import friday_brain
 
         result = friday_brain.think(
@@ -130,10 +164,110 @@ class FridayGmail:
             f"Keep it concise and clear."
         )
 
-        return {
+        draft = {
             "draft": result["response"], "subject": f"Re: {email_subject}",
             "to": email_from, "ready": True,
+            # Carried through to send_draft() so the actual send threads
+            # onto the original message instead of landing as a new,
+            # unrelated thread in the recipient's inbox.
+            "message_id": message_id,
         }
+        self._last_draft = draft
+        return draft
+
+    def extract_address(self, raw: str) -> str:
+        """Pulls a bare address out of an RFC 2822 'Name <addr>' string
+        (or a plain address, or free text containing one)."""
+        match = _EMAIL_RE.search(raw or "")
+        return match.group(0) if match else ""
+
+    def _resolve_attachment(self, ref: str) -> Path | None:
+        """A local file path, or the id of something already ingested via
+        services/documents.py — either way, callers shouldn't need to
+        know which. Missing on both counts (rather than silently dropping
+        it) becomes a hard error in send_email(): an attachment the boss
+        asked for that quietly never showed up is worse than a failed send."""
+        p = Path(ref)
+        if p.is_file():
+            return p
+        try:
+            from services.documents import get_path
+            doc_path = get_path(ref)
+        except Exception:
+            doc_path = None
+        if doc_path and Path(doc_path).is_file():
+            return Path(doc_path)
+        return None
+
+    def send_email(self, to: str = "", subject: str = "", body: str = "",
+                    in_reply_to: str = "", attachments: list | None = None) -> dict:
+        """Actually sends, via the same SMTP app-password credentials the
+        IMAP side uses. No approval step here — the caller (a "send it"
+        confirmation, or an explicit compose-and-send request) is the
+        approval; this is the action, not another draft."""
+        if not GMAIL_USER or not GMAIL_PASS:
+            return {"ok": False, "error": "Gmail not configured"}
+
+        address = self.extract_address(to)
+        if not address:
+            return {"ok": False, "error": f"'{to}' doesn't look like an email address"}
+        if not (body or "").strip():
+            return {"ok": False, "error": "Nothing to send — the body is empty"}
+
+        files = []
+        for ref in (attachments or []):
+            path = self._resolve_attachment(ref)
+            if not path:
+                return {"ok": False, "error": f"Attachment not found: {ref}"}
+            files.append(path)
+
+        msg = MIMEMultipart()
+        msg["Subject"] = subject or "(no subject)"
+        msg["From"] = GMAIL_USER
+        msg["To"] = address
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = in_reply_to
+        msg.attach(MIMEText(body))
+
+        for path in files:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(path.read_bytes())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{path.name}"')
+            msg.attach(part)
+
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+                smtp.login(GMAIL_USER, GMAIL_PASS)
+                smtp.send_message(msg)
+        except Exception as e:
+            print(f"[FRIDAY Gmail] send failed: {e}")
+            return {"ok": False, "error": str(e)}
+
+        return {
+            "ok": True, "to": address, "subject": msg["Subject"],
+            "attachments": [p.name for p in files],
+        }
+
+    def send_draft(self, to: str = "", body: str = "", attachments: list | None = None) -> dict:
+        """Sends whatever draft_reply() last produced. `to`/`body` let the
+        boss redirect or tweak it in the same breath ("send it to her
+        personal address instead") without redrafting."""
+        if not self._last_draft:
+            return {"ok": False, "error": "Nothing drafted yet, boss"}
+
+        draft = self._last_draft
+        result = self.send_email(
+            to=to or draft.get("to", ""),
+            subject=draft.get("subject", ""),
+            body=body or draft.get("draft", ""),
+            in_reply_to=draft.get("message_id", ""),
+            attachments=attachments,
+        )
+        if result.get("ok"):
+            self._last_draft = {}
+        return result
 
     def find_email(self, search: str = "") -> dict:
         """Finds a specific email to reply to — scoped to the last 20

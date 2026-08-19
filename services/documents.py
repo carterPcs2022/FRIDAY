@@ -164,6 +164,15 @@ def find_in_documents(query: str) -> list[dict]:
     return results
 
 
+def get_path(document_id: str) -> str | None:
+    """Resolves an ingested document's id back to its file path — lets
+    other services (email attachments) reference "the doc I just sent
+    you" by id instead of needing to know or re-pass the original path."""
+    index = _load_index()
+    doc = next((d for d in index if d["id"] == document_id), None)
+    return doc["path"] if doc else None
+
+
 def list_documents() -> list[dict]:
     return [{"id": d["id"], "name": d["name"], "summary": d["summary"][:150],
              "ingested_at": d["ingested_at"]} for d in _load_index()]
