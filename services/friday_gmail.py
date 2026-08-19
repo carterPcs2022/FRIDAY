@@ -4,7 +4,22 @@ per-app password mechanism, generated under Google Account -> Security ->
 App Passwords with 2FA enabled). JARVIS_V5's Gmail integration
 (core/tools/gmail.py) uses the same IMAP/app-password mechanism, not
 OAuth2 — two separate repos/deploys, each with its own EMAIL_ADDRESS/
-EMAIL_PASSWORD, not meant to share state."""
+EMAIL_PASSWORD, not meant to share state.
+
+Accepted tradeoff, not an oversight: an app password is full-mailbox
+access (read, send, delete — everything this account can do), with no
+OAuth-style scope limiting (no restricting it to send-only, for
+instance) and no fine-grained revocation beyond regenerating the whole
+password. That's a real difference from OAuth2, and worth knowing if
+EMAIL_PASSWORD ever leaks. What keeps it reasonable for a single-user
+personal deploy: generating one requires 2FA already being enabled on
+the account, it's independently revocable from the actual Google
+password, and it's read from EMAIL_PASSWORD via env var only — never
+committed (.env is gitignored). A full OAuth2 migration would close
+that scope gap, but it's a materially bigger lift (consent screen,
+token storage/refresh, a redirect flow like services/friday_calendar.py
+already has for Google Calendar) for marginal gain here; if this ever
+stops being a single-user deploy, that tradeoff is worth revisiting."""
 import os
 import re
 import json
