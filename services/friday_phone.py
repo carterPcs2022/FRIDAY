@@ -101,6 +101,22 @@ class FridayPhone:
         client.messages.create(body=f"FRIDAY: {response}", from_=TWILIO_FROM, to=from_number)
         return response
 
+    def send_sms(self, to_number: str, message: str) -> dict:
+        """FRIDAY texts out proactively — distinct from handle_sms(), which
+        only replies to a text that came in. Same Twilio client, opposite
+        direction: this is FRIDAY-initiated, not a response."""
+        if not _twilio_configured():
+            return {"error": "Twilio not configured (TWILIO_ACCOUNT_SID/AUTH_TOKEN/PHONE)"}
+        if not to_number:
+            return {"error": "No destination number provided"}
+        if not (message or "").strip():
+            return {"error": "Nothing to send — the message is empty"}
+
+        from twilio.rest import Client
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        sent = client.messages.create(body=message[:1500], from_=TWILIO_FROM, to=to_number)
+        return {"ok": True, "sid": sent.sid, "to": to_number}
+
     def send_alert_call(self, message: str, to_number: str) -> dict:
         """FRIDAY calls you directly for a critical alert."""
         if not _twilio_configured():

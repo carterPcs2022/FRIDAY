@@ -816,6 +816,18 @@ CALL_TRIGGERS = [
     "call ", "dial ", "call up ", "give a call", "reach out to ",
 ]
 
+# Unlike CALL_TRIGGERS (which just hands the HUD an "action": "call" for
+# the device's own dialer), this fires a real, billable Twilio SMS
+# straight from command() — so it's kept to explicit "text"-as-verb
+# phrasing rather than CALL_TRIGGERS' broader "call "/"dial " style. A
+# false match here still can't send anything real unless the recipient
+# resolves to an actual number (MY_PHONE_NUMBER for "text me", or a
+# contact with a stored phone) — see the SMS_TRIGGERS handler below.
+SMS_TRIGGERS = [
+    "text me", "send me a text", "send a text to",
+    "shoot a text to", "text ",
+]
+
 # "what did i miss" moved to CATCHUP_TRIGGERS below — that feature's
 # response already folds in unread email count alongside news/tasks/
 # people, so it's a strict superset of what this email-only trigger
@@ -1683,6 +1695,47 @@ def command():
                 "contact": name, "mode": "call_initiation",
             })
 
+        # ── FRIDAY sends a real text (Twilio) ────────────────────────────────
+        if any(t in p_lower for t in SMS_TRIGGERS) and friday_brain:
+            from services.friday_phone import friday_phone
+            import re as rex
+            extract = friday_brain.think(
+                f"From this: '{prompt}'\n"
+                f"Extract who to text and what to say. If it's addressed "
+                f"to the boss themself ('text me'), use \"me\" for 'to'.\n"
+                f'JSON: {{"to": str, "message": str}}'
+            )
+            try:
+                clean = rex.sub(r"```json|```", "", extract["response"]).strip()
+                data = json.loads(clean)
+                to = data.get("to", "")
+                message = data.get("message", "")
+            except Exception:
+                to, message = "", ""
+
+            if to.strip().lower() == "me":
+                number = os.environ.get("MY_PHONE_NUMBER", "")
+            else:
+                contact = friday_contacts.find_by_name(to) if friday_contacts else {}
+                number = contact.get("phone", "")
+
+            if not number or not message:
+                response = (
+                    "I don't have a number for that, boss — add one with "
+                    "'add contact' first, or tell me what to say."
+                    if not number else "What should it say, boss?"
+                )
+                _log(prompt, response, "sms_send")
+                return jsonify({"response": response, "mode": "sms_send"})
+
+            result = friday_phone.send_sms(number, message)
+            if result.get("ok"):
+                response = "Sent, boss."
+            else:
+                response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
+            _log(prompt, response, "sms_send")
+            return jsonify({"response": response, "mode": "sms_send", **result})
+
         # ── Catch-up brief ────────────────────────────────────────────────────
         if any(t in p_lower for t in CATCHUP_TRIGGERS) and friday_brain:
             import concurrent.futures
@@ -2090,6 +2143,7 @@ def command():
                 draft_result = friday_gmail.draft_reply(
                     email_subject=found.get("subject", ""), email_from=found.get("from", ""),
                     email_body=found.get("body", ""), instruction=instruction,
+                    message_id=found.get("message_id", ""),
                 )
                 draft = draft_result.get("draft", "")
                 response = (
@@ -2134,12 +2188,18 @@ def command():
                 to, subject, body = "", "", ""
 
             if not friday_gmail.extract_address(to):
-                # No bare address in the prompt or the extraction — fall
-                # back to matching it against a recent sender by name, the
-                # same lookup the reply-draft flow uses.
-                found = friday_gmail.find_email(to)
-                if found:
-                    to = found.get("from", "")
+                # No bare address in the prompt or the extraction — try
+                # the contact book first (a name FRIDAY actually has an
+                # address for), then fall back to matching it against a
+                # recent inbox sender by name, the same lookup the
+                # reply-draft flow uses.
+                contact = friday_contacts.find_by_name(to) if friday_contacts else {}
+                if contact.get("email"):
+                    to = contact["email"]
+                else:
+                    found = friday_gmail.find_email(to)
+                    if found:
+                        to = found.get("from", "")
 
             if not to or not body:
                 response = "Who's it going to, and what should it say, boss?"
@@ -2829,6 +2889,24 @@ def friday_phone_alert():
     return jsonify(friday_phone.send_alert_call(message, to_number))
 
 
+@app.route("/friday/phone/text", methods=["POST"])
+def friday_phone_text():
+    """FRIDAY sends a real text, not a webhook reply — 'text me Y' or
+    'text [contact] Y'. Same billable-action IP screening as /phone/alert;
+    an outbound SMS costs real money same as a real call."""
+    from services.friday_phone import friday_phone
+    if SECURITY_OK:
+        screen = friday_security.screen_request(friday_security.client_ip(request), "phone text")
+        if screen.get("blocked"):
+            return jsonify({"error": "Request blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    to_number = data.get("to") or os.environ.get("MY_PHONE_NUMBER", "")
+    message = data.get("message", "")
+    if not to_number or not message:
+        return jsonify({"error": "Both 'to' and 'message' are required"}), 400
+    return jsonify(friday_phone.send_sms(to_number, message))
+
+
 # ── Phone (Pushcut — calls from the boss's own real number) ──────────────────
 # Not Twilio: remotely runs a Shortcut on his own iPhone via Pushcut's
 # Automation Server, so the call genuinely comes from his real number.
@@ -3221,7 +3299,10 @@ def contacts_add():
     name = data.get("name", "").strip()
     if not name:
         return jsonify({"error": "name required"}), 400
-    return jsonify(friday_contacts.add_contact(name, data.get("relationship", "neutral"), data.get("notes", "")))
+    return jsonify(friday_contacts.add_contact(
+        name, data.get("relationship", "neutral"), data.get("notes", ""),
+        email=data.get("email", ""), phone=data.get("phone", ""),
+    ))
 
 
 @app.route("/friday/contacts/<name>")
@@ -3480,6 +3561,7 @@ def email_draft():
     return jsonify(friday_gmail.draft_reply(
         email_subject=data.get("subject", ""), email_from=data.get("from", ""),
         email_body=data.get("body", ""), instruction=data.get("instruction", ""),
+        message_id=data.get("message_id", ""),
     ))
 
 
@@ -3502,10 +3584,14 @@ def email_send():
     to = data.get("to", "")
     subject = data.get("subject", "")
     body = data.get("body", "")
+    attachments = data.get("attachments") or None
     if to or body:
-        result = friday_gmail.send_email(to=to, subject=subject, body=body)
+        result = friday_gmail.send_email(
+            to=to, subject=subject, body=body,
+            in_reply_to=data.get("in_reply_to", ""), attachments=attachments,
+        )
     else:
-        result = friday_gmail.send_draft(to=to, body=body)
+        result = friday_gmail.send_draft(to=to, body=body, attachments=attachments)
     return jsonify(result), (200 if result.get("ok") else 400)
 
 

@@ -11,8 +11,12 @@ import json
 import imaplib
 import smtplib
 import email
+from email import encoders
 from email.header import decode_header
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from pathlib import Path
 
 GMAIL_USER = os.getenv("EMAIL_ADDRESS", "")
 GMAIL_PASS = os.getenv("EMAIL_PASSWORD", "")
@@ -91,7 +95,7 @@ class FridayGmail:
 
         return {
             "subject": subject, "from": sender, "body": body,
-            "id": eid.decode(),
+            "id": eid.decode(), "message_id": msg.get("Message-ID", ""),
         }
 
     def summarize_inbox(self) -> str:
@@ -128,7 +132,8 @@ class FridayGmail:
         return urgent
 
     def draft_reply(self, email_subject: str = "", email_from: str = "",
-                    email_body: str = "", instruction: str = "") -> dict:
+                    email_body: str = "", instruction: str = "",
+                    message_id: str = "") -> dict:
         """Draft a reply — FRIDAY writes it, the boss approves before it
         actually sends. This never sends by itself; approval happens as a
         separate step (send_draft(), after the boss says "send it")."""
@@ -147,6 +152,10 @@ class FridayGmail:
         draft = {
             "draft": result["response"], "subject": f"Re: {email_subject}",
             "to": email_from, "ready": True,
+            # Carried through to send_draft() so the actual send threads
+            # onto the original message instead of landing as a new,
+            # unrelated thread in the recipient's inbox.
+            "message_id": message_id,
         }
         self._last_draft = draft
         return draft
@@ -157,7 +166,26 @@ class FridayGmail:
         match = _EMAIL_RE.search(raw or "")
         return match.group(0) if match else ""
 
-    def send_email(self, to: str = "", subject: str = "", body: str = "") -> dict:
+    def _resolve_attachment(self, ref: str) -> Path | None:
+        """A local file path, or the id of something already ingested via
+        services/documents.py — either way, callers shouldn't need to
+        know which. Missing on both counts (rather than silently dropping
+        it) becomes a hard error in send_email(): an attachment the boss
+        asked for that quietly never showed up is worse than a failed send."""
+        p = Path(ref)
+        if p.is_file():
+            return p
+        try:
+            from services.documents import get_path
+            doc_path = get_path(ref)
+        except Exception:
+            doc_path = None
+        if doc_path and Path(doc_path).is_file():
+            return Path(doc_path)
+        return None
+
+    def send_email(self, to: str = "", subject: str = "", body: str = "",
+                    in_reply_to: str = "", attachments: list | None = None) -> dict:
         """Actually sends, via the same SMTP app-password credentials the
         IMAP side uses. No approval step here — the caller (a "send it"
         confirmation, or an explicit compose-and-send request) is the
@@ -171,10 +199,28 @@ class FridayGmail:
         if not (body or "").strip():
             return {"ok": False, "error": "Nothing to send — the body is empty"}
 
-        msg = MIMEText(body)
+        files = []
+        for ref in (attachments or []):
+            path = self._resolve_attachment(ref)
+            if not path:
+                return {"ok": False, "error": f"Attachment not found: {ref}"}
+            files.append(path)
+
+        msg = MIMEMultipart()
         msg["Subject"] = subject or "(no subject)"
         msg["From"] = GMAIL_USER
         msg["To"] = address
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = in_reply_to
+        msg.attach(MIMEText(body))
+
+        for path in files:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(path.read_bytes())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{path.name}"')
+            msg.attach(part)
 
         try:
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
@@ -184,9 +230,12 @@ class FridayGmail:
             print(f"[FRIDAY Gmail] send failed: {e}")
             return {"ok": False, "error": str(e)}
 
-        return {"ok": True, "to": address, "subject": msg["Subject"]}
+        return {
+            "ok": True, "to": address, "subject": msg["Subject"],
+            "attachments": [p.name for p in files],
+        }
 
-    def send_draft(self, to: str = "", body: str = "") -> dict:
+    def send_draft(self, to: str = "", body: str = "", attachments: list | None = None) -> dict:
         """Sends whatever draft_reply() last produced. `to`/`body` let the
         boss redirect or tweak it in the same breath ("send it to her
         personal address instead") without redrafting."""
@@ -198,6 +247,8 @@ class FridayGmail:
             to=to or draft.get("to", ""),
             subject=draft.get("subject", ""),
             body=body or draft.get("draft", ""),
+            in_reply_to=draft.get("message_id", ""),
+            attachments=attachments,
         )
         if result.get("ok"):
             self._last_draft = {}

@@ -16,15 +16,40 @@ RELATIONSHIP_COLORS = {
 
 class FridayContacts:
 
-    def add_contact(self, name: str, relationship: str = "neutral", notes: str = "") -> dict:
+    def add_contact(self, name: str, relationship: str = "neutral", notes: str = "",
+                     email: str = "", phone: str = "") -> dict:
         contacts = self._load()
+        existing = contacts.get(name, {})
         contacts[name] = {
             "name": name, "relationship": relationship,
             "color": RELATIONSHIP_COLORS.get(relationship, "#ffaa00"),
-            "notes": notes, "added": datetime.now().isoformat(), "last_seen": None,
+            "notes": notes,
+            # Re-adding a known contact (e.g. to set their email later)
+            # shouldn't blank out an address that was set separately —
+            # only overwrite when the caller actually passed a new one.
+            "email": email or existing.get("email", ""),
+            "phone": phone or existing.get("phone", ""),
+            "added": existing.get("added") or datetime.now().isoformat(),
+            "last_seen": existing.get("last_seen"),
         }
         self._save(contacts)
         return contacts[name]
+
+    def find_by_name(self, query: str) -> dict:
+        """Resolves a name/nickname to a stored contact — exact key match
+        first, then substring, so "email pepper" finds a contact stored
+        as "Pepper Potts". Returns {} if nothing matches, same shape as a
+        miss in every other lookup here (find_email, get_intel)."""
+        if not query:
+            return {}
+        contacts = self._load()
+        if query in contacts:
+            return contacts[query]
+        q_low = query.lower()
+        for name, contact in contacts.items():
+            if q_low in name.lower():
+                return contact
+        return {}
 
     def get_intel(self, name: str) -> dict:
         """Quick, grounded brief — only reasons over what's actually
