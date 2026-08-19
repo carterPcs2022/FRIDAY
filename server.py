@@ -94,8 +94,12 @@ def login():
     next_path = request.args.get("next", "/hud")
     # "//evil.com" passes a bare startswith("/") check but browsers treat
     # it as a protocol-relative external URL — the actual open-redirect
-    # shape to guard against, not just a non-leading-slash value.
-    if not next_path.startswith("/") or next_path.startswith("//"):
+    # shape to guard against, not just a non-leading-slash value. Checking
+    # the backslash-normalized path (not next_path itself) closes the
+    # same bypass via "/\evil.com": WHATWG URL parsing treats \ as / for
+    # http(s) links, so browsers resolve that identically to "//evil.com"
+    # even though the raw string only has one leading slash.
+    if not next_path.startswith("/") or next_path.replace("\\", "/").startswith("//"):
         next_path = "/hud"
 
     if request.method == "GET":
@@ -166,11 +170,17 @@ def _ensure_memory():
             logging.warning(f"Failed to ensure directory '{name}': {e}")
 
 
-_ensure_memory()
 # ── Shared state (see core/app_state.py) ──────────────────────────────────
 from core.app_state import *  # noqa: F401,F403 -- see core/app_state.py's
 # docstring: /command and this file's own startup/background-thread code
 # below reference these exact names unchanged from before the blueprint split.
+
+# _ensure_memory() needs BASE_DIR, which now lives in core.app_state --
+# must run after the star-import above, not before it. Calling it before
+# BASE_DIR exists doesn't raise visibly: the NameError is caught by this
+# function's own try/except and only shows up as a logged warning, so
+# every directory here would silently never get created.
+_ensure_memory()
 
 # ── Blueprints (see routes/*.py) ────────────────────────────────────────────
 from routes.voice_vision import voice_vision_bp

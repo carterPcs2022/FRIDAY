@@ -58,7 +58,14 @@ def email_send():
     subject = data.get("subject", "")
     body = data.get("body", "")
     attachments = data.get("attachments") or None
-    if to or body:
+    # Both fields present -> a fully-specified new email, sent directly.
+    # Anything less (neither, or just one) -> send_draft(), which fills in
+    # whatever's missing from the pending draft -- that's what lets a
+    # caller redirect ("to" only) or tweak ("body" only) the draft without
+    # re-specifying the whole thing. `to or body` here would wrongly send
+    # a partial override straight to send_email(), which then fails on
+    # the half that was never supplied instead of falling back to the draft.
+    if to and body:
         result = friday_gmail.send_email(
             to=to, subject=subject, body=body,
             in_reply_to=data.get("in_reply_to", ""), attachments=attachments,

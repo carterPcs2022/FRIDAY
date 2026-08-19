@@ -44,6 +44,15 @@ class HulkBuster:
             try:
                 from services.friday_security import friday_security
                 friday_security._blocked_ips.add(ip)
+                # Without this, a manually-triggered deploy (the
+                # /friday/hulkbuster/deploy route, or core/veronica.py
+                # detecting a tampered security file) only blocks the IP
+                # for as long as this process stays up -- the whole point
+                # of friday_security's Turso-backed persistence was that a
+                # HulkBuster block survives a redeploy, not just the
+                # automatic 3-threats escalation path that already calls
+                # this correctly via friday_security._maybe_escalate().
+                friday_security._persist_block(ip, f"hulkbuster: {reason}")
                 blocked = True
             except Exception:
                 pass
