@@ -1,14 +1,23 @@
 """services/friday_news.py — personalized brief over core.tools.web's
 DuckDuckGo search. Honest about the source: Instant-Answer results, not a
 real news wire, so coverage of breaking stories will often be thin."""
+import os
 import json
 from pathlib import Path
 
 INTERESTS_FILE = Path("memory/friday_interests.json")
+
+# FRIDAY_NEWS_INTERESTS overrides the built-in default list — comma-
+# separated, e.g. "AI,robotics,SpaceX". Only the seed default; once
+# add_interest()/_save_interests() has written memory/friday_interests.json,
+# that file wins on every subsequent read (same as before this existed).
+_DEFAULT_INTERESTS_FALLBACK = (
+    "artificial intelligence,Iron Man technology,exoskeleton,"
+    "wearable tech,robotics,Anthropic,tech startups,SpaceX"
+)
 DEFAULT_INTERESTS = [
-    "artificial intelligence", "Iron Man technology",
-    "exoskeleton", "wearable tech", "robotics",
-    "Anthropic", "tech startups", "SpaceX",
+    t.strip() for t in os.getenv("FRIDAY_NEWS_INTERESTS", _DEFAULT_INTERESTS_FALLBACK).split(",")
+    if t.strip()
 ]
 
 
