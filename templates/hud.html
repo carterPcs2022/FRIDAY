@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F.R.I.D.A.Y</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/hud.css') }}">
+</head>
+<body>
+
+
+<div class="particles" id="particles"></div>
+<canvas id="friday-face" width="220" height="220"></canvas>
+
+<!-- HELMET VIEW — first-person HUD overlay. Every readout below reflects
+     something FRIDAY actually tracks (security/lockdown/protocol state) —
+     no decorative flight-HUD placeholders that never update. -->
+<canvas id="reticle-overlay" width="680" height="680"
+  style="position:fixed;top:50%;left:50%;
+  transform:translate(-50%,-50%);
+  opacity:0.35;pointer-events:none;z-index:1;
+  mix-blend-mode:screen">
+</canvas>
+
+<div id="hud-edge-strip" style="position:fixed;top:80px;left:20px;right:20px;
+  display:flex;justify-content:space-between;
+  pointer-events:none;z-index:2;opacity:0.7">
+  <div style="font-size:9px;color:var(--hud-glow, rgba(72,202,228,0.7));
+    letter-spacing:1px;font-family:'Courier New'">
+    <div>RANGE: <span id="hud-range">---</span></div>
+    <div>THREATS: <span id="hud-threats">0</span></div>
+  </div>
+  <div style="font-size:9px;color:var(--hud-glow, rgba(72,202,228,0.7));
+    letter-spacing:1px;text-align:right;
+    font-family:'Courier New'">
+    <div>LOCK: <span id="hud-lock">CLEAR</span></div>
+    <div>PWR: <span id="hud-pwr">---</span></div>
+  </div>
+</div>
+
+<canvas id="corner-radar-friday" width="80" height="80"
+  style="position:fixed;bottom:100px;left:20px;
+  opacity:0.5;pointer-events:none;z-index:2">
+</canvas>
+<div class="widget-stage" id="widget-stage"></div>
+<div class="cov-banner" id="cov-banner">COVERAGE MODE - JARVIS OFFLINE</div>
+<div class="backdrop" id="backdrop" onclick="closeAll()"></div>
+
+<!-- LEFT PANEL - Systems -->
+<div class="slide-panel panel-left" id="panel-left">
+  <div class="panel-header">
+    <div class="panel-title">SYSTEMS</div>
+    <button class="panel-close" onclick="toggleLeft()">&times;</button>
+  </div>
+  <div class="panel-content">
+
+    <div class="p-section">
+      <div class="p-section-title">DIAGNOSTICS</div>
+      <div class="stat-card">
+        <div class="stat-card-header"><span class="stat-card-label">CPU</span><span class="stat-card-value bright" id="p-cpu">-%</span></div>
+        <div class="stat-bar"><div class="stat-bar-fill" id="p-cpu-bar" style="width:0%"></div></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-header"><span class="stat-card-label">MEMORY</span><span class="stat-card-value" id="p-ram">-%</span></div>
+        <div class="stat-bar"><div class="stat-bar-fill" id="p-ram-bar" style="width:0%"></div></div>
+      </div>
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">STATUS</div>
+      <div class="info-row"><span class="info-label">UPTIME</span><span class="info-val bright" id="p-uptime">-</span></div>
+      <div class="info-row"><span class="info-label">JARVIS</span><span class="info-val" id="p-jarvis">-</span></div>
+      <div class="info-row"><span class="info-label">COVERAGE</span><span class="info-val" id="p-coverage">STANDBY</span></div>
+      <div class="info-row"><span class="info-label">MODE</span><span class="info-val bright" id="p-mode">NORMAL</span></div>
+      <div class="info-row"><span class="info-label">API CALLS</span><span class="info-val" id="p-calls">-</span></div>
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">SECURITY</div>
+      <div class="info-row"><span class="info-label">THREATS</span><span class="info-val danger" id="p-threats">0</span></div>
+      <div class="info-row"><span class="info-label">BLOCKED IPS</span><span class="info-val warn" id="p-blocked">0</span></div>
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">VERONICA</div>
+      <div class="veronica-grid">
+        <div class="ver-card"><div class="ver-card-val" id="v-backed">-</div><div class="ver-card-label">BACKED UP</div></div>
+        <div class="ver-card"><div class="ver-card-val" id="v-repairs">0</div><div class="ver-card-label">REPAIRS</div></div>
+      </div>
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">VOICE MODE</div>
+      <div class="mode-grid">
+        <button class="mode-btn active" onclick="setMode('normal')">NORMAL</button>
+        <button class="mode-btn" onclick="setMode('focused')">FOCUSED</button>
+        <button class="mode-btn" onclick="setMode('support')">SUPPORT</button>
+        <button class="mode-btn" onclick="setMode('coverage')">COVERAGE</button>
+      </div>
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">TRAINING WHEELS</div>
+      <div class="stat-card">
+        <div class="stat-card-header"><span class="stat-card-label">TRUST TIER</span><span class="stat-card-value bright" id="trust-tier">-</span></div>
+        <div class="stat-bar"><div class="stat-bar-fill" id="trust-bar" style="width:0%"></div></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- RIGHT PANEL - Intelligence -->
+<div class="slide-panel panel-right" id="panel-right">
+  <div class="panel-header">
+    <div class="panel-title">INTELLIGENCE</div>
+    <button class="panel-close" onclick="toggleRight()">&times;</button>
+  </div>
+  <div class="panel-content">
+
+    <div class="p-section">
+      <div class="p-section-title">EMOTIONAL TREND</div>
+      <div class="emotion-grid" id="p-emotions"><div class="emotion-badge">NEUTRAL</div></div>
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">TRAINING</div>
+      <div class="info-row"><span class="info-label">FACTS LEARNED</span><span class="info-val bright" id="p-training">-</span></div>
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">PROTOCOLS</div>
+      <div class="protocol-grid">
+        <button class="proto-btn" onclick="runProto(1)">P1 COVERAGE</button>
+        <button class="proto-btn" onclick="runProto(3)">P3 DARK MODE</button>
+        <button class="proto-btn" onclick="runProto(16)">P16 CHECK-IN</button>
+        <button class="proto-btn" onclick="runProto(20)">P20 MORNING</button>
+      </div>
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">QUICK LINKS</div>
+      <div class="info-row"><a href="/friday/veronica/selftest" target="_blank" style="color:var(--bright);text-decoration:none;font-size:11px">Veronica Self-Test -&gt;</a></div>
+      <div class="info-row"><a href="/friday/protocols" target="_blank" style="color:var(--bright);text-decoration:none;font-size:11px">All Protocols -&gt;</a></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- MAIN CHAT SCREEN -->
+<div class="chat-screen">
+
+  <div class="top-bar">
+    <div class="friday-logo">
+      <canvas id="friday-arc" width="32" height="32" style="border-radius:50%;display:block"></canvas>
+      <div class="logo-text-wrap">
+        <div class="logo-name">F.R.I.D.A.Y</div>
+        <div class="logo-version">HOLOGRAPHIC INTERFACE</div>
+      </div>
+    </div>
+
+    <div class="top-pills">
+      <div class="pill online" id="status-pill">ONLINE</div>
+      <div class="pill" id="jarvis-pill">JARVIS -</div>
+      <div class="pill" id="model-pill">NORMAL</div>
+    </div>
+
+    <div class="top-right">
+      <div class="clock-display" id="clock">--:--:--</div>
+      <button class="panel-toggle voice-mode-btn" id="voice-mode-btn" onclick="toggleVoiceMode()" title="Hands-free wake-word listening">VOICE OFF</button>
+      <button class="panel-toggle voice-mode-btn" id="enroll-voice-btn" onclick="enrollVoice()" title="Enroll your voice for speaker verification">&#127908; ENROLL MY VOICE</button>
+      <button class="panel-toggle" id="reset-voice-btn" onclick="resetVoiceEnrollment()" title="Wipe the stored voice profile and start over" style="font-size:9px">Reset &amp; Re-enroll</button>
+      <button class="panel-toggle" onclick="toggleLeft()" title="Systems">&#9881;</button>
+      <button class="panel-toggle" onclick="toggleRight()" title="Intelligence">&#9670;</button>
+      <button id="reticle-toggle-btn" onclick="toggleReticle()"
+        style="padding:4px 12px;border-radius:2px;
+        border:1px solid rgba(72,202,228,0.6);
+        background:transparent;color:#48cae4;
+        font-size:9px;letter-spacing:2px;cursor:pointer">
+        &#9678; HELMET VIEW
+      </button>
+    </div>
+  </div>
+
+  <div class="messages-area" id="messages">
+    <div class="msg-wrap sys">
+      <div class="msg-who">SYSTEM</div>
+      <div class="msg-bubble">F.R.I.D.A.Y online. Ready when you are, boss.</div>
+    </div>
+  </div>
+
+  <div class="input-zone">
+    <div class="quick-actions">
+      <button class="qa-btn" onclick="quickSend('FRIDAY run a morning brief')">Morning Brief</button>
+      <button class="qa-btn" onclick="quickSend('FRIDAY threat assessment')">Threat Scan</button>
+      <button class="qa-btn" onclick="quickSend('What is your status')">Status</button>
+    </div>
+
+    <div class="input-row">
+      <input class="chat-inp" id="chat-inp" placeholder="Say 'FRIDAY' or type here, boss..."
+             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}">
+      <input type="file" id="vision-file" accept="image/*" style="display:none" onchange="uploadVisionImage(event)">
+      <button class="mic-btn" id="vision-btn" onclick="document.getElementById('vision-file').click()" title="Show FRIDAY something (chat description)">&#128206;</button>
+      <input type="file" id="identify-file" accept="image/*" style="display:none" onchange="uploadIdentifyImage(event)">
+      <button class="mic-btn" id="identify-btn" onclick="document.getElementById('identify-file').click()" title="Quick identify (spawns an AR widget)">&#128065;</button>
+      <button class="mic-btn" id="mic-btn" onclick="toggleMic()">&#127908;</button>
+      <button class="send-btn" onclick="send()">&#9654;</button>
+    </div>
+    <div class="voice-hint" id="voice-hint" style="display:none;">Listening for "FRIDAY" — say the wake word, then your command.</div>
+  </div>
+
+</div>
+
+<button class="status-orb" onclick="toggleLeft()" title="System status">
+  <div class="status-orb-dot" id="status-orb-dot"></div>
+</button>
+
+<button class="mute-float" id="mute-float" onclick="toggleMute()" title="Mute voice">&#128266;</button>
+
+
+<script src="{{ url_for('static', filename='js/hud.js') }}"></script>
+<script src="{{ url_for('static', filename='js/hud_reticle.js') }}"></script>
+</body>
+</html>

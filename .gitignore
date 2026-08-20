@@ -2,7 +2,14 @@
 .DS_Store
 __pycache__/
 memory/
-static/
+# Runtime-generated files (voice output, etc.) live directly under
+# static/ -- but static/css and static/js hold real source (the HUD
+# page's stylesheet/scripts), so those are tracked.
+static/*
+!static/css/
+!static/css/**
+!static/js/
+!static/js/**
 budget.json
 logs/
 veronica_backups/
