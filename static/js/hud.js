@@ -118,15 +118,18 @@ function playAudio(file) {
   currentAudio.addEventListener('play', () => {
     if (window.onFridaySpeak) window.onFridaySpeak();
     if (window.onFridaySpeakFace) window.onFridaySpeakFace();
+    startBargeInWatch();
   });
   currentAudio.addEventListener('ended', () => {
     if (window.onFridayDone) window.onFridayDone();
     if (window.onFridayDoneFace) window.onFridayDoneFace();
+    stopBargeInWatch();
     openConversationWindow();
   });
   currentAudio.addEventListener('pause', () => {
     if (window.onFridayDone) window.onFridayDone();
     if (window.onFridayDoneFace) window.onFridayDoneFace();
+    stopBargeInWatch();
   });
   currentAudio.play().catch(() => {});
 }
@@ -222,6 +225,163 @@ let commandChunks = [];
 let silenceTimer = null;
 let awaitingCommand = false;
 
+// ── Voice Activity Detection (VAD) ──────────────────────────────────────────
+// Two things this adds on top of the wake-word flow above:
+//  1. Real end-of-command detection during capture, replacing the old fixed
+//     resetSilenceTimer() timeout -- that timer fired once at a hardcoded
+//     delay regardless of whether the boss was still mid-sentence, so any
+//     command that took longer than ~2.5s to say got cut off. VAD instead
+//     watches actual mic volume and only stops once real trailing silence
+//     follows detected speech (falls back to the old fixed timer on
+//     browsers without Web Audio support).
+//  2. True barge-in: speaking over FRIDAY while she's talking interrupts
+//     her immediately, without repeating the wake word first (extending
+//     the existing "wake word mid-response interrupts" behavior in
+//     beginCommandCapture() to "just start talking" too).
+// Untestable end-to-end in a sandbox with no mic/speakers -- verified here
+// only as far as syntax validity and the fallback path when Web Audio is
+// unavailable. Needs real hands-on tuning of the threshold constants below
+// against an actual mic/room before relying on it.
+const VAD_SPEECH_THRESHOLD = 0.045;   // RMS 0..1 -- above this counts as voice, not room noise
+const VAD_SPEECH_SUSTAIN_MS = 150;    // must stay above threshold this long (debounces clicks/pops)
+const VAD_TRAILING_SILENCE_MS = 900;  // real silence after speech = utterance done
+const VAD_MAX_CAPTURE_MS = 20000;     // hard cap so a stuck-open mic can't record forever
+const VAD_BARGE_SUSTAIN_MS = 200;     // slightly longer than speech-start, to avoid a stray
+                                       // noise cutting FRIDAY off mid-sentence for nothing
+
+let bargeStream = null;      // persistent mic stream, open only while voice mode is on
+let bargeInStop = null;      // active VAD watcher stopper while FRIDAY is speaking
+let commandVadStop = null;   // active VAD watcher stopper during command capture
+
+function getAudioContextClass() {
+  return window.AudioContext || window.webkitAudioContext || null;
+}
+
+function rmsVolume(analyser, data) {
+  analyser.getByteTimeDomainData(data);
+  let sumSquares = 0;
+  for (let i = 0; i < data.length; i++) {
+    const norm = (data[i] - 128) / 128;
+    sumSquares += norm * norm;
+  }
+  return Math.sqrt(sumSquares / data.length);
+}
+
+// Watches `stream` for voice activity. Calls onSpeechStart() once, the
+// first time volume stays above `threshold` for `sustainMs`. If
+// `silenceMs` is set, once speech has started, `silenceMs` of continuous
+// quiet afterward calls onSilence() and stops. If `noSpeechTimeoutMs` is
+// set, giving up on speech ever starting (still silent after that long)
+// also calls onSilence() and stops. `maxMs`, if set, is a hard cap on
+// total watch time regardless of activity. Returns a stop() function for
+// external/early cancellation (which does NOT call onSilence -- that's
+// only for the watcher's own natural end conditions).
+function watchVoiceActivity(stream, opts) {
+  const AC = getAudioContextClass();
+  if (!AC || !stream) return null;
+  const { threshold, sustainMs, silenceMs, noSpeechTimeoutMs, maxMs, onSpeechStart, onSilence } = opts;
+
+  let ctx;
+  try { ctx = new AC(); } catch (e) { return null; }
+  const source = ctx.createMediaStreamSource(stream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  source.connect(analyser);
+  const data = new Uint8Array(analyser.fftSize);
+
+  let aboveSince = null;
+  let belowSince = null;
+  let speechStarted = false;
+  let rafId = null;
+  const startedAt = Date.now();
+
+  function teardown() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    try { source.disconnect(); } catch (e) {}
+    try { ctx.close(); } catch (e) {}
+  }
+
+  function finish() {
+    teardown();
+    if (onSilence) onSilence();
+  }
+
+  function loop() {
+    const vol = rmsVolume(analyser, data);
+    const now = Date.now();
+
+    if (maxMs && now - startedAt > maxMs) { finish(); return; }
+    if (!speechStarted && noSpeechTimeoutMs && now - startedAt > noSpeechTimeoutMs) { finish(); return; }
+
+    if (vol >= threshold) {
+      belowSince = null;
+      if (aboveSince === null) aboveSince = now;
+      if (!speechStarted && now - aboveSince >= sustainMs) {
+        speechStarted = true;
+        if (onSpeechStart) onSpeechStart();
+      }
+    } else {
+      aboveSince = null;
+      if (speechStarted && silenceMs) {
+        if (belowSince === null) belowSince = now;
+        if (now - belowSince >= silenceMs) { finish(); return; }
+      }
+    }
+    rafId = requestAnimationFrame(loop);
+  }
+
+  rafId = requestAnimationFrame(loop);
+  return teardown;
+}
+
+// echoCancellation matters more here than anywhere else the mic gets
+// opened: this stream stays live specifically WHILE FRIDAY's own TTS is
+// playing through the speakers, so without it the mic can pick up her own
+// voice and barge-in on itself. Most browsers default this to true
+// already, but it's requested explicitly rather than relied on -- and it
+// still isn't perfect on setups where the mic and speakers are far apart
+// (e.g. external speakers), which is part of why VAD_SPEECH_THRESHOLD /
+// VAD_BARGE_SUSTAIN_MS above are deliberately not hair-trigger.
+const MIC_CONSTRAINTS = { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
+
+async function ensureBargeStream() {
+  if (bargeStream) return bargeStream;
+  try {
+    bargeStream = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
+  } catch (e) {
+    bargeStream = null;
+  }
+  return bargeStream;
+}
+
+function releaseBargeStream() {
+  stopBargeInWatch();
+  if (bargeStream) { bargeStream.getTracks().forEach(t => t.stop()); bargeStream = null; }
+}
+
+// Armed only while FRIDAY's audio is actually playing (see playAudio()) --
+// sustained voice energy during that window means "stop talking, I'm
+// talking to you now," same intent as the existing wake-word interrupt,
+// just without needing the wake word repeated.
+function startBargeInWatch() {
+  if (!voiceModeOn || awaitingCommand || !bargeStream) return;
+  bargeInStop = watchVoiceActivity(bargeStream, {
+    threshold: VAD_SPEECH_THRESHOLD,
+    sustainMs: VAD_BARGE_SUSTAIN_MS,
+    onSpeechStart: () => {
+      stopBargeInWatch();
+      if (currentAudio && !currentAudio.paused) { currentAudio.pause(); currentAudio.currentTime = 0; }
+      try { window.speechSynthesis.cancel(); } catch (e) {}
+      beginCommandCapture(false);
+    },
+  });
+}
+
+function stopBargeInWatch() {
+  if (bargeInStop) { bargeInStop(); bargeInStop = null; }
+}
+
 function getSpeechRecognition() {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 }
@@ -278,8 +438,13 @@ function toggleVoiceMode() {
   btn.textContent = voiceModeOn ? 'VOICE ON' : 'VOICE OFF';
   btn.classList.toggle('on', voiceModeOn);
   document.getElementById('voice-hint').style.display = voiceModeOn ? 'block' : 'none';
-  if (voiceModeOn) startWakeListening();
-  else stopWakeListening();
+  if (voiceModeOn) {
+    startWakeListening();
+    ensureBargeStream(); // best-effort -- barge-in just won't work if this fails
+  } else {
+    stopWakeListening();
+    releaseBargeStream();
+  }
 }
 
 function startWakeListening() {
@@ -340,6 +505,7 @@ function stopWakeListening() {
     try { commandRecorder.stop(); } catch (e) {}
   }
   clearTimeout(silenceTimer);
+  if (commandVadStop) { commandVadStop(); commandVadStop = null; }
 }
 
 async function beginCommandCapture(ambiguous, timeoutMs) {
@@ -362,7 +528,7 @@ async function beginCommandCapture(ambiguous, timeoutMs) {
 
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
   } catch (e) {
     addMsg('sys', 'SYSTEM', "Couldn't access the microphone, boss.");
     showListeningIndicator(false);
@@ -377,6 +543,7 @@ async function beginCommandCapture(ambiguous, timeoutMs) {
   commandRecorder.onstop = async () => {
     stream.getTracks().forEach(t => t.stop());
     clearTimeout(silenceTimer);
+    if (commandVadStop) { commandVadStop(); commandVadStop = null; }
     showListeningIndicator(false);
     const blob = new Blob(commandChunks, { type: 'audio/webm' });
     await sendCommandAudio(blob);
@@ -385,14 +552,32 @@ async function beginCommandCapture(ambiguous, timeoutMs) {
   };
 
   commandRecorder.start();
-  resetSilenceTimer(timeoutMs);
+
+  // Real VAD: keep recording as long as the boss keeps talking, stop
+  // shortly after genuine trailing silence -- not the fixed-length timer
+  // resetSilenceTimer() used to be (see its comment below for why that
+  // was a real bug, not just a simplification). Falls back to the old
+  // fixed timer wherever Web Audio isn't available.
+  commandVadStop = watchVoiceActivity(stream, {
+    threshold: VAD_SPEECH_THRESHOLD,
+    sustainMs: VAD_SPEECH_SUSTAIN_MS,
+    silenceMs: VAD_TRAILING_SILENCE_MS,
+    noSpeechTimeoutMs: timeoutMs || 2500,
+    maxMs: VAD_MAX_CAPTURE_MS,
+    onSilence: () => {
+      if (commandRecorder && commandRecorder.state !== 'inactive') commandRecorder.stop();
+    },
+  });
+  if (!commandVadStop) resetSilenceTimer(timeoutMs);
 }
 
 function resetSilenceTimer(timeoutMs) {
   clearTimeout(silenceTimer);
-  // 2.5s of silence after the wake word = "the command is done" by default
-  // (no reliable cross-browser voice-activity signal to key off of); the
-  // follow-up conversation window below passes a longer timeout instead.
+  // Fallback only, for browsers without Web Audio support -- fixed-length
+  // cutoff regardless of whether the boss is still mid-sentence. Real
+  // capture uses watchVoiceActivity() above instead, which extends the
+  // recording for as long as speech continues and only stops after actual
+  // trailing silence.
   silenceTimer = setTimeout(() => {
     if (commandRecorder && commandRecorder.state !== 'inactive') commandRecorder.stop();
   }, timeoutMs || 2500);
