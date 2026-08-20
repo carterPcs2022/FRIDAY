@@ -1958,22 +1958,41 @@ def command():
                         except Exception:
                             pass
 
-                context = get_context_for(prompt)
+                # Conversation-turn recall (keyword-matched past exchanges)
+                # is the one context source core/memory_hub.py doesn't cover
+                # -- kept as its own lookup here, and deliberately the most
+                # generic signal, so it sits last in the prepend order below.
+                try:
+                    from core.friday_memory import recall as recall_conversations
+                    recalled = recall_conversations(prompt, 3)
+                except Exception:
+                    recalled = []
+                context = f"Recent relevant: {' | '.join(recalled)}" if recalled else ""
+
                 if TRAINING_OK:
                     knowledge = friday_trainer.get_context_brief(prompt)
                     if knowledge:
                         context = "\n".join(filter(None, [knowledge, context]))
-                if WISDOM_OK:
-                    # Prepended, not appended — _build_messages() truncates
-                    # context to its first 500 chars, so query-specific
-                    # relevant history needs to survive that cut ahead of
-                    # the more generic facts/recall context, not after it.
-                    try:
-                        wisdom = get_wisdom_context(prompt)
-                        if wisdom:
-                            context = "\n".join(filter(None, [wisdom, context]))
-                    except Exception as e:
-                        logging.warning(f"Wisdom context lookup failed: {e}")
+
+                # core/memory_hub.py's unified recall() -- facts, notes,
+                # second_brain, continuity's unresolved topics, and (via
+                # services/wisdom.py) decisions/reading/journal, all ranked
+                # together. Replaces the old separate get_context_for()
+                # facts lookup and standalone wisdom lookup that used to
+                # live here -- both were subsets of what this one call
+                # already covers, so calling both was redundant, not
+                # additive. Prepended, not appended — _build_messages()
+                # truncates context to its first 500 chars, so this
+                # query-specific, already-ranked signal needs to survive
+                # that cut ahead of the more generic context above.
+                try:
+                    from core.memory_hub import recall as recall_memory
+                    hits = recall_memory(prompt, limit=5)
+                    if hits:
+                        memory_context = "; ".join(h["text"] for h in hits)
+                        context = "\n".join(filter(None, [memory_context, context]))
+                except Exception as e:
+                    logging.warning(f"Memory hub recall failed: {e}")
 
                 if COVERAGE_MODE:
                     friday_brain.set_voice_mode("coverage")
