@@ -9,7 +9,7 @@ would error at collection if it weren't) — the rest pins the actual
 shape so a future change that drops or duplicates a route fails loudly
 here instead of showing up as a 404 in production.
 """
-KNOWN_ROUTE_COUNT = 159  # routes registered as of the blueprint split
+KNOWN_ROUTE_COUNT = 161  # 159 as of the blueprint split + 2 memory_hub routes (V3 Phase 2)
 
 # A representative sample across every blueprint, not the full 159 --
 # enough to catch "a whole blueprint failed to register" without this
@@ -27,7 +27,7 @@ EXPECTED_PATHS = [
     "/friday/ooda", "/friday/emcon", "/friday/career/resume",
     "/friday/decisions/analyze", "/friday/finance/stock",
     "/friday/legal/analyze", "/friday/tutor/explain", "/friday/plan",
-    "/budget", "/hud",
+    "/budget", "/hud", "/friday/memory/recall", "/friday/memory/remember",
 ]
 
 EXPECTED_BLUEPRINTS = {

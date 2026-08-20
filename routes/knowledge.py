@@ -98,3 +98,30 @@ def code_fix():
     if not friday_code:
         return jsonify({"error": "unavailable"}), 503
     return jsonify(friday_code.fix(data.get("code", ""), data.get("error", "")))
+
+
+@knowledge_bp.route("/friday/memory/recall")
+def memory_recall():
+    """core/memory_hub.py's unified recall -- searches facts, notes,
+    second brain, reading history, journal, decisions, and continuity's
+    unresolved topics in one call, ranked together. Distinct from
+    /friday/brain/recall above, which only ever searched second_brain."""
+    from core.memory_hub import recall
+    query = request.args.get("q", "")
+    if not query:
+        return jsonify({"error": "q required"}), 400
+    return jsonify({"results": recall(query, limit=int(request.args.get("limit", 8)))})
+
+
+@knowledge_bp.route("/friday/memory/remember", methods=["POST"])
+def memory_remember():
+    """core/memory_hub.py's unified write dispatcher -- routes to
+    whichever store's own write method fits `kind` (fact/note/reading/
+    journal/topic/general). See that module's docstring for the mapping."""
+    from core.memory_hub import remember
+    data = request.get_json(silent=True) or {}
+    content = data.get("content", "").strip()
+    if not content:
+        return jsonify({"error": "content required"}), 400
+    kwargs = {k: v for k, v in data.items() if k not in ("content", "kind")}
+    return jsonify(remember(content, kind=data.get("kind", "general"), **kwargs))
