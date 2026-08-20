@@ -31,6 +31,8 @@ from enum import IntEnum
 
 log = logging.getLogger(__name__)
 
+FRIDAY_NAME = os.getenv("FRIDAY_NAME", "FRIDAY")
+
 
 class Priority(IntEnum):
     INFO = 0
@@ -69,7 +71,7 @@ def _email(title: str, message: str):
         from services.friday_gmail import friday_gmail, GMAIL_USER
         if not GMAIL_USER:
             return
-        friday_gmail.send_email(to=GMAIL_USER, subject=f"FRIDAY: {title}", body=message)
+        friday_gmail.send_email(to=GMAIL_USER, subject=f"{FRIDAY_NAME}: {title}", body=message)
     except Exception as e:
         log.warning("Email notify failed: %s", e)
 

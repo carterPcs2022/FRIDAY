@@ -28,6 +28,7 @@ TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM = os.getenv("TWILIO_PHONE", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 _INTERNAL_PORT = os.getenv("PORT", "8080")
+FRIDAY_NAME = os.getenv("FRIDAY_NAME", "FRIDAY")
 
 
 def _twilio_configured() -> bool:
@@ -71,7 +72,7 @@ class FridayPhone:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="Polly.Joanna" rate="95%">
-        Hey, it's FRIDAY. What's up?
+        Hey, it's {FRIDAY_NAME}. What's up?
     </Say>
     <Record action="{PUBLIC_URL}/friday/phone/respond" method="POST"
             maxLength="30" playBeep="false" transcribe="true"
@@ -130,7 +131,7 @@ class FridayPhone:
         call = client.calls.create(
             twiml=f"""<Response>
                 <Say voice="Polly.Joanna" rate="95%">
-                    Boss. FRIDAY here. {clean_msg}
+                    Boss. {FRIDAY_NAME} here. {clean_msg}
                     Call back when you get a chance.
                 </Say>
             </Response>""",

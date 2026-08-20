@@ -137,6 +137,13 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='[FRIDAY] %(message)s')
 
+# Display-only identity — distinct from config/friday_personality.py,
+# which is who FRIDAY *is* (her actual character, baked into every LLM
+# call). These two just control what shows up in status output and the
+# startup log; changing them doesn't touch her personality at all.
+FRIDAY_NAME = os.getenv("FRIDAY_NAME", "FRIDAY")
+FRIDAY_VERSION = os.getenv("FRIDAY_VERSION", "2.0")
+
 
 @app.errorhandler(Exception)
 def _handle_uncaught_error(e):
@@ -869,7 +876,7 @@ if HEALTH_OK:
 @app.route("/")
 def home():
     return jsonify({
-        "status": "FRIDAY V2 ONLINE", "core": CORE_STATUS,
+        "status": f"{FRIDAY_NAME} V{FRIDAY_VERSION} ONLINE", "core": CORE_STATUS,
         "jarvis": "online" if JARVIS_ONLINE else "offline",
         "coverage": COVERAGE_MODE, "uptime": int(time.time() - BOOT_TIME),
     })
@@ -2041,5 +2048,5 @@ def takeover():
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    logging.info(f"FRIDAY V2 starting on port {port}")
+    logging.info(f"{FRIDAY_NAME} V{FRIDAY_VERSION} starting on port {port}")
     app.run(host="0.0.0.0", port=port)

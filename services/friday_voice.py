@@ -18,6 +18,11 @@ STATIC_DIR = BASE_DIR / "static"
 
 # Sarah — warm, conversational. Distinct from JARVIS's deep/formal voice.
 FRIDAY_VOICE_ID = os.getenv("FRIDAY_VOICE_ID", "eQ3MKh19cr7ApgSW5Ob0")
+# A distinct voice specifically for mode="coverage" (JARVIS is offline and
+# FRIDAY has assumed control, per server.py's COVERAGE_MODE) -- a subtle
+# audible signal that she's covering, not her normal voice. Falls back to
+# the normal voice ID if unset, so behavior is unchanged until configured.
+FRIDAY_COVERAGE_VOICE_ID = os.getenv("FRIDAY_COVERAGE_VOICE_ID", FRIDAY_VOICE_ID)
 ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 
 VOICE_SETTINGS = {
@@ -51,9 +56,10 @@ def speak(text: str, mode: str = "normal") -> str | None:
 
     if ELEVENLABS_KEY:
         settings = VOICE_SETTINGS.get(mode, VOICE_SETTINGS["normal"])
+        voice_id = FRIDAY_COVERAGE_VOICE_ID if mode == "coverage" else FRIDAY_VOICE_ID
         try:
             r = httpx.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{FRIDAY_VOICE_ID}",
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
                 json={
                     "text": clean,
                     "model_id": "eleven_turbo_v2",

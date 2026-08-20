@@ -15,8 +15,19 @@ from core.app_state import (
     scatter_engine,
     suit_lockdown,
 )
+from core.permissions import ConfirmationGate
 
 security_bp = Blueprint("security", __name__)
+
+# Unlike Scatter (its own passphrase-bound 2-step) and lockdown
+# (deliberately frictionless -- see core/permissions.py), a manual
+# HulkBuster deploy had no confirmation step at all: one authenticated
+# POST immediately blocked an IP and triggered suit_lockdown. The
+# automatic 3-threats escalation path (friday_security._maybe_escalate())
+# doesn't go through this route at all, so this gate only adds friction
+# to a human deliberately calling the API directly -- not to the
+# automated response.
+_hulkbuster_gate = ConfirmationGate("HulkBuster deployment")
 
 
 @security_bp.route("/friday/lockdown", methods=["POST"])
@@ -35,9 +46,18 @@ def hulkbuster_status():
 
 @security_bp.route("/friday/hulkbuster/deploy", methods=["POST"])
 def hulkbuster_deploy():
+    """Two-step like Scatter: POST without confirm_token gets you a
+    token; POST again with that same token within 10 minutes actually
+    deploys. See _hulkbuster_gate above for why this route specifically
+    gets it and /friday/lockdown deliberately doesn't."""
     if not HULKBUSTER_OK:
         return jsonify({"error": "hulkbuster unavailable"}), 503
     data = request.get_json(silent=True) or {}
+    confirm_token = data.get("confirm_token", "")
+    if not confirm_token:
+        return jsonify(_hulkbuster_gate.request())
+    if not _hulkbuster_gate.confirm(confirm_token):
+        return jsonify({"error": "confirmation missing or expired — request again"}), 400
     return jsonify(hulkbuster.deploy(data.get("reason", "manual"), data.get("ip", "")))
 
 
