@@ -1,0 +1,33 @@
+name: Tests
+
+# Runs on every push and PR against main -- FRIDAY had zero CI before
+# this (see tests/ for why that mattered: four real bugs slipped through
+# a review pass that hand-testing alone didn't catch). No secrets are
+# configured here on purpose: every service in this codebase already
+# degrades to "unconfigured" cleanly when its credentials are absent
+# (see core/config_validator.py), so the test suite runs against that
+# same natural unconfigured state -- exactly what a fresh clone or a
+# contributor's machine has, no real API keys needed in CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -v
