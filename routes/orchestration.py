@@ -3,8 +3,9 @@ monolithic server.py. Registered onto the main Flask app in server.py
 via app.register_blueprint(orchestration_bp); nothing here changes behavior,
 only where the code lives.
 """
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 
+from core.permissions import RiskLevel, risk_for
 from core.app_state import (
     CAPABILITIES_OK,
     CAPABILITY_MAP,
@@ -150,6 +151,26 @@ def list_capabilities():
     if not CAPABILITIES_OK:
         return jsonify({"error": "capabilities unavailable"}), 503
     return jsonify({"triggers": list(CAPABILITY_MAP.keys())})
+
+
+@orchestration_bp.route("/friday/permissions")
+def permissions_status():
+    """Introspects the live route table and classifies every registered
+    route by risk tier (core/permissions.py) -- the actual current
+    classification, not a hand-maintained list that can drift from what's
+    really registered."""
+    by_tier = {level.name: [] for level in RiskLevel}
+    for rule in current_app.url_map.iter_rules():
+        if rule.rule == "/static/<path:filename>":
+            continue
+        tier = risk_for(rule.endpoint, rule.methods - {"HEAD", "OPTIONS"})
+        by_tier[tier.name].append(rule.rule)
+    for paths in by_tier.values():
+        paths.sort()
+    return jsonify({
+        "tiers": by_tier,
+        "counts": {k: len(v) for k, v in by_tier.items()},
+    })
 
 
 @orchestration_bp.route("/friday/trust")
