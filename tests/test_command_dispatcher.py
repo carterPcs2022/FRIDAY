@@ -205,7 +205,24 @@ class TestCommandSmokeAcrossTriggers:
         # otherwise trip the same 30-req/60s limit real traffic would --
         # a real, separately-tested behavior (see test_security.py), not
         # something this dispatcher-ordering test is about.
-        with mock.patch("server.SECURITY_OK", False):
+        #
+        # news_anchor is mocked too: "news"/"catch up" both reach
+        # FridayNewsAnchor.morning_brief(), which does real DuckDuckGo
+        # searches (see services/friday_news.py) -- up to 8 real outbound
+        # requests, several seconds even when they just fail fast. That
+        # made this test slow enough (~3-19s depending on the sandbox's
+        # network timeout behavior) to let the background JARVIS/Groq/
+        # Anthropic connectivity-check thread (core/friday_protocols.py)
+        # complete its first cycle mid-suite and flip friday_protocols.
+        # range_level to DARK -- which made every /command call in every
+        # test running after this one short-circuit through the dark-mode
+        # emergency response instead of reaching friday_brain, breaking
+        # tests/test_command_memory_integration.py's mocks entirely
+        # unrelated to what this test is actually checking (dispatcher
+        # call order, not news content).
+        with mock.patch("server.SECURITY_OK", False), \
+             mock.patch("server.news_anchor") as news:
+            news.morning_brief.return_value = "Nothing new, boss."
             for prompt in self.PROMPTS:
                 resp = _post(client, prompt)
                 assert resp.status_code == 200, f"{prompt!r} -> {resp.status_code}"
