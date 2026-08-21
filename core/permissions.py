@@ -83,6 +83,12 @@ ROUTE_RISK: dict = {
     "security.trigger_lockdown": RiskLevel.DESTRUCTIVE,
     "security.hulkbuster_deploy": RiskLevel.DESTRUCTIVE,
     "security.trigger_scatter": RiskLevel.DESTRUCTIVE,
+    # Writes a self-generated patch to a live core file (server.py,
+    # friday_brain.py, the security files...). Sandbox-tested and
+    # confirm-gated (see core/self_repair.py), but the actual write is
+    # the same "hard to reverse cleanly if wrong" shape as the rest of
+    # this tier.
+    "orchestration.self_repair_confirm": RiskLevel.DESTRUCTIVE,
 
     # -- Recovery actions: same reasoning core/scatter.py already
     # documents for reassemble() staying single-step -- friction here

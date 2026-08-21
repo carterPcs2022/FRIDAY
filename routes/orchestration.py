@@ -11,6 +11,7 @@ from core.app_state import (
     CAPABILITY_MAP,
     CORE_STATUS,
     PROTOCOLS_OK,
+    SELF_REPAIR_OK,
     TRAINING_OK,
     TRAINING_WHEELS_OK,
     VERONICA_OK,
@@ -20,6 +21,7 @@ from core.app_state import (
     friday_remember,
     friday_trainer,
     get_mood_history,
+    self_repair,
     training_wheels,
     veronica,
 )
@@ -144,6 +146,26 @@ def veronica_contain(component):
     if not VERONICA_OK:
         return jsonify({"error": "veronica unavailable"}), 503
     return jsonify(veronica.contain_failing_component(component))
+
+
+# ── Self-repair: diagnose a real logic bug (not file corruption --
+# Veronica already handles that), propose and sandbox-test a minimal fix,
+# then stage it. See core/self_repair.py for why the live file is never
+# touched without a human confirming. ────────────────────────────────────
+
+@orchestration_bp.route("/friday/self_repair/run", methods=["POST"])
+def self_repair_run():
+    if not SELF_REPAIR_OK:
+        return jsonify({"error": "self-repair unavailable"}), 503
+    return jsonify(self_repair.attempt_repair())
+
+
+@orchestration_bp.route("/friday/self_repair/confirm", methods=["POST"])
+def self_repair_confirm():
+    if not SELF_REPAIR_OK:
+        return jsonify({"error": "self-repair unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    return jsonify(self_repair.confirm_repair(data.get("confirm_token")))
 
 
 @orchestration_bp.route("/friday/capabilities")
