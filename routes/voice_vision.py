@@ -163,7 +163,7 @@ def friday_voice_audio():
 @voice_vision_bp.route("/friday/hud/poll")
 def friday_hud_poll():
     """Polled every ~1s by the real /hud page's spawnWidget() system
-    (embedded in FRIDAY_HUD_HTML below). No WebSocket in this Flask
+    (static/js/hud.js). No WebSocket in this Flask
     process, so widgets sit in an in-memory queue until picked up here —
     see services/friday_hud.py. Delivered-once: each widget is returned
     exactly once, to whichever poll happens to catch it."""

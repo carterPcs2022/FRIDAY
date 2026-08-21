@@ -937,6 +937,1043 @@ def status_alias():
 
 # ── Main command endpoint ─────────────────────────────────────────────────────
 
+# ── NLU dispatcher: one function per trigger-check block, called in
+# the exact original order from command() below. Each returns the
+# jsonify(...) response (or (response, status) tuple) if its trigger
+# matched, else None to fall through to the next check. Extracted
+# mechanically from the original inline if-chain -- same behavior,
+# same ordering, just named and callable individually.
+def _cmd_lockdown_locked(prompt):
+    if LOCKDOWN_OK and suit_lockdown.is_locked():
+        if suit_lockdown.try_unlock(prompt):
+            response = "Unlocked. Welcome back, boss."
+            _log(prompt, response, "lockdown_unlock")
+            return jsonify({"response": response, "mode": "lockdown_unlock"})
+        response = "System locked. Provide the passphrase to unlock."
+        _log(prompt, response, "lockdown")
+        return jsonify({"response": response, "mode": "lockdown", "blocked": True})
+
+
+def _cmd_lockdown_trigger(prompt):
+    if LOCKDOWN_OK and any(t in prompt.lower() for t in LOCKDOWN_TRIGGERS):
+        suit_lockdown.activate(reason="voice command")
+        response = "Lockdown active. Standing by."
+        _log(prompt, response, "lockdown_activate")
+        return jsonify({"response": response, "mode": "lockdown_activate"})
+
+
+def _cmd_mayday(prompt):
+    if MAYDAY_PHRASE in prompt.lower():
+        response = "Mayday received. What's happening, boss?"
+        _log(prompt, response, "MAYDAY")
+        try:
+            # CRITICAL -> Pushover priority 2 (emergency) -> notify()'s
+            # _pushover() path -> friday_caps._pushover_alert(), which
+            # applies retry/expire itself for priority 2 — a distress
+            # signal that only pushes once, with no retry-until-acked,
+            # defeats its own purpose if boss's phone is silenced or
+            # out of reach. Same tier as friday_health.py's
+            # critical-vitals alert.
+            from services.notifications import critical
+            critical(
+                "FRIDAY MAYDAY",
+                f"Mayday phrase triggered. Emergency contact on file: {EMERGENCY_CONTACT_PHONE}",
+            )
+        except Exception as e:
+            logging.warning(f"MAYDAY notify failed: {e}")
+        if CHECKIN_OK:
+            try:
+                from services.checkin_system import emergency_pending
+                emergency_pending.set()
+            except Exception:
+                pass
+        audio_file = friday_speak(response) if VOICE_OK else None
+        return jsonify({
+            "response": response, "mode": "MAYDAY",
+            "has_audio": bool(audio_file), "audio_file": audio_file,
+        })
+
+
+def _cmd_safe_checkin(prompt):
+    if any(t in prompt.lower() for t in SAFE_TRIGGERS):
+        response = "Good to hear, boss. Standing down." if CHECKIN_OK else "Glad to hear it, boss."
+        if CHECKIN_OK:
+            checkin_system.confirm_safe()
+        _log(prompt, response, "safe_checkin")
+        return jsonify({"response": response, "mode": "safe_checkin"})
+
+
+def _cmd_security_screen(prompt):
+    if SECURITY_OK:
+        screen = friday_security.screen_request(friday_security.client_ip(request), prompt)
+        if screen.get("blocked"):
+            return jsonify({"response": "Request blocked.", "blocked": True}), 403
+
+
+def _cmd_learn_voice_mode(prompt):
+    try:
+        if voice_memory:
+            voice_memory.analyze_and_learn(prompt)
+            best_mode = voice_memory.get_current_best_mode()
+            if friday_brain and not COVERAGE_MODE:
+                friday_brain.set_voice_mode(best_mode)
+    except Exception:
+        pass
+
+
+def _cmd_dark_mode(prompt):
+    if PROTOCOLS_OK and friday_protocols.range_level == RangeLevel.DARK:
+        response = friday_protocols.emergency_response(prompt)
+        _log(prompt, response, "emergency")
+        return jsonify({"response": response, "mode": "emergency", "range": "dark"})
+
+
+def _cmd_capabilities(prompt):
+    if CAPABILITIES_OK:
+        p_lower = prompt.lower()
+        for trigger, (handler, response_key) in CAPABILITY_MAP.items():
+            if trigger in p_lower:
+                try:
+                    result = handler(prompt)
+                    response = result.get(response_key) or "Done, boss."
+                    audio = friday_speak(response) if VOICE_OK else None
+                    _log(prompt, response, trigger)
+                    return jsonify({
+                        "response": response, "mode": trigger,
+                        "has_audio": bool(audio), "audio_file": audio,
+                    })
+                except Exception as e:
+                    logging.warning(f"Capability '{trigger}' failed: {e}")
+                break
+
+
+def _cmd_news(prompt, p_lower):
+    if ("news" in p_lower or "what's happening" in p_lower) and news_anchor:
+        response = news_anchor.morning_brief()
+        _log(prompt, response, "news")
+        return jsonify({"response": response, "mode": "news"})
+
+
+def _cmd_translate(prompt, p_lower):
+    if "translate" in p_lower and translator:
+        text = p_lower.replace("translate", "").replace("friday", "").strip()
+        result = translator.translate(text)
+        _log(prompt, result["translation"], "translate")
+        return jsonify({"response": result["translation"], "mode": "translate"})
+
+
+def _cmd_code_review(prompt, p_lower):
+    if ("review this code" in p_lower or "fix this code" in p_lower) and friday_code:
+        result = friday_code.quick_review(prompt)
+        _log(prompt, result["review"], "code")
+        return jsonify({"response": result["review"], "mode": "code"})
+
+
+def _cmd_remember_this(prompt, p_lower):
+    if ("remember this" in p_lower or "store this" in p_lower) and second_brain:
+        result = second_brain.ingest(prompt)
+        response = f"Stored: {result['summary']}" if result["summary"] else "Stored, boss."
+        _log(prompt, response, "brain")
+        return jsonify({"response": response, "mode": "brain"})
+
+
+def _cmd_people_brief(prompt, p_lower):
+    if "people brief on " in p_lower and relationships:
+        name = p_lower.split("people brief on ")[-1].strip()
+        result = relationships.get_intel(name)
+        response = result.get("brief") or f"No intel on {name} yet, boss."
+        _log(prompt, response, "intel")
+        return jsonify({"response": response, "mode": "intel"})
+
+
+def _cmd_caller_id(prompt, p_lower):
+    if any(t in p_lower for t in CALLER_TRIGGERS):
+        import re
+        match = re.search(r"(?:call from|calling from|incoming call from)\s+(.+?)(?:\.|$)", p_lower)
+        caller = match.group(1).strip().title() if match else ""
+
+        if not caller:
+            response = "Who's calling, boss?"
+            _log(prompt, response, "caller_id")
+            return jsonify({"response": response, "mode": "caller_id"})
+
+        if relationships and friday_brain:
+            intel = relationships.get_intel(caller)
+            days_since = intel.get("days_since", -1)
+            notes = intel.get("notes", [])
+            context = f"Days since last contact: {days_since}\n" if days_since >= 0 else ""
+            context += f"Notes: {notes[-1] if notes else 'None'}\n"
+            context += f"Brief: {intel.get('brief', '')}"
+
+            result = friday_brain.think(
+                f"Caller ID: {caller}\n{context}\n\n"
+                f"FRIDAY caller announcement. Who they are, last contact if "
+                f"known, answer or skip recommendation. Under 20 words. "
+                f"Natural. FRIDAY style."
+            )
+            response = result["response"] or f"It's {caller}, boss."
+            _log(prompt, response, "caller_id")
+            if VOICE_OK:
+                friday_speak(response)
+            return jsonify({"response": response, "caller": caller, "mode": "caller_id"})
+
+
+def _cmd_call_initiate(prompt, p_lower):
+    if any(t in p_lower for t in CALL_TRIGGERS):
+        import re
+        match = re.search(
+            r"(?:call|dial|call up|reach out to)\s+(.+?)(?:\s+(?:for|about|and|please|now).*)?$",
+            p_lower
+        )
+        name = match.group(1).strip().title() if match else ""
+
+        if not name:
+            response = "Who do you want me to call, boss?"
+            _log(prompt, response, "call")
+            return jsonify({"response": response, "action": None})
+
+        rel_intel = {}
+        if relationships:
+            rel_intel = relationships.get_intel(name)
+
+        brief = ""
+        if friday_brain:
+            notes = rel_intel.get("notes", [])
+            days = rel_intel.get("days_since", -1)
+            brief_result = friday_brain.think(
+                f"Pre-call brief for calling {name}.\n"
+                f"Last contact: {days} days ago.\n"
+                f"Notes: {notes[-2:] if notes else 'None'}\n"
+                f"Context: {rel_intel.get('brief', '')}\n\n"
+                f"One sentence prep brief BEFORE the call. "
+                f"What to know going in. Under 15 words."
+            )
+            brief = brief_result["response"]
+
+        response = f"Calling {name} now, boss. {brief}" if brief else f"Calling {name} now, boss."
+
+        _log(prompt, response, "call")
+        return jsonify({
+            "response": response, "action": "call",
+            "contact": name, "mode": "call_initiation",
+        })
+
+
+def _cmd_sms_send(prompt, p_lower):
+    if any(t in p_lower for t in SMS_TRIGGERS) and friday_brain:
+        from services.friday_phone import friday_phone
+        import re as rex
+        extract = friday_brain.think(
+            f"From this: '{prompt}'\n"
+            f"Extract who to text and what to say. If it's addressed "
+            f"to the boss themself ('text me'), use \"me\" for 'to'.\n"
+            f'JSON: {{"to": str, "message": str}}'
+        )
+        try:
+            clean = rex.sub(r"```json|```", "", extract["response"]).strip()
+            data = json.loads(clean)
+            to = data.get("to", "")
+            message = data.get("message", "")
+        except Exception:
+            to, message = "", ""
+
+        if to.strip().lower() == "me":
+            number = os.environ.get("MY_PHONE_NUMBER", "")
+        else:
+            contact = friday_contacts.find_by_name(to) if friday_contacts else {}
+            number = contact.get("phone", "")
+
+        if not number or not message:
+            response = (
+                "I don't have a number for that, boss — add one with "
+                "'add contact' first, or tell me what to say."
+                if not number else "What should it say, boss?"
+            )
+            _log(prompt, response, "sms_send")
+            return jsonify({"response": response, "mode": "sms_send"})
+
+        result = friday_phone.send_sms(number, message)
+        if result.get("ok"):
+            response = "Sent, boss."
+        else:
+            response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
+        _log(prompt, response, "sms_send")
+        return jsonify({"response": response, "mode": "sms_send", **result})
+
+
+def _cmd_catchup(prompt, p_lower):
+    if any(t in p_lower for t in CATCHUP_TRIGGERS) and friday_brain:
+        import concurrent.futures
+
+        catchup_data = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {}
+            if friday_gmail:
+                futures[executor.submit(friday_gmail.get_unread, 10)] = "emails"
+            if news_anchor:
+                futures[executor.submit(news_anchor.morning_brief)] = "news"
+            if relationships:
+                futures[executor.submit(relationships.who_needs_attention)] = "people"
+
+            catchup_data["tasks"] = len([t for t in get_tasks() if not t.get("done")])
+
+            for f in concurrent.futures.as_completed(futures, timeout=15):
+                key = futures[f]
+                try:
+                    catchup_data[key] = f.result()
+                except Exception:
+                    pass
+
+        emails = catchup_data.get("emails", [])
+        news = catchup_data.get("news", "")
+        people = catchup_data.get("people", [])
+        tasks_cnt = catchup_data.get("tasks", 0)
+
+        # This brief didn't pull calendar data before, but "brief" style
+        # prompts can still volunteer a plausible-sounding meeting
+        # unprompted — an explicit status line closes that gap the same
+        # way _combined_morning_brief() needed it.
+        if friday_calendar and friday_calendar.is_connected():
+            todays = friday_calendar.get_today()
+            calendar_line = (
+                f"Today's calendar: {', '.join(e['title'] for e in todays[:5])}"
+                if todays else "No events on calendar today. Do not invent any meetings."
+            )
+        else:
+            calendar_line = "Calendar is not connected. Do not invent or assume any meetings, events, or appointments."
+
+        result = friday_brain.think(
+            f"Catch-up brief:\n"
+            f"Unread emails: {len(emails)}\n"
+            f"Top email: {emails[0].get('subject', '') if emails else 'none'}\n"
+            f"Pending tasks: {tasks_cnt}\n"
+            f"People needing contact: {len(people)}\n"
+            f"News: {news[:100] if news else 'none'}\n"
+            f"{calendar_line}\n\n"
+            f"Quick catch-up brief. Most important first. Under 80 words. FRIDAY style."
+        )
+        response = result["response"]
+        _log(prompt, response, "catchup")
+        return jsonify({"response": response, "mode": "catchup"})
+
+
+def _cmd_focus(prompt, p_lower):
+    if any(t in p_lower for t in FOCUS_TRIGGERS):
+        import re
+        mins_match = re.search(r"(\d+)\s*min", p_lower)
+        mins = int(mins_match.group(1)) if mins_match else 25
+
+        task = "focus session"
+        if friday_brain:
+            result = friday_brain.think(
+                f"What task from this? '{prompt}'\n"
+                f"Reply with just the task or 'focus session'."
+            )
+            task = result["response"].strip() or "focus session"
+
+        _FOCUS_SESSION["active"] = True
+        _FOCUS_SESSION["task"] = task
+        _FOCUS_SESSION["end_time"] = time.time() + mins * 60
+
+        def _end_focus(mins=mins, task=task):
+            time.sleep(mins * 60)
+            _FOCUS_SESSION["active"] = False
+            if VOICE_OK:
+                friday_speak(f"Focus session complete, boss. {mins} minutes done.")
+            _push("FRIDAY", f"Focus session done: {task}")
+
+        threading.Thread(target=_end_focus, daemon=True).start()
+
+        response = f"Focus mode active, boss. {mins} minutes for: {task}. I'll hold non-urgent alerts."
+        _log(prompt, response, "focus")
+        return jsonify({"response": response, "mode": "focus"})
+
+
+def _cmd_habit_log(prompt, p_lower):
+    if any(t in p_lower for t in HABIT_LOG_TRIGGERS) and habits and friday_brain:
+        result = friday_brain.think(f"Extract habit from: {prompt}\nOne word reply.")
+        habit_name = result["response"].strip()
+        if habit_name:
+            log_result = habits.log(habit_name)
+            streak = log_result.get("streak", 1)
+            response = f"Logged {habit_name}, boss. That's a {streak}-day streak."
+            _log(prompt, response, "habit")
+            return jsonify({"response": response, "mode": "habit"})
+
+
+def _cmd_journal(prompt, p_lower):
+    if any(t in p_lower for t in JOURNAL_TRIGGERS) and journal:
+        mood = "neutral"
+        if emotional_intel:
+            mood = emotional_intel.analyze(prompt).get("emotion", "neutral")
+        journal.log_entry(prompt, mood=mood)
+        response = "Logged, boss."
+        if friday_brain:
+            result = friday_brain.think(
+                f"Acknowledge this journal entry warmly:\n{prompt}\n\nUnder 20 words. FRIDAY style."
+            )
+            response = result["response"] or response
+        _log(prompt, response, "journal")
+        return jsonify({"response": response, "mode": "journal"})
+
+
+def _cmd_probability(prompt, p_lower):
+    if any(t in p_lower for t in PROBABILITY_TRIGGERS) and friday_brain:
+        result = friday_brain.think(
+            f"Probability assessment:\n{prompt}\n\n"
+            f"Analyze like FRIDAY in Civil War.\n"
+            f"Give:\n1. Probability estimate (X%)\n2. Key factors for/against\n"
+            f"3. What would change the odds\n4. Recommended action\n\n"
+            f"You have no specific project data beyond what's in your actual "
+            f"memory and second brain. If asked about project specifics "
+            f"(manufacturing status, components, timelines) that you don't have "
+            f"real logged information about, say so explicitly — do not invent "
+            f"specific details, percentages, component names, or status updates "
+            f"that aren't grounded in actual stored data. A probability estimate "
+            f"itself is fine to give (that's the nature of the ask), but do NOT "
+            f"list fake specific 'contributing factors' with fabricated precision "
+            f"numbers unless those factors are real and known. FRIDAY tactical style."
+        )
+        response = result["response"]
+
+        # Track the call for later calibration checking — best-effort:
+        # a response that doesn't include a clean "X%" (rare, but the
+        # LLM occasionally hedges instead) just isn't logged rather
+        # than blocking the response on it.
+        if calibration:
+            try:
+                import re
+                pct_match = re.search(r"(\d{1,3})\s*%", response)
+                if pct_match:
+                    calibration.log_prediction(prompt, int(pct_match.group(1)), reasoning=response)
+            except Exception:
+                pass
+
+        _log(prompt, response, "probability")
+        return jsonify({"response": response, "mode": "probability"})
+
+
+def _cmd_recon(prompt, p_lower):
+    matched_recon = next((t for t in RECON_TRIGGERS if t in p_lower), None)
+    if matched_recon and RECON_OK and friday_brain:
+        # Case-insensitive strip of whichever trigger matched — p_lower
+        # already told us it's in there somewhere.
+        idx = p_lower.find(matched_recon)
+        situation = (prompt[:idx] + prompt[idx + len(matched_recon):]).strip() if idx >= 0 else prompt
+        result = recognizance.scout(situation or prompt)
+        response = result.get("brief") or "Nothing solid to report, boss."
+        _log(prompt, response, "recon")
+        audio_file = friday_speak(response) if VOICE_OK else None
+        return jsonify({
+            "response": response, "mode": "recon",
+            "has_audio": bool(audio_file), "audio_file": audio_file,
+        })
+
+
+def _cmd_diagnostics(prompt, p_lower):
+    DIAGNOSTICS_TRIGGERS = ["run diagnostics"]
+    if any(t in p_lower for t in DIAGNOSTICS_TRIGGERS):
+        from services import system_doctor
+        report = system_doctor.full_check()
+        response = "Health check unavailable, boss."
+        if friday_brain:
+            result = friday_brain.think(
+                f"Summarize this system health check for the boss, naturally, "
+                f"not as raw data. One or two sentences, FRIDAY style:\n{report}"
+            )
+            response = result.get("response", response)
+        _log(prompt, response, "diagnostics")
+        audio_file = friday_speak(response) if VOICE_OK else None
+        return jsonify({
+            "response": response, "mode": "diagnostics",
+            "has_audio": bool(audio_file), "audio_file": audio_file,
+        })
+
+
+def _cmd_cross_check(prompt, p_lower):
+    CROSS_CHECK_TRIGGERS = [
+        "check with jarvis", "cross check", "ask jarvis too",
+        "get a second opinion", "what does jarvis think",
+    ]
+    matched_trigger = next((t for t in CROSS_CHECK_TRIGGERS if t in p_lower), None)
+    if matched_trigger and cross_check:
+        question = prompt
+        for t in CROSS_CHECK_TRIGGERS:
+            question = question.lower().replace(t, "").strip()
+        question = question or prompt
+
+        result = cross_check.ask_both(question)
+        friday_side = result["friday"][:150]
+        jarvis_side = result["jarvis"][:150]
+        if result["agreement"]["aligned"]:
+            response = (
+                f"We're aligned, boss. Me: \"{friday_side}\" "
+                f"JARVIS: \"{jarvis_side}\""
+            )
+        else:
+            response = (
+                f"We don't agree on this one, boss. Me: \"{friday_side}\" "
+                f"JARVIS: \"{jarvis_side}\""
+            )
+        _log(prompt, response, "cross_check")
+        return jsonify({"response": response, "mode": "cross_check", "detail": result})
+
+
+def _cmd_combat_mode(prompt, p_lower):
+    if any(t in p_lower for t in COMBAT_TRIGGERS) and friday_brain:
+        friday_brain.set_voice_mode("combat")
+        response = "Combat mode. Standing by."
+        _log(prompt, response, "mode")
+        return jsonify({"response": response, "mode": "combat"})
+
+
+def _cmd_normal_mode(prompt, p_lower):
+    if any(t in p_lower for t in NORMAL_MODE_TRIGGERS) and friday_brain:
+        friday_brain.set_voice_mode("normal")
+        response = "Standing down, boss."
+        _log(prompt, response, "mode")
+        return jsonify({"response": response, "mode": "normal"})
+
+
+def _cmd_priority(prompt, p_lower):
+    if any(t in p_lower for t in PRIORITY_TRIGGERS) and friday_brain:
+        pending = [t for t in get_tasks() if not t.get("done")]
+        emails = []
+        if friday_gmail:
+            try:
+                emails = friday_gmail.get_urgent()
+            except Exception:
+                pass
+
+        notes_ctx = ""
+        if second_brain:
+            actions = second_brain.get_actions()
+            if actions:
+                notes_ctx = "\n".join(a.get("action", "") for a in actions[:3])
+
+        energy = voice_memory.predict_energy_now() if voice_memory else ""
+
+        result = friday_brain.think(
+            f"Priority analysis — what should boss focus on NOW:\n\n"
+            f"Pending tasks ({len(pending)}):\n"
+            + "\n".join(f"- {t['task']}" for t in pending[:5])
+            + f"\n\nUrgent emails: {len(emails)}\n"
+            f"Pending actions from notes: {notes_ctx}\n"
+            f"Energy read: {energy}\n\n"
+            f"What's the single most important thing to do right now?\n"
+            f"Then the next 2 things. Be specific and decisive.\n"
+            f"Under 60 words. FRIDAY tactical style."
+        )
+        response = result["response"]
+        _log(prompt, response, "priority")
+        return jsonify({"response": response, "mode": "priority"})
+
+
+def _cmd_travel(prompt, p_lower):
+    if any(t in p_lower for t in TRAVEL_TRIGGERS) and friday_brain:
+        import re
+        match = re.search(
+            r"(?:traveling to|trip to|flying to|visiting)\s+(.+?)(?:\s+(?:for|on|next|this).*)?$",
+            p_lower
+        )
+        city = match.group(1).strip().title() if match else ""
+
+        if city:
+            from core.tools.web import search
+            results = search(f"{city} travel tips time zone weather", 3)
+            result = friday_brain.think(
+                f"Travel intel for {city}:\n\n"
+                + "\n".join(
+                    f"- {r.get('title', '')}: {r.get('snippet', '')[:100]}"
+                    for r in results[:3]
+                )
+                + "\n\nBrief travel brief:\n"
+                  "1. Current time and time zone difference from New York\n"
+                  "2. Current weather\n3. 2-3 things to know\nUnder 60 words. FRIDAY style."
+            )
+            response = result["response"]
+            _log(prompt, response, "travel")
+            return jsonify({"response": response, "mode": "travel"})
+
+
+def _cmd_spotify_stop(prompt, p_lower):
+    if any(t in p_lower for t in SPOTIFY_STOP_TRIGGERS) and friday_spotify:
+        friday_spotify.pause()
+        response = "Pausing, boss."
+        _log(prompt, response, "spotify")
+        return jsonify({"response": response, "mode": "spotify"})
+
+
+def _cmd_spotify_play(prompt, p_lower):
+    for trigger in SPOTIFY_PLAY_TRIGGERS:
+        if trigger in p_lower and friday_spotify:
+            query = p_lower.split(trigger)[-1].strip().replace("on spotify", "").strip()
+            result = friday_spotify.play(query)
+            if result.get("playing"):
+                response = f"Playing {result.get('track', '')} by {result.get('artist', '')}, boss."
+            else:
+                response = result.get("error", "Couldn't play that, boss.")
+            _log(prompt, response, "spotify")
+            return jsonify({"response": response, "mode": "spotify"})
+
+
+def _cmd_calendar_add(prompt, p_lower):
+    if any(t in p_lower for t in CALENDAR_ADD_TRIGGERS) and friday_brain:
+        if not (friday_calendar and friday_calendar.is_connected()):
+            response = "Your calendar isn't connected yet, boss."
+            _log(prompt, response, "calendar")
+            return jsonify({"response": response, "mode": "calendar"})
+
+        import re as rex
+        result = friday_brain.think(
+            f"Extract a calendar event from: {prompt}\n"
+            f"Current time: {datetime.datetime.now().isoformat()}\n\n"
+            f'Reply as JSON: {{"title": str, "start": "ISO 8601 datetime", '
+            f'"end": "ISO 8601 datetime"}}\n'
+            f"If no duration is given, default to 30 minutes. JSON only."
+        )
+        try:
+            clean = rex.sub(r"```json|```", "", result["response"]).strip()
+            data = json.loads(clean)
+            created = friday_calendar.create_event(
+                data.get("title", "Event"), data["start"], data["end"]
+            )
+            if created.get("ok"):
+                response = f"Added \"{data.get('title', 'Event')}\" to your calendar, boss."
+            else:
+                response = created.get("error", "Couldn't add that to your calendar, boss.")
+        except Exception:
+            response = "Wasn't sure what to schedule there, boss — try again with a time?"
+        _log(prompt, response, "calendar")
+        return jsonify({"response": response, "mode": "calendar"})
+
+
+def _cmd_goal_report(prompt, p_lower):
+    if any(t in p_lower for t in GOAL_REPORT_TRIGGERS) and goals:
+        active = goals.get_active_goals()
+        if not active:
+            response = "No goals tracked yet, boss. Tell me your goals and I'll track them."
+        elif friday_brain:
+            result = friday_brain.think(
+                f"Quick goal status for {len(active)} active goals:\n"
+                + "\n".join(
+                    f"- {g['name']}: {g.get('sessions', 0)} sessions, "
+                    f"last worked {(g.get('last_worked') or 'never')[:10]}"
+                    for g in active
+                )
+                + "\n\nBrief status. Under 40 words. FRIDAY style."
+            )
+            response = result["response"]
+        else:
+            response = f"{len(active)} active goals, boss."
+        _log(prompt, response, "goal_report")
+        return jsonify({"response": response, "mode": "goal_report"})
+
+
+def _cmd_goal_add(prompt, p_lower):
+    if any(t in p_lower for t in GOAL_ADD_TRIGGERS) and goals and friday_brain:
+        import re as rex
+        extract = friday_brain.think(
+            f"Extract goal from: '{prompt}'\n"
+            f'Reply as JSON: {{"name": str, "description": str}}'
+        )
+        try:
+            clean = rex.sub(r"```json|```", "", extract["response"]).strip()
+            data = json.loads(clean)
+            name = data.get("name", "")
+            if name:
+                goals.add_goal(name, data.get("description", ""))
+                response = f"Goal added, boss: {name}. I'll track your progress."
+            else:
+                response = "What's the goal, boss?"
+        except Exception:
+            response = "What's the goal, boss?"
+        _log(prompt, response, "goal_add")
+        return jsonify({"response": response, "mode": "goal_add"})
+
+
+def _cmd_goal_progress(prompt, p_lower):
+    if any(t in p_lower for t in GOAL_PROGRESS_TRIGGERS) and goals:
+        log_result = goals.log_progress(work_done=prompt, auto_detect=True)
+        if log_result.get("logged"):
+            response = f"Logged progress on {log_result['goal']}, boss. Session {log_result['sessions']}."
+        else:
+            response = "Noted — didn't match it to a tracked goal, boss."
+        _log(prompt, response, "goal_progress")
+        return jsonify({"response": response, "mode": "goal_progress"})
+
+
+def _cmd_email_draft(prompt, p_lower):
+    if any(t in p_lower for t in DRAFT_TRIGGERS) and friday_gmail and friday_brain:
+        import re as rex
+        extract = friday_brain.think(
+            f"From this: '{prompt}'\n"
+            f"Extract: who to reply to and what to say.\n"
+            f'JSON: {{"to": str, "instruction": str}}'
+        )
+        try:
+            clean = rex.sub(r"```json|```", "", extract["response"]).strip()
+            data = json.loads(clean)
+            search = data.get("to", "")
+            instruction = data.get("instruction", "")
+        except Exception:
+            search, instruction = prompt, ""
+
+        found = friday_gmail.find_email(search)
+        if found:
+            draft_result = friday_gmail.draft_reply(
+                email_subject=found.get("subject", ""), email_from=found.get("from", ""),
+                email_body=found.get("body", ""), instruction=instruction,
+                message_id=found.get("message_id", ""),
+            )
+            draft = draft_result.get("draft", "")
+            response = (
+                f"Here's a draft reply to {found.get('from', '')[:30]}, boss:\n\n"
+                f"{draft}\n\nWant me to send it or adjust anything?"
+            )
+        else:
+            response = "I couldn't find that email, boss. Try 'FRIDAY draft a reply to [exact name or subject]'."
+        _log(prompt, response, "email_draft")
+        return jsonify({"response": response, "mode": "email_draft"})
+
+
+def _cmd_email_send(prompt, p_lower):
+    if any(t in p_lower for t in SEND_TRIGGERS) and friday_gmail:
+        result = friday_gmail.send_draft()
+        if result.get("ok"):
+            response = f"Sent, boss. On its way to {result.get('to', '')}."
+        else:
+            response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
+        _log(prompt, response, "email_send")
+        return jsonify({"response": response, "mode": "email_send", **result})
+
+
+def _cmd_email_compose_send(prompt, p_lower):
+    if any(t in p_lower for t in COMPOSE_SEND_TRIGGERS) and friday_gmail and friday_brain:
+        import re as rex
+        extract = friday_brain.think(
+            f"From this: '{prompt}'\n"
+            f"Extract who to email and what to say.\n"
+            f'JSON: {{"to": str, "subject": str, "body": str}}\n'
+            f"'to' should be the raw email address if one appears in the "
+            f"text, otherwise the name/description as given. 'subject' "
+            f"should be short and inferred from the message if none is "
+            f"stated. 'body' should be the message to send, written out "
+            f"in full sentences."
+        )
+        try:
+            clean = rex.sub(r"```json|```", "", extract["response"]).strip()
+            data = json.loads(clean)
+            to = data.get("to", "")
+            subject = data.get("subject", "")
+            body = data.get("body", "")
+        except Exception:
+            to, subject, body = "", "", ""
+
+        if not friday_gmail.extract_address(to):
+            # No bare address in the prompt or the extraction — try
+            # the contact book first (a name FRIDAY actually has an
+            # address for), then fall back to matching it against a
+            # recent inbox sender by name, the same lookup the
+            # reply-draft flow uses.
+            contact = friday_contacts.find_by_name(to) if friday_contacts else {}
+            if contact.get("email"):
+                to = contact["email"]
+            else:
+                found = friday_gmail.find_email(to)
+                if found:
+                    to = found.get("from", "")
+
+        if not to or not body:
+            response = "Who's it going to, and what should it say, boss?"
+            _log(prompt, response, "email_compose_send")
+            return jsonify({"response": response, "mode": "email_compose_send"})
+
+        result = friday_gmail.send_email(to=to, subject=subject, body=body)
+        if result.get("ok"):
+            response = f"Sent, boss. On its way to {result.get('to', '')}."
+        else:
+            response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
+        _log(prompt, response, "email_compose_send")
+        return jsonify({"response": response, "mode": "email_compose_send", **result})
+
+
+def _cmd_email_triage(prompt, p_lower):
+    if any(t in p_lower for t in TRIAGE_TRIGGERS) and friday_gmail:
+        triage = friday_gmail.smart_triage()
+        summary = triage.get("summary", "")
+        cats = triage.get("categories", {})
+        urgent = cats.get("urgent", [])
+        response = (
+            f"Inbox triage complete, boss. {summary}.\n"
+            f"Urgent: {', '.join(urgent[:2]) if urgent else 'none'}."
+        )
+        _log(prompt, response, "email_triage")
+        return jsonify({"response": response, "triage": triage, "mode": "email_triage"})
+
+
+def _cmd_email_summary(prompt, p_lower):
+    if any(t in p_lower for t in EMAIL_TRIGGERS) and friday_gmail:
+        summary = friday_gmail.summarize_inbox()
+        _log(prompt, summary, "email")
+        return jsonify({"response": summary, "mode": "email"})
+
+
+def _cmd_note(prompt, p_lower):
+    if any(t in p_lower for t in NOTE_TRIGGERS):
+        from core.friday_memory import save_note, get_recent_turns
+        turns = get_recent_turns(2)
+        note = {
+            "ts": datetime.datetime.now().isoformat(),
+            "content": turns[-1].get("friday", "") if turns else prompt,
+            "context": prompt,
+        }
+        save_note(note)
+        response = "Noted, boss."
+        _log(prompt, response, "note")
+        return jsonify({"response": response, "mode": "note"})
+
+
+def _cmd_reminder(prompt, p_lower):
+    if any(t in p_lower for t in REMINDER_TRIGGERS) and friday_brain:
+        import re as rex
+        result = friday_brain.think(
+            f"Extract reminder from: {prompt}\n\n"
+            f"Reply as JSON: {{\"task\": str, \"minutes\": int}}\n"
+            f"Examples:\n"
+            f"'remind me in 30 minutes to call back' -> {{\"task\":\"call back\",\"minutes\":30}}\n"
+            f"'remind me at 3pm' -> {{\"task\":\"reminder\",\"minutes\": calculated from now}}\n"
+            f"JSON only."
+        )["response"]
+        try:
+            clean = rex.sub(r"```json|```", "", result).strip()
+            data = json.loads(clean)
+            task = data.get("task", "reminder")
+            mins = int(data.get("minutes", 5))
+            add_reminder(task, mins)
+            response = f"Reminder set for {mins} minutes, boss. I'll let you know."
+        except Exception:
+            response = "What do you need reminding about, boss?"
+        _log(prompt, response, "reminder")
+        return jsonify({"response": response, "mode": "reminder"})
+
+
+def _cmd_task_show(prompt, p_lower):
+    if any(t in p_lower for t in TASK_SHOW_TRIGGERS):
+        tasks = [t for t in get_tasks() if not t.get("done")]
+        if not tasks:
+            response = "Nothing on the list, boss. Clear schedule."
+        elif friday_brain:
+            result = friday_brain.think(
+                f"Task list summary:\n"
+                + "\n".join(f"- {t['task']}" for t in tasks[:10])
+                + "\n\nBrief summary. What needs attention first. Under 40 words."
+            )
+            response = result["response"]
+        else:
+            response = f"{len(tasks)} things on your list, boss."
+        _log(prompt, response, "tasks")
+        return jsonify({"response": response, "mode": "tasks"})
+
+
+def _cmd_task_add(prompt, p_lower):
+    if any(t in p_lower for t in TASK_ADD_TRIGGERS) and friday_brain:
+        result = friday_brain.think(
+            f"Extract task from: {prompt}\n"
+            f"Reply with just the task. No extra text."
+        )["response"]
+        task = result.strip()
+        if task:
+            add_task(task)
+            response = f"Added to your list, boss: {task}"
+        else:
+            response = "What do you want to add, boss?"
+        _log(prompt, response, "task_add")
+        return jsonify({"response": response, "mode": "task_add"})
+
+
+def _cmd_med_schedule(prompt, p_lower):
+    if any(t in p_lower for t in MED_SCHEDULE_TRIGGERS) and medicine_tracker:
+        response = medicine_tracker.get_schedule_summary()
+        _log(prompt, response, "medicine")
+        return jsonify({"response": response, "mode": "medicine"})
+
+
+def _cmd_med_taken(prompt, p_lower):
+    if any(t in p_lower for t in MED_TAKEN_TRIGGERS) and medicine_tracker and friday_brain:
+        extract = friday_brain.think(
+            f"Extract medicine name from: '{prompt}'\n"
+            f"Reply with just the name, nothing else."
+        )
+        med_name = extract["response"].strip()
+        if med_name:
+            result = medicine_tracker.log_taken(med_name)
+            response = (
+                f"Logged, boss. {med_name} marked as taken."
+                if result.get("logged")
+                else f"Couldn't find {med_name} in your schedule, boss."
+            )
+        else:
+            response = "Which medicine did you take, boss?"
+        _log(prompt, response, "medicine")
+        return jsonify({"response": response, "mode": "medicine"})
+
+
+def _cmd_med_skip(prompt, p_lower):
+    if any(t in p_lower for t in MED_SKIP_TRIGGERS) and medicine_tracker and friday_brain:
+        extract = friday_brain.think(
+            f"Extract medicine name from: '{prompt}'\n"
+            f"Reply with just the name, nothing else."
+        )
+        med_name = extract["response"].strip()
+        if med_name:
+            result = medicine_tracker.log_skipped(med_name)
+            response = (
+                f"Got it, boss. {med_name} logged as skipped."
+                if result.get("logged")
+                else f"Couldn't find {med_name} in your schedule, boss."
+            )
+        else:
+            response = "Which medicine are you skipping, boss?"
+        _log(prompt, response, "medicine")
+        return jsonify({"response": response, "mode": "medicine"})
+
+
+def _cmd_med_add(prompt, p_lower):
+    if any(t in p_lower for t in MED_ADD_TRIGGERS) and medicine_tracker and friday_brain:
+        import re as medrex
+        extract = friday_brain.think(
+            f"Extract medicine tracking info from: '{prompt}'\n"
+            f"Reply as JSON: {{\"name\": str, \"times\": [\"HH:MM\"], \"dosage\": str}}\n"
+            f"If time isn't specified, use a reasonable default "
+            f"like [\"08:00\"]. JSON only."
+        )
+        try:
+            clean = medrex.sub(r"```json|```", "", extract["response"]).strip()
+            data = json.loads(clean)
+            result = medicine_tracker.add_medicine(
+                data.get("name", ""),
+                data.get("times", ["08:00"]),
+                data.get("dosage", ""),
+            )
+            response = (
+                f"Added {result['name']} to your schedule, boss. "
+                f"I'll remind you."
+            )
+        except Exception:
+            response = (
+                "What medicine, and what time should I remind "
+                "you, boss?"
+            )
+        _log(prompt, response, "medicine")
+        return jsonify({"response": response, "mode": "medicine"})
+
+
+def _cmd_homekit(prompt, p_lower):
+    for trigger, shortcut in HOMEKIT_TRIGGERS.items():
+        if trigger in p_lower:
+            if TRAINING_WHEELS_OK and not training_wheels.can_perform("mac_bridge_control"):
+                response = "Not authorized yet, boss — trust score isn't there for Mac Bridge control."
+                _log(prompt, response, "homekit")
+                return jsonify({"response": response, "mode": "homekit", "blocked": True})
+
+            mac_url = os.environ.get("MAC_BRIDGE_URL", "")
+            if not mac_url:
+                response = "Mac bridge isn't configured, boss."
+            else:
+                try:
+                    import requests as req
+                    r = req.post(f"{mac_url}/mac/run",
+                                json={"command": shortcut, "token": os.environ.get("MAC_BRIDGE_TOKEN", "")},
+                                timeout=5)
+                    ok = r.status_code == 200 and not r.json().get("error")
+                    response = "Done, boss." if ok else "Couldn't reach the Mac bridge, boss."
+                except Exception:
+                    ok = False
+                    response = "Couldn't reach the Mac bridge, boss."
+                if TRAINING_WHEELS_OK:
+                    training_wheels.record_outcome("mac_bridge_control", ok)
+            _log(prompt, response, "homekit")
+            return jsonify({"response": response, "mode": "homekit"})
+
+
+def _cmd_mac_app(prompt, p_lower):
+    MAC_APP_TRIGGERS = {
+        "open spotify": "Spotify", "open chrome": "Google Chrome",
+        "open safari": "Safari", "open terminal": "Terminal",
+        "open finder": "Finder", "open notes": "Notes",
+    }
+    for trigger, app_name in MAC_APP_TRIGGERS.items():
+        if trigger in p_lower:
+            if TRAINING_WHEELS_OK and not training_wheels.can_perform("mac_bridge_control"):
+                response = "Not authorized yet, boss — trust score isn't there for Mac Bridge control."
+                _log(prompt, response, "mac_bridge")
+                return jsonify({"response": response, "mode": "mac_bridge", "blocked": True})
+
+            from services.mac_bridge import mac_bridge
+            result = mac_bridge.open_app(app_name)
+            ok = "error" not in result
+            response = f"Done, boss. {app_name} is opening." if ok else f"Couldn't reach your Mac, boss: {result['error']}"
+            if TRAINING_WHEELS_OK:
+                training_wheels.record_outcome("mac_bridge_control", ok)
+            _log(prompt, response, "mac_bridge")
+            return jsonify({"response": response, "mode": "mac_bridge"})
+
+
+def _cmd_ha_status(prompt, p_lower):
+    if HA_OK and home_assistant and any(t in p_lower for t in HA_STATUS_TRIGGERS):
+        result = home_assistant.get_states()
+        if "error" in result:
+            response = "Home Assistant isn't reachable right now, boss."
+        else:
+            # "remote" entities duplicate their paired media_player's
+            # friendly name (e.g. the TV's remote.* and media_player.*
+            # both read "LivingRm (UN50NU6950)") — skip them so the
+            # readout doesn't repeat the same device twice.
+            devices = [
+                {"name": e.get("attributes", {}).get("friendly_name", e["entity_id"]), "state": e["state"]}
+                for e in result["states"]
+                if e["entity_id"].split(".")[0] != "remote"
+            ]
+            lines = [f"{d['name']} is {d['state']}" for d in devices]
+            response = "Here's what Home Assistant sees, boss: " + "; ".join(lines) + "."
+            spawn_widget("data", {"title": "HOME ASSISTANT", "rows": devices})
+        _log(prompt, response, "home_assistant")
+        return jsonify({"response": response, "mode": "home_assistant"})
+
+
+def _cmd_ha_toggle(prompt, p_lower):
+    if HA_OK and home_assistant and ("turn on" in p_lower or "turn off" in p_lower):
+        for device_name, entity_id in HA_DEVICE_TRIGGERS.items():
+            if device_name in p_lower:
+                domain = entity_id.split(".")[0]
+                service = "turn_on" if "turn on" in p_lower else "turn_off"
+                result = home_assistant.call_service(domain, service, entity_id)
+                if "error" in result:
+                    response = "Home Assistant isn't reachable right now, boss."
+                else:
+                    verb = "on" if service == "turn_on" else "off"
+                    response = f"Done, boss. Turning the {device_name} {verb}."
+                _log(prompt, response, "home_assistant")
+                return jsonify({"response": response, "mode": "home_assistant"})
+
+
+def _cmd_jarvis_proxy(prompt, p_lower):
+    if JARVIS_ONLINE and not COVERAGE_MODE:
+        try:
+            import requests as req
+            r = req.post(
+                f"{JARVIS_URL}/stark/chat", json={"message": prompt},
+                headers={"Authorization": f"Bearer {JARVIS_TOKEN}"}, timeout=10,
+            )
+            if r.status_code == 200:
+                response = r.json().get("response", "")
+                _log(prompt, response, "jarvis-proxy")
+                return jsonify({"response": safe(response), "mode": "jarvis", "via": "proxy"})
+        except Exception:
+            pass
+
+
 @app.route("/command", methods=["POST"])
 def command():
     prompt = ""
@@ -954,991 +1991,272 @@ def command():
         # used to be the actual bug). Anything else gets the same generic
         # "system locked" reply, so a stolen device can't fish for behavior
         # differences to guess the passphrase. ─────────────────────────────
-        if LOCKDOWN_OK and suit_lockdown.is_locked():
-            if suit_lockdown.try_unlock(prompt):
-                response = "Unlocked. Welcome back, boss."
-                _log(prompt, response, "lockdown_unlock")
-                return jsonify({"response": response, "mode": "lockdown_unlock"})
-            response = "System locked. Provide the passphrase to unlock."
-            _log(prompt, response, "lockdown")
-            return jsonify({"response": response, "mode": "lockdown", "blocked": True})
+        result = _cmd_lockdown_locked(prompt)
+        if result is not None:
+            return result
 
-        if LOCKDOWN_OK and any(t in prompt.lower() for t in LOCKDOWN_TRIGGERS):
-            suit_lockdown.activate(reason="voice command")
-            response = "Lockdown active. Standing by."
-            _log(prompt, response, "lockdown_activate")
-            return jsonify({"response": response, "mode": "lockdown_activate"})
+        result = _cmd_lockdown_trigger(prompt)
+        if result is not None:
+            return result
 
         # ── Mayday — no LLM call, responds immediately ────────────────────────
-        if MAYDAY_PHRASE in prompt.lower():
-            response = "Mayday received. What's happening, boss?"
-            _log(prompt, response, "MAYDAY")
-            try:
-                # CRITICAL -> Pushover priority 2 (emergency) -> notify()'s
-                # _pushover() path -> friday_caps._pushover_alert(), which
-                # applies retry/expire itself for priority 2 — a distress
-                # signal that only pushes once, with no retry-until-acked,
-                # defeats its own purpose if boss's phone is silenced or
-                # out of reach. Same tier as friday_health.py's
-                # critical-vitals alert.
-                from services.notifications import critical
-                critical(
-                    "FRIDAY MAYDAY",
-                    f"Mayday phrase triggered. Emergency contact on file: {EMERGENCY_CONTACT_PHONE}",
-                )
-            except Exception as e:
-                logging.warning(f"MAYDAY notify failed: {e}")
-            if CHECKIN_OK:
-                try:
-                    from services.checkin_system import emergency_pending
-                    emergency_pending.set()
-                except Exception:
-                    pass
-            audio_file = friday_speak(response) if VOICE_OK else None
-            return jsonify({
-                "response": response, "mode": "MAYDAY",
-                "has_audio": bool(audio_file), "audio_file": audio_file,
-            })
+        result = _cmd_mayday(prompt)
+        if result is not None:
+            return result
 
         # ── Safe check-in — no LLM call, stands down any pending escalation.
         # confirm_safe() already speaks its own line via friday_voice.speak()
         # (same as autonomous_agent._alert()'s convention of speaking
         # directly rather than through the HTTP response) so this doesn't
         # also generate a second, redundant audio_file for the HUD to play. ─
-        if any(t in prompt.lower() for t in SAFE_TRIGGERS):
-            response = "Good to hear, boss. Standing down." if CHECKIN_OK else "Glad to hear it, boss."
-            if CHECKIN_OK:
-                checkin_system.confirm_safe()
-            _log(prompt, response, "safe_checkin")
-            return jsonify({"response": response, "mode": "safe_checkin"})
+        result = _cmd_safe_checkin(prompt)
+        if result is not None:
+            return result
 
-        if SECURITY_OK:
-            screen = friday_security.screen_request(friday_security.client_ip(request), prompt)
-            if screen.get("blocked"):
-                return jsonify({"response": "Request blocked.", "blocked": True}), 403
+        result = _cmd_security_screen(prompt)
+        if result is not None:
+            return result
 
         # Learn from every request up front (not gated behind any one
         # response branch) so it applies regardless of which handler below
         # ends up serving it.
-        try:
-            if voice_memory:
-                voice_memory.analyze_and_learn(prompt)
-                best_mode = voice_memory.get_current_best_mode()
-                if friday_brain and not COVERAGE_MODE:
-                    friday_brain.set_voice_mode(best_mode)
-        except Exception:
-            pass
+        result = _cmd_learn_voice_mode(prompt)
+        if result is not None:
+            return result
 
         # Dark mode — zero external connectivity, local-only responses
-        if PROTOCOLS_OK and friday_protocols.range_level == RangeLevel.DARK:
-            response = friday_protocols.emergency_response(prompt)
-            _log(prompt, response, "emergency")
-            return jsonify({"response": response, "mode": "emergency", "range": "dark"})
+        result = _cmd_dark_mode(prompt)
+        if result is not None:
+            return result
 
         # MCU capabilities — checked before the JARVIS proxy since these are
         # specifically FRIDAY's own named abilities, not generic chat that
         # should default to JARVIS when he's reachable.
-        if CAPABILITIES_OK:
-            p_lower = prompt.lower()
-            for trigger, (handler, response_key) in CAPABILITY_MAP.items():
-                if trigger in p_lower:
-                    try:
-                        result = handler(prompt)
-                        response = result.get(response_key) or "Done, boss."
-                        audio = friday_speak(response) if VOICE_OK else None
-                        _log(prompt, response, trigger)
-                        return jsonify({
-                            "response": response, "mode": trigger,
-                            "has_audio": bool(audio), "audio_file": audio,
-                        })
-                    except Exception as e:
-                        logging.warning(f"Capability '{trigger}' failed: {e}")
-                    break
+        result = _cmd_capabilities(prompt)
+        if result is not None:
+            return result
 
         # Second-brain / news / relationships / code intents — same tier as
         # CAPABILITY_MAP above: FRIDAY's own named abilities, checked before
         # the JARVIS proxy for the same reason.
         p_lower = prompt.lower()
 
-        if ("news" in p_lower or "what's happening" in p_lower) and news_anchor:
-            response = news_anchor.morning_brief()
-            _log(prompt, response, "news")
-            return jsonify({"response": response, "mode": "news"})
+        result = _cmd_news(prompt, p_lower)
+        if result is not None:
+            return result
 
-        if "translate" in p_lower and translator:
-            text = p_lower.replace("translate", "").replace("friday", "").strip()
-            result = translator.translate(text)
-            _log(prompt, result["translation"], "translate")
-            return jsonify({"response": result["translation"], "mode": "translate"})
+        result = _cmd_translate(prompt, p_lower)
+        if result is not None:
+            return result
 
-        if ("review this code" in p_lower or "fix this code" in p_lower) and friday_code:
-            result = friday_code.quick_review(prompt)
-            _log(prompt, result["review"], "code")
-            return jsonify({"response": result["review"], "mode": "code"})
+        result = _cmd_code_review(prompt, p_lower)
+        if result is not None:
+            return result
 
-        if ("remember this" in p_lower or "store this" in p_lower) and second_brain:
-            result = second_brain.ingest(prompt)
-            response = f"Stored: {result['summary']}" if result["summary"] else "Stored, boss."
-            _log(prompt, response, "brain")
-            return jsonify({"response": response, "mode": "brain"})
+        result = _cmd_remember_this(prompt, p_lower)
+        if result is not None:
+            return result
 
         # "people brief on " — deliberately avoids the substring "intel on":
         # CAPABILITY_MAP already has an "intel on" trigger (government_intel(),
         # checked above this block) that matches as a substring anywhere in
         # the prompt, so any phrase containing "intel on" — even prefixed —
         # would still be unreachable.
-        if "people brief on " in p_lower and relationships:
-            name = p_lower.split("people brief on ")[-1].strip()
-            result = relationships.get_intel(name)
-            response = result.get("brief") or f"No intel on {name} yet, boss."
-            _log(prompt, response, "intel")
-            return jsonify({"response": response, "mode": "intel"})
+        result = _cmd_people_brief(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Caller intelligence ──────────────────────────────────────────────
-        if any(t in p_lower for t in CALLER_TRIGGERS):
-            import re
-            match = re.search(r"(?:call from|calling from|incoming call from)\s+(.+?)(?:\.|$)", p_lower)
-            caller = match.group(1).strip().title() if match else ""
-
-            if not caller:
-                response = "Who's calling, boss?"
-                _log(prompt, response, "caller_id")
-                return jsonify({"response": response, "mode": "caller_id"})
-
-            if relationships and friday_brain:
-                intel = relationships.get_intel(caller)
-                days_since = intel.get("days_since", -1)
-                notes = intel.get("notes", [])
-                context = f"Days since last contact: {days_since}\n" if days_since >= 0 else ""
-                context += f"Notes: {notes[-1] if notes else 'None'}\n"
-                context += f"Brief: {intel.get('brief', '')}"
-
-                result = friday_brain.think(
-                    f"Caller ID: {caller}\n{context}\n\n"
-                    f"FRIDAY caller announcement. Who they are, last contact if "
-                    f"known, answer or skip recommendation. Under 20 words. "
-                    f"Natural. FRIDAY style."
-                )
-                response = result["response"] or f"It's {caller}, boss."
-                _log(prompt, response, "caller_id")
-                if VOICE_OK:
-                    friday_speak(response)
-                return jsonify({"response": response, "caller": caller, "mode": "caller_id"})
+        result = _cmd_caller_id(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── FRIDAY initiates a call ───────────────────────────────────────────
-        if any(t in p_lower for t in CALL_TRIGGERS):
-            import re
-            match = re.search(
-                r"(?:call|dial|call up|reach out to)\s+(.+?)(?:\s+(?:for|about|and|please|now).*)?$",
-                p_lower
-            )
-            name = match.group(1).strip().title() if match else ""
-
-            if not name:
-                response = "Who do you want me to call, boss?"
-                _log(prompt, response, "call")
-                return jsonify({"response": response, "action": None})
-
-            rel_intel = {}
-            if relationships:
-                rel_intel = relationships.get_intel(name)
-
-            brief = ""
-            if friday_brain:
-                notes = rel_intel.get("notes", [])
-                days = rel_intel.get("days_since", -1)
-                brief_result = friday_brain.think(
-                    f"Pre-call brief for calling {name}.\n"
-                    f"Last contact: {days} days ago.\n"
-                    f"Notes: {notes[-2:] if notes else 'None'}\n"
-                    f"Context: {rel_intel.get('brief', '')}\n\n"
-                    f"One sentence prep brief BEFORE the call. "
-                    f"What to know going in. Under 15 words."
-                )
-                brief = brief_result["response"]
-
-            response = f"Calling {name} now, boss. {brief}" if brief else f"Calling {name} now, boss."
-
-            _log(prompt, response, "call")
-            return jsonify({
-                "response": response, "action": "call",
-                "contact": name, "mode": "call_initiation",
-            })
+        result = _cmd_call_initiate(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── FRIDAY sends a real text (Twilio) ────────────────────────────────
-        if any(t in p_lower for t in SMS_TRIGGERS) and friday_brain:
-            from services.friday_phone import friday_phone
-            import re as rex
-            extract = friday_brain.think(
-                f"From this: '{prompt}'\n"
-                f"Extract who to text and what to say. If it's addressed "
-                f"to the boss themself ('text me'), use \"me\" for 'to'.\n"
-                f'JSON: {{"to": str, "message": str}}'
-            )
-            try:
-                clean = rex.sub(r"```json|```", "", extract["response"]).strip()
-                data = json.loads(clean)
-                to = data.get("to", "")
-                message = data.get("message", "")
-            except Exception:
-                to, message = "", ""
-
-            if to.strip().lower() == "me":
-                number = os.environ.get("MY_PHONE_NUMBER", "")
-            else:
-                contact = friday_contacts.find_by_name(to) if friday_contacts else {}
-                number = contact.get("phone", "")
-
-            if not number or not message:
-                response = (
-                    "I don't have a number for that, boss — add one with "
-                    "'add contact' first, or tell me what to say."
-                    if not number else "What should it say, boss?"
-                )
-                _log(prompt, response, "sms_send")
-                return jsonify({"response": response, "mode": "sms_send"})
-
-            result = friday_phone.send_sms(number, message)
-            if result.get("ok"):
-                response = "Sent, boss."
-            else:
-                response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
-            _log(prompt, response, "sms_send")
-            return jsonify({"response": response, "mode": "sms_send", **result})
+        result = _cmd_sms_send(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Catch-up brief ────────────────────────────────────────────────────
-        if any(t in p_lower for t in CATCHUP_TRIGGERS) and friday_brain:
-            import concurrent.futures
-
-            catchup_data = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                futures = {}
-                if friday_gmail:
-                    futures[executor.submit(friday_gmail.get_unread, 10)] = "emails"
-                if news_anchor:
-                    futures[executor.submit(news_anchor.morning_brief)] = "news"
-                if relationships:
-                    futures[executor.submit(relationships.who_needs_attention)] = "people"
-
-                catchup_data["tasks"] = len([t for t in get_tasks() if not t.get("done")])
-
-                for f in concurrent.futures.as_completed(futures, timeout=15):
-                    key = futures[f]
-                    try:
-                        catchup_data[key] = f.result()
-                    except Exception:
-                        pass
-
-            emails = catchup_data.get("emails", [])
-            news = catchup_data.get("news", "")
-            people = catchup_data.get("people", [])
-            tasks_cnt = catchup_data.get("tasks", 0)
-
-            # This brief didn't pull calendar data before, but "brief" style
-            # prompts can still volunteer a plausible-sounding meeting
-            # unprompted — an explicit status line closes that gap the same
-            # way _combined_morning_brief() needed it.
-            if friday_calendar and friday_calendar.is_connected():
-                todays = friday_calendar.get_today()
-                calendar_line = (
-                    f"Today's calendar: {', '.join(e['title'] for e in todays[:5])}"
-                    if todays else "No events on calendar today. Do not invent any meetings."
-                )
-            else:
-                calendar_line = "Calendar is not connected. Do not invent or assume any meetings, events, or appointments."
-
-            result = friday_brain.think(
-                f"Catch-up brief:\n"
-                f"Unread emails: {len(emails)}\n"
-                f"Top email: {emails[0].get('subject', '') if emails else 'none'}\n"
-                f"Pending tasks: {tasks_cnt}\n"
-                f"People needing contact: {len(people)}\n"
-                f"News: {news[:100] if news else 'none'}\n"
-                f"{calendar_line}\n\n"
-                f"Quick catch-up brief. Most important first. Under 80 words. FRIDAY style."
-            )
-            response = result["response"]
-            _log(prompt, response, "catchup")
-            return jsonify({"response": response, "mode": "catchup"})
+        result = _cmd_catchup(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Focus / Pomodoro timer ────────────────────────────────────────────
-        if any(t in p_lower for t in FOCUS_TRIGGERS):
-            import re
-            mins_match = re.search(r"(\d+)\s*min", p_lower)
-            mins = int(mins_match.group(1)) if mins_match else 25
-
-            task = "focus session"
-            if friday_brain:
-                result = friday_brain.think(
-                    f"What task from this? '{prompt}'\n"
-                    f"Reply with just the task or 'focus session'."
-                )
-                task = result["response"].strip() or "focus session"
-
-            _FOCUS_SESSION["active"] = True
-            _FOCUS_SESSION["task"] = task
-            _FOCUS_SESSION["end_time"] = time.time() + mins * 60
-
-            def _end_focus(mins=mins, task=task):
-                time.sleep(mins * 60)
-                _FOCUS_SESSION["active"] = False
-                if VOICE_OK:
-                    friday_speak(f"Focus session complete, boss. {mins} minutes done.")
-                _push("FRIDAY", f"Focus session done: {task}")
-
-            threading.Thread(target=_end_focus, daemon=True).start()
-
-            response = f"Focus mode active, boss. {mins} minutes for: {task}. I'll hold non-urgent alerts."
-            _log(prompt, response, "focus")
-            return jsonify({"response": response, "mode": "focus"})
+        result = _cmd_focus(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Habit logging ─────────────────────────────────────────────────────
-        if any(t in p_lower for t in HABIT_LOG_TRIGGERS) and habits and friday_brain:
-            result = friday_brain.think(f"Extract habit from: {prompt}\nOne word reply.")
-            habit_name = result["response"].strip()
-            if habit_name:
-                log_result = habits.log(habit_name)
-                streak = log_result.get("streak", 1)
-                response = f"Logged {habit_name}, boss. That's a {streak}-day streak."
-                _log(prompt, response, "habit")
-                return jsonify({"response": response, "mode": "habit"})
+        result = _cmd_habit_log(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Journal ───────────────────────────────────────────────────────────
-        if any(t in p_lower for t in JOURNAL_TRIGGERS) and journal:
-            mood = "neutral"
-            if emotional_intel:
-                mood = emotional_intel.analyze(prompt).get("emotion", "neutral")
-            journal.log_entry(prompt, mood=mood)
-            response = "Logged, boss."
-            if friday_brain:
-                result = friday_brain.think(
-                    f"Acknowledge this journal entry warmly:\n{prompt}\n\nUnder 20 words. FRIDAY style."
-                )
-                response = result["response"] or response
-            _log(prompt, response, "journal")
-            return jsonify({"response": response, "mode": "journal"})
+        result = _cmd_journal(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Probability assessment ────────────────────────────────────────────
-        if any(t in p_lower for t in PROBABILITY_TRIGGERS) and friday_brain:
-            result = friday_brain.think(
-                f"Probability assessment:\n{prompt}\n\n"
-                f"Analyze like FRIDAY in Civil War.\n"
-                f"Give:\n1. Probability estimate (X%)\n2. Key factors for/against\n"
-                f"3. What would change the odds\n4. Recommended action\n\n"
-                f"You have no specific project data beyond what's in your actual "
-                f"memory and second brain. If asked about project specifics "
-                f"(manufacturing status, components, timelines) that you don't have "
-                f"real logged information about, say so explicitly — do not invent "
-                f"specific details, percentages, component names, or status updates "
-                f"that aren't grounded in actual stored data. A probability estimate "
-                f"itself is fine to give (that's the nature of the ask), but do NOT "
-                f"list fake specific 'contributing factors' with fabricated precision "
-                f"numbers unless those factors are real and known. FRIDAY tactical style."
-            )
-            response = result["response"]
-
-            # Track the call for later calibration checking — best-effort:
-            # a response that doesn't include a clean "X%" (rare, but the
-            # LLM occasionally hedges instead) just isn't logged rather
-            # than blocking the response on it.
-            if calibration:
-                try:
-                    import re
-                    pct_match = re.search(r"(\d{1,3})\s*%", response)
-                    if pct_match:
-                        calibration.log_prediction(prompt, int(pct_match.group(1)), reasoning=response)
-                except Exception:
-                    pass
-
-            _log(prompt, response, "probability")
-            return jsonify({"response": response, "mode": "probability"})
+        result = _cmd_probability(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Recognizance ─────────────────────────────────────────────────────
-        matched_recon = next((t for t in RECON_TRIGGERS if t in p_lower), None)
-        if matched_recon and RECON_OK and friday_brain:
-            # Case-insensitive strip of whichever trigger matched — p_lower
-            # already told us it's in there somewhere.
-            idx = p_lower.find(matched_recon)
-            situation = (prompt[:idx] + prompt[idx + len(matched_recon):]).strip() if idx >= 0 else prompt
-            result = recognizance.scout(situation or prompt)
-            response = result.get("brief") or "Nothing solid to report, boss."
-            _log(prompt, response, "recon")
-            audio_file = friday_speak(response) if VOICE_OK else None
-            return jsonify({
-                "response": response, "mode": "recon",
-                "has_audio": bool(audio_file), "audio_file": audio_file,
-            })
+        result = _cmd_recon(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── System doctor ────────────────────────────────────────────────────
-        DIAGNOSTICS_TRIGGERS = ["run diagnostics"]
-        if any(t in p_lower for t in DIAGNOSTICS_TRIGGERS):
-            from services import system_doctor
-            report = system_doctor.full_check()
-            response = "Health check unavailable, boss."
-            if friday_brain:
-                result = friday_brain.think(
-                    f"Summarize this system health check for the boss, naturally, "
-                    f"not as raw data. One or two sentences, FRIDAY style:\n{report}"
-                )
-                response = result.get("response", response)
-            _log(prompt, response, "diagnostics")
-            audio_file = friday_speak(response) if VOICE_OK else None
-            return jsonify({
-                "response": response, "mode": "diagnostics",
-                "has_audio": bool(audio_file), "audio_file": audio_file,
-            })
+        result = _cmd_diagnostics(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Cross-check with JARVIS ────────────────────────────────────────────
-        CROSS_CHECK_TRIGGERS = [
-            "check with jarvis", "cross check", "ask jarvis too",
-            "get a second opinion", "what does jarvis think",
-        ]
-        matched_trigger = next((t for t in CROSS_CHECK_TRIGGERS if t in p_lower), None)
-        if matched_trigger and cross_check:
-            question = prompt
-            for t in CROSS_CHECK_TRIGGERS:
-                question = question.lower().replace(t, "").strip()
-            question = question or prompt
-
-            result = cross_check.ask_both(question)
-            friday_side = result["friday"][:150]
-            jarvis_side = result["jarvis"][:150]
-            if result["agreement"]["aligned"]:
-                response = (
-                    f"We're aligned, boss. Me: \"{friday_side}\" "
-                    f"JARVIS: \"{jarvis_side}\""
-                )
-            else:
-                response = (
-                    f"We don't agree on this one, boss. Me: \"{friday_side}\" "
-                    f"JARVIS: \"{jarvis_side}\""
-                )
-            _log(prompt, response, "cross_check")
-            return jsonify({"response": response, "mode": "cross_check", "detail": result})
+        result = _cmd_cross_check(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Combat / normal mode ──────────────────────────────────────────────
-        if any(t in p_lower for t in COMBAT_TRIGGERS) and friday_brain:
-            friday_brain.set_voice_mode("combat")
-            response = "Combat mode. Standing by."
-            _log(prompt, response, "mode")
-            return jsonify({"response": response, "mode": "combat"})
+        result = _cmd_combat_mode(prompt, p_lower)
+        if result is not None:
+            return result
 
-        if any(t in p_lower for t in NORMAL_MODE_TRIGGERS) and friday_brain:
-            friday_brain.set_voice_mode("normal")
-            response = "Standing down, boss."
-            _log(prompt, response, "mode")
-            return jsonify({"response": response, "mode": "normal"})
+        result = _cmd_normal_mode(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Priority focus ────────────────────────────────────────────────────
-        if any(t in p_lower for t in PRIORITY_TRIGGERS) and friday_brain:
-            pending = [t for t in get_tasks() if not t.get("done")]
-            emails = []
-            if friday_gmail:
-                try:
-                    emails = friday_gmail.get_urgent()
-                except Exception:
-                    pass
-
-            notes_ctx = ""
-            if second_brain:
-                actions = second_brain.get_actions()
-                if actions:
-                    notes_ctx = "\n".join(a.get("action", "") for a in actions[:3])
-
-            energy = voice_memory.predict_energy_now() if voice_memory else ""
-
-            result = friday_brain.think(
-                f"Priority analysis — what should boss focus on NOW:\n\n"
-                f"Pending tasks ({len(pending)}):\n"
-                + "\n".join(f"- {t['task']}" for t in pending[:5])
-                + f"\n\nUrgent emails: {len(emails)}\n"
-                f"Pending actions from notes: {notes_ctx}\n"
-                f"Energy read: {energy}\n\n"
-                f"What's the single most important thing to do right now?\n"
-                f"Then the next 2 things. Be specific and decisive.\n"
-                f"Under 60 words. FRIDAY tactical style."
-            )
-            response = result["response"]
-            _log(prompt, response, "priority")
-            return jsonify({"response": response, "mode": "priority"})
+        result = _cmd_priority(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Travel intel ──────────────────────────────────────────────────────
-        if any(t in p_lower for t in TRAVEL_TRIGGERS) and friday_brain:
-            import re
-            match = re.search(
-                r"(?:traveling to|trip to|flying to|visiting)\s+(.+?)(?:\s+(?:for|on|next|this).*)?$",
-                p_lower
-            )
-            city = match.group(1).strip().title() if match else ""
-
-            if city:
-                from core.tools.web import search
-                results = search(f"{city} travel tips time zone weather", 3)
-                result = friday_brain.think(
-                    f"Travel intel for {city}:\n\n"
-                    + "\n".join(
-                        f"- {r.get('title', '')}: {r.get('snippet', '')[:100]}"
-                        for r in results[:3]
-                    )
-                    + "\n\nBrief travel brief:\n"
-                      "1. Current time and time zone difference from New York\n"
-                      "2. Current weather\n3. 2-3 things to know\nUnder 60 words. FRIDAY style."
-                )
-                response = result["response"]
-                _log(prompt, response, "travel")
-                return jsonify({"response": response, "mode": "travel"})
+        result = _cmd_travel(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Spotify direct control ────────────────────────────────────────────
-        if any(t in p_lower for t in SPOTIFY_STOP_TRIGGERS) and friday_spotify:
-            friday_spotify.pause()
-            response = "Pausing, boss."
-            _log(prompt, response, "spotify")
-            return jsonify({"response": response, "mode": "spotify"})
+        result = _cmd_spotify_stop(prompt, p_lower)
+        if result is not None:
+            return result
 
-        for trigger in SPOTIFY_PLAY_TRIGGERS:
-            if trigger in p_lower and friday_spotify:
-                query = p_lower.split(trigger)[-1].strip().replace("on spotify", "").strip()
-                result = friday_spotify.play(query)
-                if result.get("playing"):
-                    response = f"Playing {result.get('track', '')} by {result.get('artist', '')}, boss."
-                else:
-                    response = result.get("error", "Couldn't play that, boss.")
-                _log(prompt, response, "spotify")
-                return jsonify({"response": response, "mode": "spotify"})
+        result = _cmd_spotify_play(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Calendar: create an event ─────────────────────────────────────────
-        if any(t in p_lower for t in CALENDAR_ADD_TRIGGERS) and friday_brain:
-            if not (friday_calendar and friday_calendar.is_connected()):
-                response = "Your calendar isn't connected yet, boss."
-                _log(prompt, response, "calendar")
-                return jsonify({"response": response, "mode": "calendar"})
-
-            import re as rex
-            result = friday_brain.think(
-                f"Extract a calendar event from: {prompt}\n"
-                f"Current time: {datetime.datetime.now().isoformat()}\n\n"
-                f'Reply as JSON: {{"title": str, "start": "ISO 8601 datetime", '
-                f'"end": "ISO 8601 datetime"}}\n'
-                f"If no duration is given, default to 30 minutes. JSON only."
-            )
-            try:
-                clean = rex.sub(r"```json|```", "", result["response"]).strip()
-                data = json.loads(clean)
-                created = friday_calendar.create_event(
-                    data.get("title", "Event"), data["start"], data["end"]
-                )
-                if created.get("ok"):
-                    response = f"Added \"{data.get('title', 'Event')}\" to your calendar, boss."
-                else:
-                    response = created.get("error", "Couldn't add that to your calendar, boss.")
-            except Exception:
-                response = "Wasn't sure what to schedule there, boss — try again with a time?"
-            _log(prompt, response, "calendar")
-            return jsonify({"response": response, "mode": "calendar"})
+        result = _cmd_calendar_add(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Goals ─────────────────────────────────────────────────────────────
-        if any(t in p_lower for t in GOAL_REPORT_TRIGGERS) and goals:
-            active = goals.get_active_goals()
-            if not active:
-                response = "No goals tracked yet, boss. Tell me your goals and I'll track them."
-            elif friday_brain:
-                result = friday_brain.think(
-                    f"Quick goal status for {len(active)} active goals:\n"
-                    + "\n".join(
-                        f"- {g['name']}: {g.get('sessions', 0)} sessions, "
-                        f"last worked {(g.get('last_worked') or 'never')[:10]}"
-                        for g in active
-                    )
-                    + "\n\nBrief status. Under 40 words. FRIDAY style."
-                )
-                response = result["response"]
-            else:
-                response = f"{len(active)} active goals, boss."
-            _log(prompt, response, "goal_report")
-            return jsonify({"response": response, "mode": "goal_report"})
+        result = _cmd_goal_report(prompt, p_lower)
+        if result is not None:
+            return result
 
-        if any(t in p_lower for t in GOAL_ADD_TRIGGERS) and goals and friday_brain:
-            import re as rex
-            extract = friday_brain.think(
-                f"Extract goal from: '{prompt}'\n"
-                f'Reply as JSON: {{"name": str, "description": str}}'
-            )
-            try:
-                clean = rex.sub(r"```json|```", "", extract["response"]).strip()
-                data = json.loads(clean)
-                name = data.get("name", "")
-                if name:
-                    goals.add_goal(name, data.get("description", ""))
-                    response = f"Goal added, boss: {name}. I'll track your progress."
-                else:
-                    response = "What's the goal, boss?"
-            except Exception:
-                response = "What's the goal, boss?"
-            _log(prompt, response, "goal_add")
-            return jsonify({"response": response, "mode": "goal_add"})
+        result = _cmd_goal_add(prompt, p_lower)
+        if result is not None:
+            return result
 
         # Left out of the source spec's command() wiring entirely (the
         # trigger list was declared but never actually checked) — without
         # this, "worked on X" would never log progress, which defeats the
         # whole point of tracking goals automatically.
-        if any(t in p_lower for t in GOAL_PROGRESS_TRIGGERS) and goals:
-            log_result = goals.log_progress(work_done=prompt, auto_detect=True)
-            if log_result.get("logged"):
-                response = f"Logged progress on {log_result['goal']}, boss. Session {log_result['sessions']}."
-            else:
-                response = "Noted — didn't match it to a tracked goal, boss."
-            _log(prompt, response, "goal_progress")
-            return jsonify({"response": response, "mode": "goal_progress"})
+        result = _cmd_goal_progress(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Email: draft / triage (checked before EMAIL_TRIGGERS — that
         # list's bare "inbox"/"what emails" are substrings of these
         # phrases and would otherwise always win first) ────────────────────
-        if any(t in p_lower for t in DRAFT_TRIGGERS) and friday_gmail and friday_brain:
-            import re as rex
-            extract = friday_brain.think(
-                f"From this: '{prompt}'\n"
-                f"Extract: who to reply to and what to say.\n"
-                f'JSON: {{"to": str, "instruction": str}}'
-            )
-            try:
-                clean = rex.sub(r"```json|```", "", extract["response"]).strip()
-                data = json.loads(clean)
-                search = data.get("to", "")
-                instruction = data.get("instruction", "")
-            except Exception:
-                search, instruction = prompt, ""
-
-            found = friday_gmail.find_email(search)
-            if found:
-                draft_result = friday_gmail.draft_reply(
-                    email_subject=found.get("subject", ""), email_from=found.get("from", ""),
-                    email_body=found.get("body", ""), instruction=instruction,
-                    message_id=found.get("message_id", ""),
-                )
-                draft = draft_result.get("draft", "")
-                response = (
-                    f"Here's a draft reply to {found.get('from', '')[:30]}, boss:\n\n"
-                    f"{draft}\n\nWant me to send it or adjust anything?"
-                )
-            else:
-                response = "I couldn't find that email, boss. Try 'FRIDAY draft a reply to [exact name or subject]'."
-            _log(prompt, response, "email_draft")
-            return jsonify({"response": response, "mode": "email_draft"})
+        result = _cmd_email_draft(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Email: send the pending draft ("send it") ───────────────────────
-        if any(t in p_lower for t in SEND_TRIGGERS) and friday_gmail:
-            result = friday_gmail.send_draft()
-            if result.get("ok"):
-                response = f"Sent, boss. On its way to {result.get('to', '')}."
-            else:
-                response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
-            _log(prompt, response, "email_send")
-            return jsonify({"response": response, "mode": "email_send", **result})
+        result = _cmd_email_send(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Email: compose and send directly, no draft step ─────────────────
-        if any(t in p_lower for t in COMPOSE_SEND_TRIGGERS) and friday_gmail and friday_brain:
-            import re as rex
-            extract = friday_brain.think(
-                f"From this: '{prompt}'\n"
-                f"Extract who to email and what to say.\n"
-                f'JSON: {{"to": str, "subject": str, "body": str}}\n'
-                f"'to' should be the raw email address if one appears in the "
-                f"text, otherwise the name/description as given. 'subject' "
-                f"should be short and inferred from the message if none is "
-                f"stated. 'body' should be the message to send, written out "
-                f"in full sentences."
-            )
-            try:
-                clean = rex.sub(r"```json|```", "", extract["response"]).strip()
-                data = json.loads(clean)
-                to = data.get("to", "")
-                subject = data.get("subject", "")
-                body = data.get("body", "")
-            except Exception:
-                to, subject, body = "", "", ""
+        result = _cmd_email_compose_send(prompt, p_lower)
+        if result is not None:
+            return result
 
-            if not friday_gmail.extract_address(to):
-                # No bare address in the prompt or the extraction — try
-                # the contact book first (a name FRIDAY actually has an
-                # address for), then fall back to matching it against a
-                # recent inbox sender by name, the same lookup the
-                # reply-draft flow uses.
-                contact = friday_contacts.find_by_name(to) if friday_contacts else {}
-                if contact.get("email"):
-                    to = contact["email"]
-                else:
-                    found = friday_gmail.find_email(to)
-                    if found:
-                        to = found.get("from", "")
-
-            if not to or not body:
-                response = "Who's it going to, and what should it say, boss?"
-                _log(prompt, response, "email_compose_send")
-                return jsonify({"response": response, "mode": "email_compose_send"})
-
-            result = friday_gmail.send_email(to=to, subject=subject, body=body)
-            if result.get("ok"):
-                response = f"Sent, boss. On its way to {result.get('to', '')}."
-            else:
-                response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
-            _log(prompt, response, "email_compose_send")
-            return jsonify({"response": response, "mode": "email_compose_send", **result})
-
-        if any(t in p_lower for t in TRIAGE_TRIGGERS) and friday_gmail:
-            triage = friday_gmail.smart_triage()
-            summary = triage.get("summary", "")
-            cats = triage.get("categories", {})
-            urgent = cats.get("urgent", [])
-            response = (
-                f"Inbox triage complete, boss. {summary}.\n"
-                f"Urgent: {', '.join(urgent[:2]) if urgent else 'none'}."
-            )
-            _log(prompt, response, "email_triage")
-            return jsonify({"response": response, "triage": triage, "mode": "email_triage"})
+        result = _cmd_email_triage(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Email ─────────────────────────────────────────────────────────────
-        if any(t in p_lower for t in EMAIL_TRIGGERS) and friday_gmail:
-            summary = friday_gmail.summarize_inbox()
-            _log(prompt, summary, "email")
-            return jsonify({"response": summary, "mode": "email"})
+        result = _cmd_email_summary(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Note that ─────────────────────────────────────────────────────────
-        if any(t in p_lower for t in NOTE_TRIGGERS):
-            from core.friday_memory import save_note, get_recent_turns
-            turns = get_recent_turns(2)
-            note = {
-                "ts": datetime.datetime.now().isoformat(),
-                "content": turns[-1].get("friday", "") if turns else prompt,
-                "context": prompt,
-            }
-            save_note(note)
-            response = "Noted, boss."
-            _log(prompt, response, "note")
-            return jsonify({"response": response, "mode": "note"})
+        result = _cmd_note(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Reminders ─────────────────────────────────────────────────────────
-        if any(t in p_lower for t in REMINDER_TRIGGERS) and friday_brain:
-            import re as rex
-            result = friday_brain.think(
-                f"Extract reminder from: {prompt}\n\n"
-                f"Reply as JSON: {{\"task\": str, \"minutes\": int}}\n"
-                f"Examples:\n"
-                f"'remind me in 30 minutes to call back' -> {{\"task\":\"call back\",\"minutes\":30}}\n"
-                f"'remind me at 3pm' -> {{\"task\":\"reminder\",\"minutes\": calculated from now}}\n"
-                f"JSON only."
-            )["response"]
-            try:
-                clean = rex.sub(r"```json|```", "", result).strip()
-                data = json.loads(clean)
-                task = data.get("task", "reminder")
-                mins = int(data.get("minutes", 5))
-                add_reminder(task, mins)
-                response = f"Reminder set for {mins} minutes, boss. I'll let you know."
-            except Exception:
-                response = "What do you need reminding about, boss?"
-            _log(prompt, response, "reminder")
-            return jsonify({"response": response, "mode": "reminder"})
+        result = _cmd_reminder(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Task list ─────────────────────────────────────────────────────────
-        if any(t in p_lower for t in TASK_SHOW_TRIGGERS):
-            tasks = [t for t in get_tasks() if not t.get("done")]
-            if not tasks:
-                response = "Nothing on the list, boss. Clear schedule."
-            elif friday_brain:
-                result = friday_brain.think(
-                    f"Task list summary:\n"
-                    + "\n".join(f"- {t['task']}" for t in tasks[:10])
-                    + "\n\nBrief summary. What needs attention first. Under 40 words."
-                )
-                response = result["response"]
-            else:
-                response = f"{len(tasks)} things on your list, boss."
-            _log(prompt, response, "tasks")
-            return jsonify({"response": response, "mode": "tasks"})
+        result = _cmd_task_show(prompt, p_lower)
+        if result is not None:
+            return result
 
-        if any(t in p_lower for t in TASK_ADD_TRIGGERS) and friday_brain:
-            result = friday_brain.think(
-                f"Extract task from: {prompt}\n"
-                f"Reply with just the task. No extra text."
-            )["response"]
-            task = result.strip()
-            if task:
-                add_task(task)
-                response = f"Added to your list, boss: {task}"
-            else:
-                response = "What do you want to add, boss?"
-            _log(prompt, response, "task_add")
-            return jsonify({"response": response, "mode": "task_add"})
+        result = _cmd_task_add(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Medicine tracker ─────────────────────────────────────────────────
-        if any(t in p_lower for t in MED_SCHEDULE_TRIGGERS) and medicine_tracker:
-            response = medicine_tracker.get_schedule_summary()
-            _log(prompt, response, "medicine")
-            return jsonify({"response": response, "mode": "medicine"})
+        result = _cmd_med_schedule(prompt, p_lower)
+        if result is not None:
+            return result
 
-        if any(t in p_lower for t in MED_TAKEN_TRIGGERS) and medicine_tracker and friday_brain:
-            extract = friday_brain.think(
-                f"Extract medicine name from: '{prompt}'\n"
-                f"Reply with just the name, nothing else."
-            )
-            med_name = extract["response"].strip()
-            if med_name:
-                result = medicine_tracker.log_taken(med_name)
-                response = (
-                    f"Logged, boss. {med_name} marked as taken."
-                    if result.get("logged")
-                    else f"Couldn't find {med_name} in your schedule, boss."
-                )
-            else:
-                response = "Which medicine did you take, boss?"
-            _log(prompt, response, "medicine")
-            return jsonify({"response": response, "mode": "medicine"})
+        result = _cmd_med_taken(prompt, p_lower)
+        if result is not None:
+            return result
 
-        if any(t in p_lower for t in MED_SKIP_TRIGGERS) and medicine_tracker and friday_brain:
-            extract = friday_brain.think(
-                f"Extract medicine name from: '{prompt}'\n"
-                f"Reply with just the name, nothing else."
-            )
-            med_name = extract["response"].strip()
-            if med_name:
-                result = medicine_tracker.log_skipped(med_name)
-                response = (
-                    f"Got it, boss. {med_name} logged as skipped."
-                    if result.get("logged")
-                    else f"Couldn't find {med_name} in your schedule, boss."
-                )
-            else:
-                response = "Which medicine are you skipping, boss?"
-            _log(prompt, response, "medicine")
-            return jsonify({"response": response, "mode": "medicine"})
+        result = _cmd_med_skip(prompt, p_lower)
+        if result is not None:
+            return result
 
-        if any(t in p_lower for t in MED_ADD_TRIGGERS) and medicine_tracker and friday_brain:
-            import re as medrex
-            extract = friday_brain.think(
-                f"Extract medicine tracking info from: '{prompt}'\n"
-                f"Reply as JSON: {{\"name\": str, \"times\": [\"HH:MM\"], \"dosage\": str}}\n"
-                f"If time isn't specified, use a reasonable default "
-                f"like [\"08:00\"]. JSON only."
-            )
-            try:
-                clean = medrex.sub(r"```json|```", "", extract["response"]).strip()
-                data = json.loads(clean)
-                result = medicine_tracker.add_medicine(
-                    data.get("name", ""),
-                    data.get("times", ["08:00"]),
-                    data.get("dosage", ""),
-                )
-                response = (
-                    f"Added {result['name']} to your schedule, boss. "
-                    f"I'll remind you."
-                )
-            except Exception:
-                response = (
-                    "What medicine, and what time should I remind "
-                    "you, boss?"
-                )
-            _log(prompt, response, "medicine")
-            return jsonify({"response": response, "mode": "medicine"})
+        result = _cmd_med_add(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Smart home via HomeKit (Shortcuts run on the Mac Bridge) ──────────
-        for trigger, shortcut in HOMEKIT_TRIGGERS.items():
-            if trigger in p_lower:
-                if TRAINING_WHEELS_OK and not training_wheels.can_perform("mac_bridge_control"):
-                    response = "Not authorized yet, boss — trust score isn't there for Mac Bridge control."
-                    _log(prompt, response, "homekit")
-                    return jsonify({"response": response, "mode": "homekit", "blocked": True})
-
-                mac_url = os.environ.get("MAC_BRIDGE_URL", "")
-                if not mac_url:
-                    response = "Mac bridge isn't configured, boss."
-                else:
-                    try:
-                        import requests as req
-                        r = req.post(f"{mac_url}/mac/run",
-                                    json={"command": shortcut, "token": os.environ.get("MAC_BRIDGE_TOKEN", "")},
-                                    timeout=5)
-                        ok = r.status_code == 200 and not r.json().get("error")
-                        response = "Done, boss." if ok else "Couldn't reach the Mac bridge, boss."
-                    except Exception:
-                        ok = False
-                        response = "Couldn't reach the Mac bridge, boss."
-                    if TRAINING_WHEELS_OK:
-                        training_wheels.record_outcome("mac_bridge_control", ok)
-                _log(prompt, response, "homekit")
-                return jsonify({"response": response, "mode": "homekit"})
+        result = _cmd_homekit(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Open a Mac app via Mac Bridge ──────────────────────────────────────
-        MAC_APP_TRIGGERS = {
-            "open spotify": "Spotify", "open chrome": "Google Chrome",
-            "open safari": "Safari", "open terminal": "Terminal",
-            "open finder": "Finder", "open notes": "Notes",
-        }
-        for trigger, app_name in MAC_APP_TRIGGERS.items():
-            if trigger in p_lower:
-                if TRAINING_WHEELS_OK and not training_wheels.can_perform("mac_bridge_control"):
-                    response = "Not authorized yet, boss — trust score isn't there for Mac Bridge control."
-                    _log(prompt, response, "mac_bridge")
-                    return jsonify({"response": response, "mode": "mac_bridge", "blocked": True})
-
-                from services.mac_bridge import mac_bridge
-                result = mac_bridge.open_app(app_name)
-                ok = "error" not in result
-                response = f"Done, boss. {app_name} is opening." if ok else f"Couldn't reach your Mac, boss: {result['error']}"
-                if TRAINING_WHEELS_OK:
-                    training_wheels.record_outcome("mac_bridge_control", ok)
-                _log(prompt, response, "mac_bridge")
-                return jsonify({"response": response, "mode": "mac_bridge"})
+        result = _cmd_mac_app(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Home Assistant — status ─────────────────────────────────────────
-        if HA_OK and home_assistant and any(t in p_lower for t in HA_STATUS_TRIGGERS):
-            result = home_assistant.get_states()
-            if "error" in result:
-                response = "Home Assistant isn't reachable right now, boss."
-            else:
-                # "remote" entities duplicate their paired media_player's
-                # friendly name (e.g. the TV's remote.* and media_player.*
-                # both read "LivingRm (UN50NU6950)") — skip them so the
-                # readout doesn't repeat the same device twice.
-                devices = [
-                    {"name": e.get("attributes", {}).get("friendly_name", e["entity_id"]), "state": e["state"]}
-                    for e in result["states"]
-                    if e["entity_id"].split(".")[0] != "remote"
-                ]
-                lines = [f"{d['name']} is {d['state']}" for d in devices]
-                response = "Here's what Home Assistant sees, boss: " + "; ".join(lines) + "."
-                spawn_widget("data", {"title": "HOME ASSISTANT", "rows": devices})
-            _log(prompt, response, "home_assistant")
-            return jsonify({"response": response, "mode": "home_assistant"})
+        result = _cmd_ha_status(prompt, p_lower)
+        if result is not None:
+            return result
 
         # ── Home Assistant — generic turn on/off <device> ───────────────────
-        if HA_OK and home_assistant and ("turn on" in p_lower or "turn off" in p_lower):
-            for device_name, entity_id in HA_DEVICE_TRIGGERS.items():
-                if device_name in p_lower:
-                    domain = entity_id.split(".")[0]
-                    service = "turn_on" if "turn on" in p_lower else "turn_off"
-                    result = home_assistant.call_service(domain, service, entity_id)
-                    if "error" in result:
-                        response = "Home Assistant isn't reachable right now, boss."
-                    else:
-                        verb = "on" if service == "turn_on" else "off"
-                        response = f"Done, boss. Turning the {device_name} {verb}."
-                    _log(prompt, response, "home_assistant")
-                    return jsonify({"response": response, "mode": "home_assistant"})
+        result = _cmd_ha_toggle(prompt, p_lower)
+        if result is not None:
+            return result
 
         # Proxy to JARVIS if online and not in coverage mode
-        if JARVIS_ONLINE and not COVERAGE_MODE:
-            try:
-                import requests as req
-                r = req.post(
-                    f"{JARVIS_URL}/stark/chat", json={"message": prompt},
-                    headers={"Authorization": f"Bearer {JARVIS_TOKEN}"}, timeout=10,
-                )
-                if r.status_code == 200:
-                    response = r.json().get("response", "")
-                    _log(prompt, response, "jarvis-proxy")
-                    return jsonify({"response": safe(response), "mode": "jarvis", "via": "proxy"})
-            except Exception:
-                pass
+        result = _cmd_jarvis_proxy(prompt, p_lower)
+        if result is not None:
+            return result
 
         # FRIDAY handles it herself
         if friday_brain:
@@ -1958,22 +2276,41 @@ def command():
                         except Exception:
                             pass
 
-                context = get_context_for(prompt)
+                # Conversation-turn recall (keyword-matched past exchanges)
+                # is the one context source core/memory_hub.py doesn't cover
+                # -- kept as its own lookup here, and deliberately the most
+                # generic signal, so it sits last in the prepend order below.
+                try:
+                    from core.friday_memory import recall as recall_conversations
+                    recalled = recall_conversations(prompt, 3)
+                except Exception:
+                    recalled = []
+                context = f"Recent relevant: {' | '.join(recalled)}" if recalled else ""
+
                 if TRAINING_OK:
                     knowledge = friday_trainer.get_context_brief(prompt)
                     if knowledge:
                         context = "\n".join(filter(None, [knowledge, context]))
-                if WISDOM_OK:
-                    # Prepended, not appended — _build_messages() truncates
-                    # context to its first 500 chars, so query-specific
-                    # relevant history needs to survive that cut ahead of
-                    # the more generic facts/recall context, not after it.
-                    try:
-                        wisdom = get_wisdom_context(prompt)
-                        if wisdom:
-                            context = "\n".join(filter(None, [wisdom, context]))
-                    except Exception as e:
-                        logging.warning(f"Wisdom context lookup failed: {e}")
+
+                # core/memory_hub.py's unified recall() -- facts, notes,
+                # second_brain, continuity's unresolved topics, and (via
+                # services/wisdom.py) decisions/reading/journal, all ranked
+                # together. Replaces the old separate get_context_for()
+                # facts lookup and standalone wisdom lookup that used to
+                # live here -- both were subsets of what this one call
+                # already covers, so calling both was redundant, not
+                # additive. Prepended, not appended — _build_messages()
+                # truncates context to its first 500 chars, so this
+                # query-specific, already-ranked signal needs to survive
+                # that cut ahead of the more generic context above.
+                try:
+                    from core.memory_hub import recall as recall_memory
+                    hits = recall_memory(prompt, limit=5)
+                    if hits:
+                        memory_context = "; ".join(h["text"] for h in hits)
+                        context = "\n".join(filter(None, [memory_context, context]))
+                except Exception as e:
+                    logging.warning(f"Memory hub recall failed: {e}")
 
                 if COVERAGE_MODE:
                     friday_brain.set_voice_mode("coverage")
