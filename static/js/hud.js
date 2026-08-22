@@ -129,6 +129,19 @@ function quickSend(text) {
   send();
 }
 
+// Forces the local-model path on demand, without waiting for a real
+// network failure -- lets the boss verify the whole offline pipeline
+// (model download, wllama load, actual inference) while still on wifi,
+// instead of finding out it's broken only after losing signal for real.
+async function testOfflineMode() {
+  const inp = document.getElementById('chat-inp');
+  const text = inp.value.trim() || "Status check, boss.";
+  inp.value = '';
+  addMsg('user', 'YOU (OFFLINE TEST)', text);
+  showThinking();
+  await sendOffline(text);
+}
+
 function escapeHtml(s) {
   const div = document.createElement('div');
   div.textContent = s;
