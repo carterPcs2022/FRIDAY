@@ -206,6 +206,7 @@ from routes.reasoning import reasoning_bp
 from routes.emcon_scenarios import emcon_scenarios_bp
 from routes.life_admin import life_admin_bp
 from routes.hud_page import hud_page_bp
+from routes.offline import offline_bp
 
 app.register_blueprint(voice_vision_bp)
 app.register_blueprint(phone_bp)
@@ -223,6 +224,7 @@ app.register_blueprint(reasoning_bp)
 app.register_blueprint(emcon_scenarios_bp)
 app.register_blueprint(life_admin_bp)
 app.register_blueprint(hud_page_bp)
+app.register_blueprint(offline_bp)
 
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")

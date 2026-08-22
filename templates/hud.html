@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>F.R.I.D.A.Y</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='css/hud.css') }}">
+<link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
+<link rel="icon" href="{{ url_for('static', filename='icons/icon.svg') }}">
+<meta name="theme-color" content="#000814">
 </head>
 <body>
 
@@ -194,6 +197,7 @@
       <button class="qa-btn" onclick="quickSend('FRIDAY run a morning brief')">Morning Brief</button>
       <button class="qa-btn" onclick="quickSend('FRIDAY threat assessment')">Threat Scan</button>
       <button class="qa-btn" onclick="quickSend('What is your status')">Status</button>
+      <button class="qa-btn" onclick="window.FridayOfflineSync && window.FridayOfflineSync.showOfflineData()" title="Last-synced tasks/notes/calendar — works with no internet">Cached Data</button>
     </div>
 
     <div class="input-row">
@@ -218,6 +222,8 @@
 <button class="mute-float" id="mute-float" onclick="toggleMute()" title="Mute voice">&#128266;</button>
 
 
+<script src="{{ url_for('static', filename='js/offline_sync.js') }}"></script>
+<script src="{{ url_for('static', filename='js/offline_model.js') }}"></script>
 <script src="{{ url_for('static', filename='js/hud.js') }}"></script>
 <script src="{{ url_for('static', filename='js/hud_reticle.js') }}"></script>
 </body>
