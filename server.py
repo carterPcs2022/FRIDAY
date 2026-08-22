@@ -1049,6 +1049,19 @@ def _cmd_capabilities(prompt):
                 break
 
 
+def _cmd_weather(prompt, p_lower):
+    if "weather" in p_lower:
+        location = ""
+        for marker in ("weather in ", "weather for ", "weather at "):
+            if marker in p_lower:
+                location = p_lower.split(marker, 1)[1].strip().rstrip("?.!")
+                break
+        brief = get_weather_brief(location)
+        response = brief if brief else "Couldn't reach a weather service right now, boss."
+        _log(prompt, response, "weather")
+        return jsonify({"response": response, "mode": "weather"})
+
+
 def _cmd_news(prompt, p_lower):
     if ("news" in p_lower or "what's happening" in p_lower) and news_anchor:
         response = news_anchor.morning_brief()
@@ -2086,6 +2099,10 @@ def command():
         # CAPABILITY_MAP above: FRIDAY's own named abilities, checked before
         # the JARVIS proxy for the same reason.
         p_lower = prompt.lower()
+
+        result = _cmd_weather(prompt, p_lower)
+        if result is not None:
+            return result
 
         result = _cmd_news(prompt, p_lower)
         if result is not None:

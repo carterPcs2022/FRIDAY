@@ -19,7 +19,7 @@ knowledge_bp = Blueprint("knowledge", __name__)
 
 @knowledge_bp.route("/friday/weather")
 def weather_route():
-    return jsonify({"weather": get_weather_brief()})
+    return jsonify({"weather": get_weather_brief(request.args.get("location", ""))})
 
 
 @knowledge_bp.route("/friday/brain/ingest", methods=["POST"])
