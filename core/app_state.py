@@ -118,6 +118,14 @@ except Exception as e:
     logging.warning(f"Veronica failed: {e}")
 
 try:
+    import core.self_repair as self_repair
+    SELF_REPAIR_OK = True
+except Exception as e:
+    self_repair = None
+    SELF_REPAIR_OK = False
+    logging.warning(f"Self-repair failed: {e}")
+
+try:
     from core.friday_capabilities import CAPABILITY_MAP, friday_caps
     CAPABILITIES_OK = True
 except Exception as e:
@@ -657,6 +665,7 @@ __all__ = [
     "RangeLevel",
     "SCATTER_OK",
     "SECURITY_OK",
+    "SELF_REPAIR_OK",
     "TASKS_TABLE",
     "TASK_FILE",
     "TEAM_OK",
@@ -733,6 +742,7 @@ __all__ = [
     "save_turn",
     "scatter_engine",
     "second_brain",
+    "self_repair",
     "social",
     "spawn_widget",
     "suit_lockdown",

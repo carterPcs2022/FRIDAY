@@ -1390,6 +1390,50 @@ def _cmd_diagnostics(prompt, p_lower):
         })
 
 
+def _cmd_self_repair(prompt, p_lower):
+    CONFIRM_TRIGGERS = [
+        "confirm the repair", "confirm repair", "apply the repair",
+        "apply the fix", "go ahead and repair yourself",
+    ]
+    if any(t in p_lower for t in CONFIRM_TRIGGERS) and SELF_REPAIR_OK:
+        result = self_repair.confirm_repair()
+        response = (f"Done, boss — {result['target']} is patched and live."
+                    if result["applied"] else f"Couldn't apply it: {result['reason']}")
+        _log(prompt, response, "self_repair")
+        audio_file = friday_speak(response) if VOICE_OK else None
+        return jsonify({"response": response, "mode": "self_repair",
+                         "has_audio": bool(audio_file), "audio_file": audio_file, **result})
+
+    RUN_TRIGGERS = [
+        "self repair", "repair yourself", "diagnose yourself",
+        "fix yourself", "check yourself for bugs",
+    ]
+    if any(t in p_lower for t in RUN_TRIGGERS) and SELF_REPAIR_OK:
+        result = self_repair.attempt_repair()
+        status = result["status"]
+        RESPONSES = {
+            "nothing_to_repair": "Ran full diagnostics — every test passes, nothing to repair, boss.",
+            "cannot_localize": "Found a failing test but couldn't trace it back to one of my "
+                                "watched files — needs a human look.",
+            "propose_failed": f"Found the failure in {result.get('target')} but couldn't "
+                               f"generate a fix: {result.get('reason')}",
+            "cannot_apply_safely": f"Found a fix for {result.get('target')} but couldn't apply "
+                                    f"it safely: {result.get('reason')}",
+            "sandbox_fix_invalid": f"Tried a fix for {result.get('target')} — it doesn't even "
+                                    f"compile, discarding it.",
+            "sandbox_fix_failed": f"Tried a fix for {result.get('target')} in a sandbox — "
+                                   f"still fails, discarding it.",
+            "awaiting_confirmation": f"Found and sandbox-tested a fix for {result.get('target')}, "
+                                      f"boss. Full suite passes in the sandbox. Say \"apply the "
+                                      f"fix\" and I'll make it live.",
+        }
+        response = RESPONSES.get(status, f"Self-repair status: {status}")
+        _log(prompt, response, "self_repair")
+        audio_file = friday_speak(response) if VOICE_OK else None
+        return jsonify({"response": response, "mode": "self_repair",
+                         "has_audio": bool(audio_file), "audio_file": audio_file, "status": status})
+
+
 def _cmd_cross_check(prompt, p_lower):
     CROSS_CHECK_TRIGGERS = [
         "check with jarvis", "cross check", "ask jarvis too",
@@ -2113,6 +2157,11 @@ def command():
 
         # ── System doctor ────────────────────────────────────────────────────
         result = _cmd_diagnostics(prompt, p_lower)
+        if result is not None:
+            return result
+
+        # ── Self-repair: diagnose/fix/sandbox-test/confirm her own bugs ────────
+        result = _cmd_self_repair(prompt, p_lower)
         if result is not None:
             return result
 

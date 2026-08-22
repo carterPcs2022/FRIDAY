@@ -27,7 +27,7 @@ DISPATCHER_FUNCTIONS = [
     "_cmd_code_review", "_cmd_remember_this", "_cmd_people_brief",
     "_cmd_caller_id", "_cmd_call_initiate", "_cmd_sms_send", "_cmd_catchup",
     "_cmd_focus", "_cmd_habit_log", "_cmd_journal", "_cmd_probability",
-    "_cmd_recon", "_cmd_diagnostics", "_cmd_cross_check", "_cmd_combat_mode",
+    "_cmd_recon", "_cmd_diagnostics", "_cmd_self_repair", "_cmd_cross_check", "_cmd_combat_mode",
     "_cmd_normal_mode", "_cmd_priority", "_cmd_travel", "_cmd_spotify_stop",
     "_cmd_spotify_play", "_cmd_calendar_add", "_cmd_goal_report",
     "_cmd_goal_add", "_cmd_goal_progress", "_cmd_email_draft",
@@ -113,6 +113,41 @@ class TestExtractedTriggerBlocks:
         with app.test_request_context():
             result = server._cmd_diagnostics("how are you", "how are you")
         assert result is None
+
+    def test_self_repair_run_trigger_reports_nothing_to_repair(self, app):
+        with app.test_request_context(), \
+             mock.patch("server.SELF_REPAIR_OK", True), \
+             mock.patch("server.self_repair") as sr, \
+             mock.patch("server.VOICE_OK", False):
+            sr.attempt_repair.return_value = {"status": "nothing_to_repair"}
+            result = server._cmd_self_repair("run a self repair", "run a self repair")
+            assert result is not None
+            body = result.get_json()
+            assert body["mode"] == "self_repair"
+            assert "nothing to repair" in body["response"].lower()
+        sr.attempt_repair.assert_called_once()
+        sr.confirm_repair.assert_not_called()
+
+    def test_self_repair_confirm_trigger_applies_staged_fix(self, app):
+        with app.test_request_context(), \
+             mock.patch("server.SELF_REPAIR_OK", True), \
+             mock.patch("server.self_repair") as sr, \
+             mock.patch("server.VOICE_OK", False):
+            sr.confirm_repair.return_value = {"applied": True, "target": "core/friday_memory.py"}
+            result = server._cmd_self_repair("apply the fix", "apply the fix")
+            assert result is not None
+            body = result.get_json()
+            assert body["mode"] == "self_repair"
+            assert "core/friday_memory.py" in body["response"]
+        sr.confirm_repair.assert_called_once()
+        sr.attempt_repair.assert_not_called()
+
+    def test_self_repair_returns_none_when_no_trigger(self, app):
+        with app.test_request_context(), mock.patch("server.self_repair") as sr:
+            result = server._cmd_self_repair("what time is it", "what time is it")
+        assert result is None
+        sr.attempt_repair.assert_not_called()
+        sr.confirm_repair.assert_not_called()
 
     def test_cross_check_matches_trigger(self, app):
         with app.test_request_context(), mock.patch("server.cross_check") as cc:

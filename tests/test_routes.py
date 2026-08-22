@@ -9,7 +9,7 @@ would error at collection if it weren't) — the rest pins the actual
 shape so a future change that drops or duplicates a route fails loudly
 here instead of showing up as a 404 in production.
 """
-KNOWN_ROUTE_COUNT = 162  # 159 as of the blueprint split + 2 memory_hub routes (Phase 2) + /friday/permissions (Phase 3)
+KNOWN_ROUTE_COUNT = 164  # 162 (see above) + 2 self-repair routes (/friday/self_repair/run, /friday/self_repair/confirm)
 
 # A representative sample across every blueprint, not the full 159 --
 # enough to catch "a whole blueprint failed to register" without this
