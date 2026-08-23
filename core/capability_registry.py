@@ -28,16 +28,14 @@ is the phase's own instruction; CAPABILITY_MAP is the natural, already-
 named starting slice, not the finish line.
 
 Honest-state finding from this audit (the concrete case the V3
-directive's Phase 25 calls out by name): core/friday_capabilities.py
-defines hack_security() and remote_system_control() as pure flavor — a
-voice line and a success dict, no real system behind either — but
-neither is actually wired into CAPABILITY_MAP. There's no trigger
-phrase that reaches them from chat at all; they're dead code, not
-merely simulated. Not fixed here (wiring them up or deleting them is a
-call for the boss, per the V3 directive's own deprecation process, not
-something to decide as a side effect of building a registry) — but
-worth surfacing plainly rather than quietly cataloguing them as if they
-were live capabilities.
+directive's Phase 25 calls out by name): core/friday_capabilities.py's
+hack_security() and remote_system_control() were pure flavor — a voice
+line and a success dict, no real system behind either — AND unreachable
+from chat entirely, with no trigger phrase wired up at all. The boss
+chose to wire them into CAPABILITY_MAP rather than delete them, so
+they're now reachable, but still exactly as simulated as their own
+docstrings say. Both are marked simulated=True below, distinct from
+every other CAPABILITY_MAP entry.
 """
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -162,10 +160,9 @@ _CHAT_CAPABILITY_META: dict[str, tuple] = {
     "deploy veronica": ("Runs a real Veronica monitor pass — restores/alerts on watched components", False, False, _veronica_available),
     "call mom": ("Fires the pre-configured Pushcut 'Call Mom' notification", False, False, _pushcut_mom_available),
     "call my mom": ("Fires the pre-configured Pushcut 'Call Mom' notification", False, False, _pushcut_mom_available),
-    # hack_security() and remote_system_control() are NOT here -- see
-    # this module's docstring. They're not in CAPABILITY_MAP at all, so
-    # there's nothing to register; including them would misrepresent
-    # dead code as a live (if simulated) capability.
+    # The two honest exceptions -- see this module's docstring.
+    "hack security": ("Pure flavor: speaks a line, no real system accessed", False, True, None),
+    "remote system control": ("Pure flavor: speaks a line, no real system controlled", False, True, None),
 }
 
 

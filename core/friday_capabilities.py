@@ -107,12 +107,13 @@ class FridayMCUCapabilities:
 
     def hack_security(self, system: str, action: str = "") -> dict:
         """Pure flavor — no real system to override here."""
+        message = f"Accessing {system}."
         try:
             from services.friday_voice import speak
-            speak(f"Accessing {system}.")
+            speak(message)
         except Exception:
             pass
-        return {"system": system, "action": action, "status": "initiated"}
+        return {"system": system, "action": action, "status": "initiated", "message": message}
 
     # ── Homecoming ───────────────────────────────────────────────────────
 
@@ -124,13 +125,14 @@ class FridayMCUCapabilities:
         )
         return {"scan": result.get("response", "")}
 
-    def remote_system_control(self, system: str, command: str) -> dict:
+    def remote_system_control(self, system: str, command: str = "") -> dict:
+        message = f"{system} — {command}. On it." if command else f"{system}. On it."
         try:
             from services.friday_voice import speak
-            speak(f"{system} — {command}. On it.")
+            speak(message)
         except Exception:
             pass
-        return {"system": system, "command": command, "executed": True}
+        return {"system": system, "command": command, "executed": True, "message": message}
 
     # ── Infinity War ─────────────────────────────────────────────────────
 
@@ -252,4 +254,13 @@ CAPABILITY_MAP = {
     "deploy veronica": (lambda q: friday_caps.deploy_veronica(), "status"),
     "call mom": (_call_mom, "message"),
     "call my mom": (_call_mom, "message"),
+    # Previously defined on FridayMCUCapabilities but never wired to a
+    # trigger phrase -- unreachable from chat entirely, not merely
+    # simulated. Found during the V3 capability-registry audit and
+    # wired in rather than deleted, same "pure flavor, no real system"
+    # honesty as everything else in this file (see hack_security() and
+    # remote_system_control()'s own docstrings) -- both are marked
+    # simulated=True in core/capability_registry.py's metadata.
+    "hack security": (lambda q: friday_caps.hack_security(q), "message"),
+    "remote system control": (lambda q: friday_caps.remote_system_control(q), "message"),
 }
