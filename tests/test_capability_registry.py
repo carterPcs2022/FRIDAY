@@ -106,19 +106,27 @@ class TestRegisterChatCapabilities:
         count = register_chat_capabilities(registry)
         assert count == len(CAPABILITY_MAP)
 
-    def test_hack_security_and_remote_system_control_are_not_registered(self):
-        """Audit finding, not a design choice: neither method is wired
-        into the real CAPABILITY_MAP at all (verified against the
-        actual dict, not assumed) -- they're unreachable dead code, not
-        merely simulated. Registering them as capabilities would
-        misrepresent that."""
+    def test_hack_security_is_marked_simulated(self):
+        """Was unreachable dead code at audit time (no trigger phrase
+        wired up at all); the boss chose to wire it in rather than
+        delete it, so it's now reachable but still marked simulated --
+        still true to hack_security()'s own "pure flavor" docstring."""
         from core.friday_capabilities import CAPABILITY_MAP
-        assert "hack security" not in CAPABILITY_MAP
-        assert "remote system control" not in CAPABILITY_MAP
+        assert "hack security" in CAPABILITY_MAP
         registry = CapabilityRegistry()
         register_chat_capabilities(registry)
-        assert registry.get("chat:hack security") is None
-        assert registry.get("chat:remote system control") is None
+        cap = registry.get("chat:hack security")
+        assert cap is not None
+        assert cap.simulated is True
+
+    def test_remote_system_control_is_marked_simulated(self):
+        from core.friday_capabilities import CAPABILITY_MAP
+        assert "remote system control" in CAPABILITY_MAP
+        registry = CapabilityRegistry()
+        register_chat_capabilities(registry)
+        cap = registry.get("chat:remote system control")
+        assert cap is not None
+        assert cap.simulated is True
 
     def test_ordinary_capability_is_not_marked_simulated(self):
         registry = CapabilityRegistry()
