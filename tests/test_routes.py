@@ -9,7 +9,11 @@ would error at collection if it weren't) — the rest pins the actual
 shape so a future change that drops or duplicates a route fails loudly
 here instead of showing up as a 404 in production.
 """
-KNOWN_ROUTE_COUNT = 167  # 164 (see above) + 3 offline-mode routes (/service-worker.js, /friday/offline/config, /friday/offline/snapshot)
+KNOWN_ROUTE_COUNT = 168  # 167 (see above) + /friday/policy/evaluate (V3 Phase 5).
+# /friday/capabilities pre-existed (a thin CAPABILITY_MAP-trigger-names stub);
+# V3 Phase 3 replaced its implementation in place with the capability
+# registry rather than adding a second, competing "capabilities" route --
+# same path+method, so no net route-count change from that one.
 
 # A representative sample across every blueprint, not the full 159 --
 # enough to catch "a whole blueprint failed to register" without this

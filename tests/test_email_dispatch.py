@@ -57,3 +57,26 @@ def test_fully_specified_email_sends_directly(client, mocked_send_methods):
     assert resp.status_code == 200
     assert send_email.called
     assert not send_draft.called
+
+
+class TestVerificationIsAttached:
+    """V3 Phase 13: the route standardizes send_email()'s own {"ok": ...}
+    into a verification block rather than inventing depth SMTP can't
+    actually provide (see core/verification_engine.py)."""
+
+    def test_successful_send_is_marked_verified(self, client):
+        with mock.patch.object(friday_gmail, "send_email",
+                                return_value={"ok": True, "to": "a@b.com"}):
+            resp = client.post("/friday/email/send", json={"to": "a@b.com", "body": "hi"})
+        body = resp.get_json()
+        assert body["verification"]["status"] == "verified"
+        assert body["verification"]["verified"] is True
+
+    def test_failed_send_is_marked_failed_not_silently_verified(self, client):
+        with mock.patch.object(friday_gmail, "send_email",
+                                return_value={"ok": False, "error": "SMTP auth failed"}):
+            resp = client.post("/friday/email/send", json={"to": "a@b.com", "body": "hi"})
+        body = resp.get_json()
+        assert body["verification"]["status"] == "failed"
+        assert body["verification"]["verified"] is False
+        assert "SMTP auth failed" in body["verification"]["detail"]
