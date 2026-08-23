@@ -2,6 +2,20 @@ const BASE = '';
 let muted = false, recording = false;
 let currentAudio = null;
 let leftOpen = false, rightOpen = false;
+// Offline mode: set once a real /command request has failed to reach the
+// network and the local in-browser model (static/js/offline_model.js) has
+// answered instead. While true, pollState() backs off so its 5s poll
+// doesn't fight this badge back to "DEGRADED" every cycle -- see send().
+let offlineModeActive = false;
+let offlineHistory = [];
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/service-worker.js').catch((e) => {
+      console.warn('Service worker registration failed:', e);
+    });
+  });
+}
 
 (function() {
   const container = document.getElementById('particles');
@@ -48,24 +62,84 @@ async function send() {
   addMsg('user', 'YOU', text);
   showThinking();
   try {
-    const r = await fetch(`${BASE}/command`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({prompt: text}),
-    });
+    // A short client-side timeout, not just relying on the fetch ever
+    // rejecting -- a request into a dead network (ship wifi, dropped
+    // connection) can hang far longer than it's worth waiting before
+    // falling back to the local model.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    let r;
+    try {
+      r = await fetch(`${BASE}/command`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prompt: text}),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     const d = await r.json();
     hideThinking();
+    setOfflineBadge(false);
     addMsg('fri', 'FRIDAY', d.response || '...', {model: d.model || '', ms: d.ms || 0, emotion: d.emotion});
     showFace();
     if (!muted && d.has_audio && d.audio_file) playAudio(d.audio_file);
   } catch(e) {
+    await sendOffline(text);
+  }
+}
+
+async function sendOffline(text) {
+  if (!window.FridayOffline) {
     hideThinking();
     addMsg('sys', 'SYSTEM', 'Connection issue, boss.');
+    return;
+  }
+  setOfflineBadge(true);
+  try {
+    const reply = await window.FridayOffline.generateOffline(offlineHistory, text, (frac) => {
+      showThinking(`LOADING LOCAL MODEL ${Math.round(frac * 100)}%`);
+    });
+    hideThinking();
+    offlineHistory.push({role: 'user', content: text}, {role: 'assistant', content: reply});
+    addMsg('fri', 'FRIDAY', reply, {model: 'local (offline)', ms: 0});
+    showFace();
+  } catch (e) {
+    hideThinking();
+    addMsg('sys', 'SYSTEM',
+      "Can't reach the server, and the local model isn't set up on this device, boss.");
+  }
+}
+
+function setOfflineBadge(active) {
+  offlineModeActive = active;
+  const pill = document.getElementById('status-pill');
+  if (!pill) return;
+  if (active) {
+    pill.textContent = 'OFFLINE · LOCAL';
+    pill.className = 'pill warn';
+  } else {
+    pill.textContent = 'ONLINE';
+    pill.className = 'pill online';
   }
 }
 
 function quickSend(text) {
   document.getElementById('chat-inp').value = text;
   send();
+}
+
+// Forces the local-model path on demand, without waiting for a real
+// network failure -- lets the boss verify the whole offline pipeline
+// (model download, wllama load, actual inference) while still on wifi,
+// instead of finding out it's broken only after losing signal for real.
+async function testOfflineMode() {
+  const inp = document.getElementById('chat-inp');
+  const text = inp.value.trim() || "Status check, boss.";
+  inp.value = '';
+  addMsg('user', 'YOU (OFFLINE TEST)', text);
+  showThinking();
+  await sendOffline(text);
 }
 
 function escapeHtml(s) {
@@ -98,11 +172,17 @@ function addMsg(type, label, text, meta = {}) {
 }
 
 let thinkEl = null;
-function showThinking() {
+function showThinking(label) {
   const area = document.getElementById('messages');
+  if (thinkEl) {
+    // Re-used for progress updates (e.g. local model download %) rather
+    // than stacking a new bubble on every callback tick.
+    thinkEl.querySelector('.thinking-text').textContent = label || 'FRIDAY IS THINKING';
+    return;
+  }
   thinkEl = document.createElement('div');
   thinkEl.className = 'thinking-bubble';
-  thinkEl.innerHTML = `<div class="think-dots-wrap"><div class="tdot"></div><div class="tdot"></div><div class="tdot"></div></div><span class="thinking-text">FRIDAY IS THINKING</span>`;
+  thinkEl.innerHTML = `<div class="think-dots-wrap"><div class="tdot"></div><div class="tdot"></div><div class="tdot"></div></div><span class="thinking-text">${label || 'FRIDAY IS THINKING'}</span>`;
   area.appendChild(thinkEl);
   area.scrollTop = area.scrollHeight;
 }
@@ -745,6 +825,7 @@ async function runProto(n) {
 }
 
 async function pollState() {
+  if (offlineModeActive) return; // let the offline badge stand until send() clears it
   try {
     const r = await fetch(`${BASE}/state`);
     const d = await r.json();

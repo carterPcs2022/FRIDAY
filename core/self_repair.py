@@ -243,8 +243,28 @@ def confirm_repair(token: str = None) -> dict:
     except Exception as e:
         return {"applied": False, "reason": str(e)}
 
+    # V3 Phase 13: writing without an exception isn't proof the write
+    # landed correctly -- re-read the file and re-compile it. A mismatch
+    # here (partial write, disk issue) rolls back to the pre-fix content
+    # automatically rather than leaving a live core file in an unknown
+    # state, same "never claim success solely because a call returned"
+    # principle as everywhere else in this module.
+    from core.verification_engine import verify_self_repair_apply
+
+    verification = verify_self_repair_apply(path, payload["fixed_content"])
+    if not verification.ok:
+        try:
+            path.write_text(payload["live_content"])
+            rollback = "rolled back to the pre-fix content"
+        except Exception as e:
+            rollback = f"ROLLBACK ALSO FAILED: {e} — {payload['rel_path']} may be in a broken state, needs manual attention"
+        _log({"type": "repair_verification_failed", "target": payload["rel_path"],
+              "detail": verification.detail, "rollback": rollback, "ts": datetime.now().isoformat()})
+        return {"applied": False, "verified": False,
+                "reason": f"post-write verification failed: {verification.detail} ({rollback})"}
+
     _log({"type": "repair_applied", "target": payload["rel_path"], "ts": datetime.now().isoformat()})
-    return {"applied": True, "target": payload["rel_path"]}
+    return {"applied": True, "verified": True, "target": payload["rel_path"]}
 
 
 def _log(entry: dict):

@@ -1,0 +1,14 @@
+{
+  "name": "F.R.I.D.A.Y",
+  "short_name": "FRIDAY",
+  "description": "F.R.I.D.A.Y holographic interface",
+  "start_url": "/hud",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#000814",
+  "theme_color": "#000814",
+  "orientation": "any",
+  "icons": [
+    { "src": "/static/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

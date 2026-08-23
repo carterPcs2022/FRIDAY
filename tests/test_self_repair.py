@@ -228,7 +228,7 @@ class TestConfirmRepair:
 
         result = self_repair.confirm_repair(token)
 
-        assert result == {"applied": True, "target": "core/friday_memory.py"}
+        assert result == {"applied": True, "verified": True, "target": "core/friday_memory.py"}
         assert live_file.read_text() == "new"
 
     def test_defaults_to_most_recently_staged_token_when_none_given(self, tmp_path, monkeypatch):
@@ -273,3 +273,25 @@ class TestConfirmRepair:
     def test_no_pending_fix_reports_clearly(self):
         result = self_repair.confirm_repair()
         assert result == {"applied": False, "reason": "no pending self-repair fix"}
+
+    def test_post_write_verification_failure_rolls_back_the_live_file(self, tmp_path, monkeypatch):
+        """The core addition from V3 Phase 13: a write that raised no
+        exception isn't proof it landed correctly. A failed post-write
+        check must restore the pre-fix content, not leave a live core
+        file in an unknown state."""
+        monkeypatch.setattr(self_repair, "BASE_DIR", tmp_path)
+        (tmp_path / "core").mkdir()
+        live_file = tmp_path / "core" / "friday_memory.py"
+        live_file.write_text("old")
+        token = self._stage_fix(live_content="old", fixed_content="new")
+
+        from core.verification_engine import VerificationResult, VerificationStatus
+        with mock.patch("core.verification_engine.verify_self_repair_apply",
+                         return_value=VerificationResult(VerificationStatus.FAILED, "disk write corrupted")):
+            result = self_repair.confirm_repair(token)
+
+        assert result["applied"] is False
+        assert result["verified"] is False
+        assert "disk write corrupted" in result["reason"]
+        assert "rolled back" in result["reason"]
+        assert live_file.read_text() == "old"  # restored, not left as "new"

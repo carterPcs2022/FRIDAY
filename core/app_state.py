@@ -23,6 +23,7 @@ moment server.py switched to a star-import.
 import json
 import logging
 import datetime
+import os
 import threading
 from collections import deque
 from pathlib import Path
@@ -622,11 +623,25 @@ def emergency(prompt: str) -> str:
     return "I'm here, boss. Systems are limited right now."
 
 
-def get_weather_brief() -> str:
-    """wttr.in's plaintext format — free, no API key, no account."""
+def get_weather_brief(location: str = "") -> str:
+    """wttr.in's plaintext format — free, no API key, no account.
+
+    A given location wins. Otherwise falls back to FRIDAY_HOME_LOCATION
+    if set, and only then to wttr.in's own IP geolocation as a last
+    resort — that geolocates the SERVER (Render's datacenter), not the
+    boss, so it's the least useful of the three and was previously the
+    *only* option, which is why a bare "what's the weather" was never
+    wired into /command: there was nothing honest to say without a
+    location. FRIDAY_HOME_LOCATION fixes the common case (a bare
+    request meaning "here"); a request naming a place still overrides it.
+    """
     try:
         import httpx
-        r = httpx.get("https://wttr.in/?format=3", timeout=5)
+        from urllib.parse import quote
+
+        loc = location or os.getenv("FRIDAY_HOME_LOCATION", "")
+        url = f"https://wttr.in/{quote(loc)}?format=3" if loc else "https://wttr.in/?format=3"
+        r = httpx.get(url, timeout=5)
         if r.status_code == 200:
             return r.text.strip()
     except Exception:

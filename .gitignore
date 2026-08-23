@@ -3,13 +3,19 @@
 __pycache__/
 memory/
 # Runtime-generated files (voice output, etc.) live directly under
-# static/ -- but static/css and static/js hold real source (the HUD
-# page's stylesheet/scripts), so those are tracked.
+# static/ -- but static/css, static/js, static/vendor (the vendored
+# wllama build for offline mode), static/icons, and static/manifest.json
+# hold real source/assets, so those are tracked.
 static/*
 !static/css/
 !static/css/**
 !static/js/
 !static/js/**
+!static/vendor/
+!static/vendor/**
+!static/icons/
+!static/icons/**
+!static/manifest.json
 budget.json
 logs/
 veronica_backups/

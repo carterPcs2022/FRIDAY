@@ -16,6 +16,7 @@ from core.app_state import (
     suit_lockdown,
 )
 from core.permissions import ConfirmationGate
+from core.verification_engine import verify_hulkbuster_deploy
 
 security_bp = Blueprint("security", __name__)
 
@@ -58,7 +59,12 @@ def hulkbuster_deploy():
         return jsonify(_hulkbuster_gate.request())
     if not _hulkbuster_gate.confirm(confirm_token):
         return jsonify({"error": "confirmation missing or expired — request again"}), 400
-    return jsonify(hulkbuster.deploy(data.get("reason", "manual"), data.get("ip", "")))
+    result = hulkbuster.deploy(data.get("reason", "manual"), data.get("ip", ""))
+    # V3 Phase 13: deploy()'s own ip_blocked flag only reflects "the
+    # try block didn't raise" -- independently re-check the live
+    # blocklist rather than trusting that alone.
+    result["verification"] = verify_hulkbuster_deploy(result).to_dict()
+    return jsonify(result)
 
 
 @security_bp.route("/friday/hulkbuster/stand-down", methods=["POST"])

@@ -8,6 +8,7 @@ from flask import Blueprint, request, jsonify
 from core.app_state import (
     friday_gmail,
 )
+from core.verification_engine import verify_email_sent
 
 email_bp = Blueprint("email", __name__)
 
@@ -72,4 +73,8 @@ def email_send():
         )
     else:
         result = friday_gmail.send_draft(to=to, body=body, attachments=attachments)
+    # V3 Phase 13: send_email()'s own {"ok": ...} is already the only
+    # signal plain SMTP offers -- standardize it rather than invent
+    # depth that isn't there (see core/verification_engine.py).
+    result["verification"] = verify_email_sent(result).to_dict()
     return jsonify(result), (200 if result.get("ok") else 400)

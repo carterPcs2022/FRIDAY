@@ -206,6 +206,7 @@ from routes.reasoning import reasoning_bp
 from routes.emcon_scenarios import emcon_scenarios_bp
 from routes.life_admin import life_admin_bp
 from routes.hud_page import hud_page_bp
+from routes.offline import offline_bp
 
 app.register_blueprint(voice_vision_bp)
 app.register_blueprint(phone_bp)
@@ -223,6 +224,7 @@ app.register_blueprint(reasoning_bp)
 app.register_blueprint(emcon_scenarios_bp)
 app.register_blueprint(life_admin_bp)
 app.register_blueprint(hud_page_bp)
+app.register_blueprint(offline_bp)
 
 # ── JARVIS monitoring ────────────────────────────────────────────────────────
 JARVIS_URL = os.environ.get("JARVIS_URL", "http://localhost:8000")
@@ -1045,6 +1047,19 @@ def _cmd_capabilities(prompt):
                 except Exception as e:
                     logging.warning(f"Capability '{trigger}' failed: {e}")
                 break
+
+
+def _cmd_weather(prompt, p_lower):
+    if "weather" in p_lower:
+        location = ""
+        for marker in ("weather in ", "weather for ", "weather at "):
+            if marker in p_lower:
+                location = p_lower.split(marker, 1)[1].strip().rstrip("?.!")
+                break
+        brief = get_weather_brief(location)
+        response = brief if brief else "Couldn't reach a weather service right now, boss."
+        _log(prompt, response, "weather")
+        return jsonify({"response": response, "mode": "weather"})
 
 
 def _cmd_news(prompt, p_lower):
@@ -2084,6 +2099,10 @@ def command():
         # CAPABILITY_MAP above: FRIDAY's own named abilities, checked before
         # the JARVIS proxy for the same reason.
         p_lower = prompt.lower()
+
+        result = _cmd_weather(prompt, p_lower)
+        if result is not None:
+            return result
 
         result = _cmd_news(prompt, p_lower)
         if result is not None:

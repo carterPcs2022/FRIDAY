@@ -6,9 +6,9 @@ only where the code lives.
 from flask import Blueprint, request, jsonify, current_app
 
 from core.permissions import RiskLevel, risk_for
+from core.capability_registry import build_registry
+from core.policy_engine import policy_engine
 from core.app_state import (
-    CAPABILITIES_OK,
-    CAPABILITY_MAP,
     CORE_STATUS,
     PROTOCOLS_OK,
     SELF_REPAIR_OK,
@@ -168,13 +168,6 @@ def self_repair_confirm():
     return jsonify(self_repair.confirm_repair(data.get("confirm_token")))
 
 
-@orchestration_bp.route("/friday/capabilities")
-def list_capabilities():
-    if not CAPABILITIES_OK:
-        return jsonify({"error": "capabilities unavailable"}), 503
-    return jsonify({"triggers": list(CAPABILITY_MAP.keys())})
-
-
 @orchestration_bp.route("/friday/permissions")
 def permissions_status():
     """Introspects the live route table and classifies every registered
@@ -193,6 +186,50 @@ def permissions_status():
         "tiers": by_tier,
         "counts": {k: len(v) for k, v in by_tier.items()},
     })
+
+
+# ── V3 migration: Capability Registry (Phase 3) + Policy Engine
+# (Phase 5) -- see core/capability_registry.py and core/policy_engine.py
+# for what these do and deliberately don't do. ─────────────────────────
+
+@orchestration_bp.route("/friday/capabilities")
+def capabilities_list():
+    """What can FRIDAY do, and is it usable right now -- built fresh
+    from the live route table + CAPABILITY_MAP each call, same
+    introspect-don't-hand-maintain approach as /friday/permissions
+    above. ?category= filters (e.g. ?category=email, ?category=mcu_capability)."""
+    registry = build_registry(current_app.url_map)
+    category = request.args.get("category")
+    capabilities = registry.by_category(category) if category else registry.all()
+    return jsonify({
+        "count": len(capabilities),
+        "capabilities": [
+            {
+                "name": c.name, "description": c.description, "category": c.category,
+                "risk_level": c.risk_level.name, "source": c.source,
+                "reversible": c.reversible, "requires_confirmation": c.requires_confirmation,
+                "simulated": c.simulated, "available": c.is_available(),
+            }
+            for c in capabilities
+        ],
+    })
+
+
+@orchestration_bp.route("/friday/policy/evaluate", methods=["POST"])
+def policy_evaluate():
+    """Runs a named capability (from /friday/capabilities) through the
+    PolicyEngine and returns ALLOW / DENY / CONFIRM. Doesn't execute
+    anything itself -- this answers "would this be allowed," the same
+    question every DESTRUCTIVE route already answers internally via its
+    own ConfirmationGate, just generalized to any registered capability."""
+    data = request.get_json(silent=True) or {}
+    name = data.get("capability", "")
+    registry = build_registry(current_app.url_map)
+    capability = registry.get(name)
+    if capability is None:
+        return jsonify({"error": f"unknown capability: {name!r}"}), 404
+    result = policy_engine.evaluate(capability, confirm_token=data.get("confirm_token"))
+    return jsonify(result.to_dict())
 
 
 @orchestration_bp.route("/friday/trust")

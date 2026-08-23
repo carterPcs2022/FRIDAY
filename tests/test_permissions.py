@@ -89,8 +89,9 @@ class TestHulkbusterDeployTwoStep:
 
     def test_second_call_with_valid_token_actually_deploys(self, client):
         with mock.patch("routes.security.HULKBUSTER_OK", True), \
-             mock.patch("routes.security.hulkbuster") as hb:
-            hb.deploy.return_value = {"deployed": True}
+             mock.patch("routes.security.hulkbuster") as hb, \
+             mock.patch("services.friday_security.friday_security._blocked_ips", {"1.2.3.4"}):
+            hb.deploy.return_value = {"deployed": True, "ip": "1.2.3.4", "ip_blocked": True}
             first = client.post("/friday/hulkbuster/deploy", json={"reason": "test", "ip": "1.2.3.4"})
             token = first.get_json()["confirm_token"]
             second = client.post(
@@ -98,7 +99,13 @@ class TestHulkbusterDeployTwoStep:
                 json={"reason": "test", "ip": "1.2.3.4", "confirm_token": token},
             )
         assert second.status_code == 200
-        assert second.get_json() == {"deployed": True}
+        body = second.get_json()
+        assert body["deployed"] is True
+        # V3 Phase 13: the route independently re-checks the live
+        # blocklist rather than just trusting deploy()'s own ip_blocked flag.
+        assert body["verification"] == {
+            "status": "verified", "detail": "1.2.3.4 confirmed present in the live blocklist", "verified": True,
+        }
         hb.deploy.assert_called_once_with("test", "1.2.3.4")
 
     def test_invalid_token_is_rejected(self, client):
@@ -145,3 +152,57 @@ class TestPermissionsRoute:
         assert "/friday/hulkbuster/deploy" in body["tiers"]["DESTRUCTIVE"]
         assert "/friday/email/send" in body["tiers"]["EXTERNAL_COMM"]
         assert "/friday/hulkbuster/stand-down" in body["tiers"]["WRITE"]
+
+
+class TestCapabilitiesRoute:
+    """V3 Phase 3 -- /friday/capabilities replaced the old thin
+    CAPABILITY_MAP-trigger-names stub in place (same path/method, no
+    second competing route) with the full registry."""
+
+    def test_lists_both_route_and_chat_sourced_capabilities(self, client):
+        resp = client.get("/friday/capabilities")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        sources = {c["source"] for c in body["capabilities"]}
+        assert sources == {"route", "chat"}
+        assert body["count"] == len(body["capabilities"])
+
+    def test_category_filter(self, client):
+        resp = client.get("/friday/capabilities?category=mcu_capability")
+        body = resp.get_json()
+        assert body["count"] > 0
+        assert all(c["category"] == "mcu_capability" for c in body["capabilities"])
+
+    def test_hulkbuster_deploy_capability_shows_destructive_and_confirmation_required(self, client):
+        resp = client.get("/friday/capabilities")
+        body = resp.get_json()
+        cap = next(c for c in body["capabilities"] if c["name"] == "route:security.hulkbuster_deploy")
+        assert cap["risk_level"] == "DESTRUCTIVE"
+        assert cap["requires_confirmation"] is True
+
+
+class TestPolicyEvaluateRoute:
+    def test_unknown_capability_is_404(self, client):
+        resp = client.post("/friday/policy/evaluate", json={"capability": "route:nope.nope"})
+        assert resp.status_code == 404
+
+    def test_low_risk_capability_is_allowed_outright(self, client):
+        resp = client.post("/friday/policy/evaluate", json={"capability": "route:email.email_summary"})
+        assert resp.status_code == 200
+        assert resp.get_json()["decision"] == "allow"
+
+    def test_destructive_capability_without_token_requires_confirmation(self, client):
+        resp = client.post("/friday/policy/evaluate",
+                            json={"capability": "route:security.hulkbuster_deploy"})
+        body = resp.get_json()
+        assert body["decision"] == "confirm"
+        assert body["confirm_token"]
+
+    def test_destructive_capability_with_valid_token_is_allowed(self, client):
+        first = client.post("/friday/policy/evaluate",
+                             json={"capability": "route:security.hulkbuster_deploy"})
+        token = first.get_json()["confirm_token"]
+        second = client.post("/friday/policy/evaluate",
+                              json={"capability": "route:security.hulkbuster_deploy",
+                                    "confirm_token": token})
+        assert second.get_json()["decision"] == "allow"
