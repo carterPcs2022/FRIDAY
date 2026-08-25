@@ -89,6 +89,14 @@ ROUTE_RISK: dict = {
     # the same "hard to reverse cleanly if wrong" shape as the rest of
     # this tier.
     "orchestration.self_repair_confirm": RiskLevel.DESTRUCTIVE,
+    # Same shape as self_repair_confirm above: both overwrite one of
+    # FRIDAY's own core source files (server.py, security files, ...)
+    # on a single call. Found during a security review -- these were
+    # previously unclassified (falling through to plain WRITE, no
+    # confirmation) despite doing exactly what HulkBuster/self-repair
+    # are gated for.
+    "orchestration.veronica_repair": RiskLevel.DESTRUCTIVE,
+    "orchestration.veronica_contain": RiskLevel.DESTRUCTIVE,
 
     # -- Recovery actions: same reasoning core/scatter.py already
     # documents for reassemble() staying single-step -- friction here

@@ -5,7 +5,7 @@ only where the code lives.
 """
 from flask import Blueprint, request, jsonify, current_app
 
-from core.permissions import RiskLevel, risk_for
+from core.permissions import ConfirmationGate, RiskLevel, risk_for
 from core.capability_registry import build_registry
 from core.policy_engine import policy_engine
 from core.app_state import (
@@ -129,6 +129,20 @@ def veronica_baselines():
     return jsonify(veronica.save_baselines())
 
 
+# Two-step like HulkBuster (see routes/security.py's _hulkbuster_gate) --
+# both routes below overwrite one of FRIDAY's own core source files on a
+# single call, restricted to the fixed FRIDAY_COMPONENTS allowlist (not
+# an arbitrary path) but with no confirmation step until this fix.
+# Separate gates, not shared -- a pending "confirm this repair" token
+# must not be able to confirm a contain instead, or vice versa (same
+# "one gate per action" reasoning core/permissions.py documents).
+# veronica.monitor()'s own automatic repairs call deploy_replacement()
+# directly, bypassing this route entirely -- self-healing still needs
+# to work with no human in the loop; only the manual API trigger does.
+_veronica_repair_gate = ConfirmationGate("Veronica manual repair")
+_veronica_contain_gate = ConfirmationGate("Veronica manual containment")
+
+
 @orchestration_bp.route("/friday/veronica/repair/<component>", methods=["POST"])
 def veronica_repair(component):
     """Restore a component from its saved backup. Returns
@@ -136,6 +150,12 @@ def veronica_repair(component):
     replacement."""
     if not VERONICA_OK:
         return jsonify({"error": "veronica unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    confirm_token = data.get("confirm_token", "")
+    if not confirm_token:
+        return jsonify(_veronica_repair_gate.request())
+    if not _veronica_repair_gate.confirm(confirm_token):
+        return jsonify({"error": "confirmation missing or expired — request again"}), 400
     return jsonify(veronica.deploy_replacement(component, "manual"))
 
 
@@ -145,6 +165,12 @@ def veronica_contain(component):
     up the original first."""
     if not VERONICA_OK:
         return jsonify({"error": "veronica unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    confirm_token = data.get("confirm_token", "")
+    if not confirm_token:
+        return jsonify(_veronica_contain_gate.request())
+    if not _veronica_contain_gate.confirm(confirm_token):
+        return jsonify({"error": "confirmation missing or expired — request again"}), 400
     return jsonify(veronica.contain_failing_component(component))
 
 
