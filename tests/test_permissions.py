@@ -119,6 +119,81 @@ class TestHulkbusterDeployTwoStep:
         assert not hb.deploy.called
 
 
+class TestVeronicaRepairAndContainTwoStep:
+    """Security-review finding: /friday/veronica/repair and /contain
+    both overwrite one of FRIDAY's own core source files on a single
+    call, same as HulkBuster, but had no confirmation step until this
+    fix. Mirrors TestHulkbusterDeployTwoStep's pattern exactly."""
+
+    def test_repair_without_token_only_requests_confirmation(self, client):
+        with mock.patch("routes.orchestration.VERONICA_OK", True), \
+             mock.patch("routes.orchestration.veronica") as v:
+            resp = client.post("/friday/veronica/repair/comp_a")
+        assert resp.status_code == 200
+        assert resp.get_json().get("status") == "awaiting_confirmation"
+        assert not v.deploy_replacement.called
+
+    def test_repair_with_valid_token_actually_repairs(self, client):
+        with mock.patch("routes.orchestration.VERONICA_OK", True), \
+             mock.patch("routes.orchestration.veronica") as v:
+            v.deploy_replacement.return_value = {"repaired": True, "component": "comp_a"}
+            first = client.post("/friday/veronica/repair/comp_a")
+            token = first.get_json()["confirm_token"]
+            second = client.post("/friday/veronica/repair/comp_a", json={"confirm_token": token})
+        assert second.status_code == 200
+        assert second.get_json()["repaired"] is True
+        v.deploy_replacement.assert_called_once_with("comp_a", "manual")
+
+    def test_repair_invalid_token_is_rejected(self, client):
+        with mock.patch("routes.orchestration.VERONICA_OK", True), \
+             mock.patch("routes.orchestration.veronica") as v:
+            resp = client.post("/friday/veronica/repair/comp_a", json={"confirm_token": "made-up"})
+        assert resp.status_code == 400
+        assert not v.deploy_replacement.called
+
+    def test_contain_without_token_only_requests_confirmation(self, client):
+        with mock.patch("routes.orchestration.VERONICA_OK", True), \
+             mock.patch("routes.orchestration.veronica") as v:
+            resp = client.post("/friday/veronica/contain/comp_a")
+        assert resp.status_code == 200
+        assert resp.get_json().get("status") == "awaiting_confirmation"
+        assert not v.contain_failing_component.called
+
+    def test_contain_with_valid_token_actually_contains(self, client):
+        with mock.patch("routes.orchestration.VERONICA_OK", True), \
+             mock.patch("routes.orchestration.veronica") as v:
+            v.contain_failing_component.return_value = {"contained": True, "component": "comp_a"}
+            first = client.post("/friday/veronica/contain/comp_a")
+            token = first.get_json()["confirm_token"]
+            second = client.post("/friday/veronica/contain/comp_a", json={"confirm_token": token})
+        assert second.status_code == 200
+        assert second.get_json()["contained"] is True
+        v.contain_failing_component.assert_called_once_with("comp_a")
+
+    def test_contain_invalid_token_is_rejected(self, client):
+        with mock.patch("routes.orchestration.VERONICA_OK", True), \
+             mock.patch("routes.orchestration.veronica") as v:
+            resp = client.post("/friday/veronica/contain/comp_a", json={"confirm_token": "made-up"})
+        assert resp.status_code == 400
+        assert not v.contain_failing_component.called
+
+    def test_a_repair_token_cannot_confirm_a_contain(self, client):
+        """Separate gates -- a pending repair confirmation must not be
+        usable to authorize a contain call instead."""
+        with mock.patch("routes.orchestration.VERONICA_OK", True), \
+             mock.patch("routes.orchestration.veronica") as v:
+            repair_request = client.post("/friday/veronica/repair/comp_a")
+            token = repair_request.get_json()["confirm_token"]
+            resp = client.post("/friday/veronica/contain/comp_a", json={"confirm_token": token})
+        assert resp.status_code == 400
+        assert not v.contain_failing_component.called
+
+    def test_repair_and_contain_are_now_destructive_tier(self):
+        from core.permissions import RiskLevel, risk_for
+        assert risk_for("orchestration.veronica_repair", {"POST"}) == RiskLevel.DESTRUCTIVE
+        assert risk_for("orchestration.veronica_contain", {"POST"}) == RiskLevel.DESTRUCTIVE
+
+
 class TestLockdownStaysSingleStep:
     """Regression guard for the deliberate exception documented in
     core/permissions.py: /friday/lockdown must NOT gain a confirmation
