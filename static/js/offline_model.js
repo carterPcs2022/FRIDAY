@@ -15,11 +15,41 @@ let _wllama = null;
 let _loadingPromise = null;
 let _configPromise = null;
 
+const CONFIG_CACHE_KEY = 'friday_offline_config';
+
+function _cachedConfig() {
+  try {
+    const raw = localStorage.getItem(CONFIG_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Fetches the model URL/system prompt from the server, but a dead
+// connection is exactly the situation offline mode exists for -- so a
+// failed or hung fetch here falls back to whatever config was last
+// fetched successfully (cached in localStorage) instead of reporting
+// "not configured" just because there's no network to ask right now.
+// A short client-side timeout matters here too: a request into a dead
+// network can hang far longer than it's worth waiting before falling
+// back (same reasoning as send()'s 8s abort in hud.js).
 function getOfflineConfig() {
   if (!_configPromise) {
-    _configPromise = fetch('/friday/offline/config')
-      .then((r) => r.json())
-      .catch(() => ({ enabled: false, model_url: '', system_prompt: '' }));
+    _configPromise = (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const r = await fetch('/friday/offline/config', { signal: controller.signal });
+        const config = await r.json();
+        try { localStorage.setItem(CONFIG_CACHE_KEY, JSON.stringify(config)); } catch (e) {}
+        return config;
+      } catch (e) {
+        return _cachedConfig() || { enabled: false, model_url: '', system_prompt: '' };
+      } finally {
+        clearTimeout(timer);
+      }
+    })();
   }
   return _configPromise;
 }
