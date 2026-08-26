@@ -23,9 +23,11 @@ stops being a single-user deploy, that tradeoff is worth revisiting."""
 import os
 import re
 import json
+import socket
 import imaplib
 import smtplib
 import email
+import contextlib
 from email import encoders
 from email.header import decode_header
 from email.mime.text import MIMEText
@@ -37,6 +39,38 @@ GMAIL_USER = os.getenv("EMAIL_ADDRESS", "")
 GMAIL_PASS = os.getenv("EMAIL_PASSWORD", "")
 
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
+
+@contextlib.contextmanager
+def _force_ipv4():
+    """smtp.gmail.com resolves to both IPv4 and IPv6 addresses. Render's
+    containers have no outbound IPv6 route, and confirmed live: every
+    send_email() call failed with Errno 101 ("Network is unreachable")
+    before ever reaching Gmail's login step -- imap.gmail.com's login
+    over the same credentials worked fine in the same process, so this
+    was never a credentials problem, just this one host resolving to an
+    address family that can't actually be reached from here.
+
+    socket.create_connection()'s normal "try each getaddrinfo result in
+    turn, fall back on failure" behavior is the usual fix for exactly
+    this dual-stack situation, but isn't saving it here in practice --
+    forcing IPv4 explicitly removes the failing address family from the
+    picture entirely rather than depending on that fallback. Scoped to
+    only the one connection attempt inside this context (restored in
+    `finally` even if the connection itself raises), not a global,
+    process-wide patch of socket.getaddrinfo — nothing else in this
+    process is affected, including the IMAP connection in connect()
+    above, which was never broken and doesn't need this."""
+    original = socket.getaddrinfo
+
+    def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        return original(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original
 
 
 class FridayGmail:
@@ -238,7 +272,7 @@ class FridayGmail:
             msg.attach(part)
 
         try:
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+            with _force_ipv4(), smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
                 smtp.login(GMAIL_USER, GMAIL_PASS)
                 smtp.send_message(msg)
         except Exception as e:
