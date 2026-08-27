@@ -1713,7 +1713,13 @@ def _cmd_calendar_add(prompt, p_lower):
         f"the last day the event covers (the same date for a single-day "
         f"event).\n"
         f"Only if the text specifies no date at all, return empty strings "
-        f"for start/end rather than guessing. JSON only."
+        f"for start/end rather than guessing. JSON only.",
+        # Without raw=True this never reached the model at all: the
+        # prompt quotes the boss's own words, so "put on my calendar ..."
+        # tripped friday_brain's "my calendar" instant-response guard and
+        # came back "Your calendar isn't connected yet, boss." -- which
+        # then failed to parse as JSON. Confirmed live.
+        raw=True,
     )
     # Previously one bare `except Exception` around parse + create, so a
     # malformed model reply, a genuine "no date in the request", and

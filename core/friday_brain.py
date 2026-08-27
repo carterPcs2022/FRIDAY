@@ -84,6 +84,16 @@ MAXIMUM_TRIGGERS = [
 
 from config.friday_personality import FRIDAY_PERSONALITY, FRIDAY_VOICE_MODES
 
+# Used instead of FRIDAY_PERSONALITY for think(raw=True). Extraction
+# callers want machine-readable output, and the personality prompt pulls
+# hard the other way -- it asks for short, warm, in-character replies,
+# which is exactly wrong when the answer has to survive json.loads().
+EXTRACTION_SYSTEM = (
+    "You are a precise data-extraction function. Follow the output format "
+    "in the user's message exactly. Reply with only that output -- no "
+    "preamble, no explanation, no commentary, and no markdown code fences."
+)
+
 
 class FridayBrain:
 
@@ -138,25 +148,51 @@ class FridayBrain:
 
     # ── Core thinking ─────────────────────────────────────────────────────────
 
-    def think(self, query: str, context: str = "", emotion_context: str = "") -> dict:
-        """FRIDAY's main think function. Fast, warm, instinctive."""
+    def think(self, query: str, context: str = "", emotion_context: str = "",
+              raw: bool = False) -> dict:
+        """FRIDAY's main think function. Fast, warm, instinctive.
+
+        `raw=True` is for structured extraction -- callers that need
+        parseable JSON back rather than something to say out loud. Every
+        step this skips exists to make output *speakable*, and each one
+        silently corrupts JSON:
+
+        - _instant_response() answers canned FRIDAY lines by keyword, and
+          an extraction prompt quotes the boss's own words, so "Extract a
+          calendar event from: Put on my calendar ..." matched the "my
+          calendar" guard and came back "Your calendar isn't connected
+          yet, boss." -- the model never ran at all. Confirmed live: this
+          is what made every calendar add fail.
+        - _clean() deletes fenced code blocks outright, so a ```json
+          block becomes an empty string.
+        - the voice-mode max_chars cap truncates, which turns a longer
+          extraction into invalid JSON mid-string.
+        - FRIDAY_PERSONALITY tells the model to be conversational and
+          terse, which actively fights "reply as JSON".
+
+        Default stays False so every existing caller keeps the exact
+        behavior it has now."""
         start = time.time()
 
         if not query:
             return {"response": "Say something, boss.", "model": "instant", "ms": 0}
 
-        instant = self._instant_response(query)
-        if instant:
-            return {"response": instant, "model": "instant", "ms": round((time.time() - start) * 1000)}
+        if not raw:
+            instant = self._instant_response(query)
+            if instant:
+                return {"response": instant, "model": "instant", "ms": round((time.time() - start) * 1000)}
 
-        cache_key = hash(query + context[:100])
+        # raw is part of the key: the same query asked both ways wants
+        # two genuinely different answers, and sharing a slot would serve
+        # a spoken sentence to a caller parsing JSON (or vice versa).
+        cache_key = hash(f"{raw}:{query}{context[:100]}")
         if cache_key in self._response_cache:
             cached = self._response_cache[cache_key]
             if time.time() - cached["ts"] < 300:
                 return {**cached["data"], "cached": True}
 
         tier = self.classify(query)
-        system = self._build_system(emotion_context)
+        system = EXTRACTION_SYSTEM if raw else self._build_system(emotion_context)
         messages = self._build_messages(query, context)
 
         # Cost cascade: Groq (free) -> Mac Bridge Ollama (free, local) ->
@@ -177,16 +213,23 @@ class FridayBrain:
             result = {"content": f"(offline) Got it, boss: {query}", "model": "offline", "provider": "local"}
 
         ms = round((time.time() - start) * 1000)
-        response = self._clean(result["content"])
 
-        mode = FRIDAY_VOICE_MODES.get(self.voice_mode, {})
-        max_chars = mode.get("max_chars", 400)
-        if len(response) > max_chars:
-            last_sentence = response[:max_chars].rfind(".")
-            if last_sentence > max_chars * 0.6:
-                response = response[:last_sentence + 1]
-            else:
-                response = response[:max_chars].rstrip() + "..."
+        if raw:
+            # Deliberately unprocessed -- see the docstring. Both the
+            # cleaning and the length cap exist to make text speakable,
+            # and both destroy JSON.
+            response = (result["content"] or "").strip()
+        else:
+            response = self._clean(result["content"])
+
+            mode = FRIDAY_VOICE_MODES.get(self.voice_mode, {})
+            max_chars = mode.get("max_chars", 400)
+            if len(response) > max_chars:
+                last_sentence = response[:max_chars].rfind(".")
+                if last_sentence > max_chars * 0.6:
+                    response = response[:last_sentence + 1]
+                else:
+                    response = response[:max_chars].rstrip() + "..."
 
         final = {
             "response": response, "model": result.get("model", ""),
