@@ -27,6 +27,7 @@ import socket
 import imaplib
 import smtplib
 import email
+import tempfile
 import contextlib
 from email import encoders
 from email.header import decode_header
@@ -216,11 +217,13 @@ class FridayGmail:
         return match.group(0) if match else ""
 
     def _resolve_attachment(self, ref: str) -> Path | None:
-        """A local file path, or the id of something already ingested via
-        services/documents.py — either way, callers shouldn't need to
-        know which. Missing on both counts (rather than silently dropping
-        it) becomes a hard error in send_email(): an attachment the boss
-        asked for that quietly never showed up is worse than a failed send."""
+        """A local file path, the id of something already ingested via
+        services/documents.py, or the name of something FRIDAY generated
+        via "create a file" (core/friday_memory.py's generated-files
+        store) — callers shouldn't need to know which. Missing on all
+        three counts (rather than silently dropping it) becomes a hard
+        error in send_email(): an attachment the boss asked for that
+        quietly never showed up is worse than a failed send."""
         p = Path(ref)
         if p.is_file():
             return p
@@ -231,6 +234,20 @@ class FridayGmail:
             doc_path = None
         if doc_path and Path(doc_path).is_file():
             return Path(doc_path)
+        try:
+            from core.friday_memory import get_generated_file
+            entry = get_generated_file(ref)
+        except Exception:
+            entry = None
+        if entry:
+            # Materialized on demand, not kept on disk between requests --
+            # the store entry (JSON+Turso) is the durable copy; this is
+            # just scratch space for smtplib to read bytes from.
+            tmp_dir = Path(tempfile.gettempdir()) / "friday_generated_files"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = tmp_dir / entry["name"]
+            tmp_path.write_text(entry.get("content", ""))
+            return tmp_path
         return None
 
     def send_email(self, to: str = "", subject: str = "", body: str = "",

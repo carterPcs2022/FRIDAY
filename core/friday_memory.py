@@ -372,3 +372,71 @@ def get_notes(limit: int = 10) -> list:
     if not isinstance(notes, list):
         return []
     return notes[-limit:]
+
+
+# ── Generated files ("create a file") ──────────────────────────────────────
+# Content lives here, not as a loose file on disk -- Render's own disk
+# doesn't survive a redeploy, and this is the same JSON+Turso mirror
+# every other durable store on this page already uses. A real file only
+# gets materialized on demand (a HUD download, an email attachment),
+# from this content, when something actually needs a path.
+
+FILES_FILE = MEMORY_DIR / "friday_files.json"
+FILES_TABLE = "files"
+
+
+def save_generated_file(entry: dict):
+    files = _load(FILES_FILE)
+    if not isinstance(files, list):
+        files = []
+    files.append(entry)
+    files = files[-200:]
+    _save(FILES_FILE, files)
+
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(FILES_TABLE)
+            turso.list_insert(FILES_TABLE, entry)
+        except Exception as e:
+            print(f"[Turso] file write failed, local JSON already has it: {e}")
+
+
+def get_generated_files(limit: int = 10) -> list:
+    if turso.is_configured():
+        rows = None
+        try:
+            turso.ensure_list_table(FILES_TABLE)
+            rows = turso.list_all(FILES_TABLE)
+        except Exception as e:
+            print(f"[Turso] files read failed, falling back to local JSON: {e}")
+        if rows:
+            return rows[-limit:]
+        if rows is not None:
+            local = _load(FILES_FILE)
+            if not isinstance(local, list):
+                local = []
+            for record in local:
+                try:
+                    turso.list_insert(FILES_TABLE, record)
+                except Exception as e:
+                    print(f"[Turso] files seed failed: {e}")
+            return local[-limit:]
+
+    files = _load(FILES_FILE)
+    if not isinstance(files, list):
+        return []
+    return files[-limit:]
+
+
+def get_generated_file(name: str) -> dict | None:
+    """Most recent file with this name, case-insensitive -- "the file
+    called X" almost always means the latest one, and a later
+    create-a-file with the same name is meant to supersede, not
+    ambiguously coexist with, the earlier one."""
+    name_low = (name or "").strip().lower()
+    if not name_low:
+        return None
+    for entry in reversed(get_generated_files(200)):
+        if entry.get("name", "").lower() == name_low:
+            return entry
+    return None

@@ -25,7 +25,7 @@
   mix-blend-mode:screen">
 </canvas>
 
-<div id="hud-edge-strip" style="position:fixed;top:80px;left:20px;right:20px;
+<div id="hud-edge-strip" style="position:fixed;left:20px;right:20px;
   display:flex;justify-content:space-between;
   pointer-events:none;z-index:2;opacity:0.7">
   <div style="font-size:9px;color:var(--hud-glow, rgba(72,202,228,0.7));
@@ -193,12 +193,14 @@
   </div>
 
   <div class="input-zone">
-    <div class="quick-actions">
-      <button class="qa-btn" onclick="quickSend('FRIDAY run a morning brief')">Morning Brief</button>
-      <button class="qa-btn" onclick="quickSend('FRIDAY threat assessment')">Threat Scan</button>
-      <button class="qa-btn" onclick="quickSend('What is your status')">Status</button>
-      <button class="qa-btn" onclick="window.FridayOfflineSync && window.FridayOfflineSync.showOfflineData()" title="Last-synced tasks/notes/calendar — works with no internet">Cached Data</button>
-      <button class="qa-btn" onclick="testOfflineMode()" title="Force the local model right now, while you still have signal, to verify offline mode actually works">Test Offline Model</button>
+    <div class="quick-actions-wrap">
+      <div class="quick-actions">
+        <button class="qa-btn" onclick="quickSend('FRIDAY run a morning brief')">Morning Brief</button>
+        <button class="qa-btn" onclick="quickSend('FRIDAY threat assessment')">Threat Scan</button>
+        <button class="qa-btn" onclick="quickSend('What is your status')">Status</button>
+        <button class="qa-btn" onclick="window.FridayOfflineSync && window.FridayOfflineSync.showOfflineData()" title="Last-synced tasks/notes/calendar — works with no internet">Cached Data</button>
+        <button class="qa-btn" onclick="testOfflineMode()" title="Force the local model right now, while you still have signal, to verify offline mode actually works">Test Offline Model</button>
+      </div>
     </div>
 
     <div class="input-row">
