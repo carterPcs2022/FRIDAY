@@ -1874,17 +1874,41 @@ def _cmd_create_file(prompt, p_lower):
         })
 
 
+def _clarify(prompt, question, options, mode_tag):
+    """A structured question with a small, enumerable set of answers --
+    the HUD renders `options` as real clickable chips (see hud.js's
+    addMsg()) instead of leaving the boss to type a free-text reply to
+    a question that only ever has a few valid answers. `options` is a
+    list of {"label": display text, "value": what gets sent back} --
+    clicking one round-trips through the normal /command endpoint with
+    that exact value as the next prompt, same as typing it would."""
+    _log(prompt, question, mode_tag)
+    return jsonify({
+        "response": question, "mode": mode_tag,
+        "clarify": {"question": question, "options": options},
+    })
+
+
 def _cmd_file_recall(prompt, p_lower):
     if any(t in p_lower for t in FILE_RECALL_TRIGGERS):
-        from core.friday_memory import get_generated_file
+        from core.friday_memory import get_generated_file, get_generated_files
 
         name = _extract_file_name(prompt, p_lower)
         entry = get_generated_file(name) if name else None
         if not entry:
-            response = (f"Couldn't find a file called \"{name}\", boss." if name
-                        else "Which file, boss? Give me the name.")
-            _log(prompt, response, "file_recall")
-            return jsonify({"response": response, "mode": "file_recall"})
+            if name:
+                response = f"Couldn't find a file called \"{name}\", boss."
+                _log(prompt, response, "file_recall")
+                return jsonify({"response": response, "mode": "file_recall"})
+
+            recent = get_generated_files(5)
+            if not recent:
+                response = "Which file, boss? Give me the name."
+                _log(prompt, response, "file_recall")
+                return jsonify({"response": response, "mode": "file_recall"})
+
+            options = [{"label": f["name"], "value": f["name"]} for f in reversed(recent)]
+            return _clarify(prompt, "Which file, boss?", options, "file_recall")
 
         response = f"Here's \"{entry['name']}\", boss."
         _log(prompt, response, "file_recall")
