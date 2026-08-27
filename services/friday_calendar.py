@@ -19,6 +19,7 @@ First-time setup:
      from there on (refreshed automatically).
 """
 import os
+import re
 import time
 import json
 import httpx
@@ -202,16 +203,41 @@ class FridayCalendar:
         now = datetime.now(timezone.utc)
         return self._events(now.isoformat(), (now + timedelta(hours=hours)).isoformat())
 
+    @staticmethod
+    def _is_date_only(value: str) -> bool:
+        return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", (value or "").strip()))
+
+    def _event_times(self, start_iso: str, end_iso: str) -> tuple[dict, dict]:
+        """Google's API takes {"date": ...} for an all-day event and
+        {"dateTime": ...} for a timed one -- passing a bare date as
+        dateTime is rejected. Picks the field from the value's own shape,
+        so callers just pass "2026-09-01" for all-day and a full
+        "2026-09-01T15:00:00" for timed, with no extra flag to keep in
+        sync.
+
+        end.date is *exclusive* in Google's model: a single-day event on
+        the 1st has to be sent as end 2026-09-02, or it lands zero-length
+        and shows up wrong in the UI. This takes the inclusive last day
+        (how people actually describe dates -- "the 1st", "the 1st to the
+        3rd") and does that conversion here, so the quirk lives next to
+        the API call rather than leaking into every caller."""
+        if self._is_date_only(start_iso) and self._is_date_only(end_iso):
+            last_day = datetime.strptime(end_iso.strip(), "%Y-%m-%d").date()
+            exclusive_end = last_day + timedelta(days=1)
+            return {"date": start_iso.strip()}, {"date": exclusive_end.isoformat()}
+        return {"dateTime": start_iso}, {"dateTime": end_iso}
+
     def create_event(self, title: str, start_iso: str, end_iso: str, description: str = "") -> dict:
         token = self._get_access_token()
         if not token:
             return {"error": "Calendar not connected"}
+        start_field, end_field = self._event_times(start_iso, end_iso)
         try:
             r = httpx.post(
                 "https://www.googleapis.com/calendar/v3/calendars/primary/events",
                 json={
                     "summary": title, "description": description,
-                    "start": {"dateTime": start_iso}, "end": {"dateTime": end_iso},
+                    "start": start_field, "end": end_field,
                 },
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=8,

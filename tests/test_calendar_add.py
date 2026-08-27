@@ -67,7 +67,11 @@ class TestNewRequest:
 
         assert result is not None
         body = result.get_json()
-        assert "try again with a time" in body["response"].lower()
+        # "with a time" was the old wording, and became actively
+        # misleading once all-day events were supported -- a bare date is
+        # enough now, so asking for a time sends the boss down a path
+        # that isn't required. See tests/test_calendar_all_day_events.py.
+        assert "try again with a date" in body["response"].lower()
         fake_cal.create_event.assert_not_called()
         assert server._pending_calendar_add != {}
         assert "context" in server._pending_calendar_add
