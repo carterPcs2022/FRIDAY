@@ -59,6 +59,40 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
   }
 })();
 
+// Shard cluster: real 3D geometry (perspective + translateZ per facet,
+// see .shard-stage/.shard-inner in hud.css), generated the same way the
+// particle field above is -- ambient decoration, not a readout, ties to
+// nothing real by design (see the "every readout is real" rule this
+// file otherwise holds to).
+(function() {
+  const inner = document.getElementById('shard-inner');
+  if (!inner) return;
+  const FACET_COUNT = 16;
+  for (let i = 0; i < FACET_COUNT; i++) {
+    const angle = (i / FACET_COUNT) * 360 + (i % 2) * 11;
+    const len = 110 + (i % 5) * 20;
+    const depth = ((i % 3) - 1) * 60;
+    const facet = document.createElement('div');
+    facet.className = 'shard-facet' + (i % 4 === 0 ? ' accent' : '');
+    facet.style.height = len + 'px';
+    facet.style.transform = `rotateZ(${angle}deg) translateZ(${depth}px)`;
+    facet.style.opacity = 0.18 + (i % 4) * 0.1;
+    inner.appendChild(facet);
+  }
+
+  // Slow idle drift plus pointer/touch parallax, guarded by
+  // prefers-reduced-motion the same way the rest of this file's motion
+  // is -- see syncTopBarClearance's neighboring guards above.
+  const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduceMotion) return;
+
+  let driftAngle = 0;
+  setInterval(() => {
+    driftAngle = (driftAngle + 0.15) % 360;
+    inner.style.transform = `rotateY(${driftAngle * 0.3}deg) rotateX(${Math.sin(driftAngle * Math.PI / 180) * 4}deg)`;
+  }, 100);
+})();
+
 function tick() {
   document.getElementById('clock').textContent = new Date().toLocaleTimeString('en-US', {hour12: false});
 }
