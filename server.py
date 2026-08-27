@@ -726,6 +726,26 @@ TASK_ADD_TRIGGERS = [
     "don't forget to", "put on my list",
 ]
 
+# SPOTIFY_PLAY_TRIGGERS' "put on" is a substring of both "put on my
+# calendar" and "put on my list", and Spotify is checked well before
+# calendar and tasks in command()'s dispatch chain -- so without this,
+# "put on my calendar September 1st" got treated as a music request and
+# came back "Spotify not authenticated" (confirmed live on a real
+# device), and "put on my list" was silently broken the same way.
+#
+# Computed rather than hardcoded so a phrase added to either list later
+# is protected automatically: the failure mode here is a command
+# silently doing something unrelated, which is exactly the kind of thing
+# nobody thinks to re-check when adding a trigger. Reordering the
+# dispatch chain would fix today's two collisions but not the general
+# shape -- the vaguer trigger would still swallow whatever came after
+# it. This makes the vague one yield to the specific one regardless of
+# order.
+_SPOTIFY_SHADOWED_TRIGGERS = [
+    t for t in (CALENDAR_ADD_TRIGGERS + TASK_ADD_TRIGGERS)
+    if any(s in t for s in SPOTIFY_PLAY_TRIGGERS + SPOTIFY_STOP_TRIGGERS)
+]
+
 TASK_SHOW_TRIGGERS = [
     "what's on my list", "show my tasks",
     "what do i need to do", "my todo",
@@ -1599,6 +1619,11 @@ def _cmd_spotify_stop(prompt, p_lower):
 
 
 def _cmd_spotify_play(prompt, p_lower):
+    # Defer to a more specific command that merely happens to contain a
+    # music trigger as a substring -- see _SPOTIFY_SHADOWED_TRIGGERS.
+    if any(t in p_lower for t in _SPOTIFY_SHADOWED_TRIGGERS):
+        return None
+
     for trigger in SPOTIFY_PLAY_TRIGGERS:
         if trigger in p_lower and friday_spotify:
             query = p_lower.split(trigger)[-1].strip().replace("on spotify", "").strip()

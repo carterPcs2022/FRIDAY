@@ -146,3 +146,60 @@ class TestPendingReply:
 
         assert result is None
         assert server._pending_calendar_add == {}
+
+
+class TestSpotifyDoesNotSwallowSpecificCommands:
+    """Confirmed live on a real device: "Put on my calendar September 1st
+    Highschool Starts" came back "Spotify not authenticated". "put on" is
+    a SPOTIFY_PLAY_TRIGGERS entry and a substring of "put on my calendar"
+    / "put on my list", and _cmd_spotify_play runs well before both
+    _cmd_calendar_add and _cmd_task_add in command()'s dispatch chain, so
+    the vaguer music trigger matched first and tried to play "my calendar
+    september 1st ..." as a track.
+
+    Tested at the dispatcher level (does _cmd_spotify_play decline?)
+    rather than end-to-end, because that's exactly where the bug was --
+    both handlers were individually correct.
+    """
+
+    def test_the_exact_phrase_from_the_bug_report_is_not_a_music_request(self, app):
+        prompt = "Put on my calendar September 1st Highschool Starts"
+        with app.test_request_context(), \
+             mock.patch("server.friday_spotify", mock.Mock()):
+            result = server._cmd_spotify_play(prompt, prompt.lower())
+
+        assert result is None, "Spotify swallowed a calendar request"
+
+    def test_adding_to_a_list_is_not_a_music_request(self, app):
+        """Broken the same way and never reported -- "put on my list" is
+        also shadowed by "put on"."""
+        prompt = "put on my list pick up milk"
+        with app.test_request_context(), \
+             mock.patch("server.friday_spotify", mock.Mock()):
+            result = server._cmd_spotify_play(prompt, prompt.lower())
+
+        assert result is None, "Spotify swallowed a task request"
+
+    def test_a_genuine_music_request_still_plays(self, app):
+        """The guard must not cost Spotify its actual trigger."""
+        fake_spotify = mock.Mock()
+        fake_spotify.play.return_value = {
+            "playing": True, "track": "Back In Black", "artist": "AC/DC",
+        }
+
+        prompt = "put on some AC/DC"
+        with app.test_request_context(), \
+             mock.patch("server.friday_spotify", fake_spotify):
+            result = server._cmd_spotify_play(prompt, prompt.lower())
+
+        assert result is not None
+        assert "Back In Black" in result.get_json()["response"]
+
+    def test_the_shadow_list_is_derived_not_hardcoded(self):
+        """Guards the self-maintaining property: a future "put on my X"
+        trigger added to either list should be protected automatically,
+        without anyone remembering this collision exists."""
+        assert "put on my calendar" in server._SPOTIFY_SHADOWED_TRIGGERS
+        assert "put on my list" in server._SPOTIFY_SHADOWED_TRIGGERS
+        # Only genuinely-shadowed phrases, not the whole trigger lists.
+        assert "add task" not in server._SPOTIFY_SHADOWED_TRIGGERS
