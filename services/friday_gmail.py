@@ -1,37 +1,47 @@
-"""services/friday_gmail.py — inbox triage over IMAP + an app password
-(console.cloud.google.com isn't involved here; this is Gmail's supported
-per-app password mechanism, generated under Google Account -> Security ->
-App Passwords with 2FA enabled). JARVIS_V5's Gmail integration
-(core/tools/gmail.py) uses the same IMAP/app-password mechanism, not
-OAuth2 — two separate repos/deploys, each with its own EMAIL_ADDRESS/
-EMAIL_PASSWORD, not meant to share state.
+"""services/friday_gmail.py — inbox triage over IMAP + an app password for
+reading; sending goes over the Gmail API via OAuth2 (see send_email()).
 
-Accepted tradeoff, not an oversight: an app password is full-mailbox
-access (read, send, delete — everything this account can do), with no
-OAuth-style scope limiting (no restricting it to send-only, for
-instance) and no fine-grained revocation beyond regenerating the whole
-password. That's a real difference from OAuth2, and worth knowing if
-EMAIL_PASSWORD ever leaks. What keeps it reasonable for a single-user
-personal deploy: generating one requires 2FA already being enabled on
-the account, it's independently revocable from the actual Google
-password, and it's read from EMAIL_PASSWORD via env var only — never
-committed (.env is gitignored). A full OAuth2 migration would close
-that scope gap, but it's a materially bigger lift (consent screen,
-token storage/refresh, a redirect flow like services/friday_calendar.py
-already has for Google Calendar) for marginal gain here; if this ever
-stops being a single-user deploy, that tradeoff is worth revisiting."""
+Reading (console.cloud.google.com isn't involved here; this is Gmail's
+supported per-app password mechanism, generated under Google Account ->
+Security -> App Passwords with 2FA enabled). JARVIS_V5's Gmail
+integration (core/tools/gmail.py) uses the same IMAP/app-password
+mechanism, not OAuth2 — two separate repos/deploys, each with its own
+EMAIL_ADDRESS/EMAIL_PASSWORD, not meant to share state.
+
+Sending used to go over raw SMTP with the same app password, but
+confirmed live from this Render deploy: outbound TCP to smtp.gmail.com
+hangs to the connect timeout on *both* port 465 (implicit TLS) and 587
+(STARTTLS) -- not a credentials or Gmail-side problem (a real refusal
+fails in milliseconds, not a hang to the exact timeout every time), and
+not port-specific either. Consistent with this host's outbound network
+blocking raw SMTP entirely, a common anti-abuse default on free/starter
+cloud tiers. HTTPS on port 443 doesn't get blocked the same way, so
+sending now goes through the Gmail API instead, authenticated via OAuth2
+-- the same authorization-code redirect flow services/friday_calendar.py
+already uses for Google Calendar (console.cloud.google.com -> new
+project -> enable the Gmail API -> OAuth consent screen -> OAuth client
+ID (Web application), authorized redirect URI
+https://<your-app>.onrender.com/friday/gmail/callback -> set
+GOOGLE_GMAIL_CLIENT_ID / GOOGLE_GMAIL_CLIENT_SECRET /
+GOOGLE_GMAIL_REDIRECT_URI -> visit /friday/gmail/auth once and approve).
+Reusing the same Google Cloud project/OAuth client as Calendar is fine
+(just enable the Gmail API on it too and add this second redirect URI);
+a separate client works just as well.
+
+Reading (IMAP + app password) is untouched -- it was never confirmed
+broken, only sending was, and IMAP's app-password auth doesn't carry the
+scope-limiting/revocation tradeoffs the old SMTP-send path did since
+sending no longer uses the app password at all."""
 import os
 import re
 import json
-import socket
+import base64
 import imaplib
-import smtplib
 import email
 import tempfile
-import contextlib
-import concurrent.futures
 import time
-import ssl
+import httpx
+from db import turso_http_client as turso
 from email import encoders
 from email.header import decode_header
 from email.mime.text import MIMEText
@@ -42,47 +52,19 @@ from pathlib import Path
 GMAIL_USER = os.getenv("EMAIL_ADDRESS", "")
 GMAIL_PASS = os.getenv("EMAIL_PASSWORD", "")
 
+# OAuth2 config for *sending* only (see module docstring) -- reading still
+# uses GMAIL_USER/GMAIL_PASS above via IMAP.
+GMAIL_SEND_CLIENT_ID = os.getenv("GOOGLE_GMAIL_CLIENT_ID", "")
+GMAIL_SEND_CLIENT_SECRET = os.getenv("GOOGLE_GMAIL_CLIENT_SECRET", "")
+GMAIL_SEND_REDIRECT_URI = os.getenv("GOOGLE_GMAIL_REDIRECT_URI", "")
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GMAIL_SEND_TOKEN_FILE = Path("memory/friday_gmail_send_token.json")
+# Mirrored to Turso as well -- see _load_send_token() for why the local
+# file alone isn't enough on this deploy.
+GMAIL_SEND_TOKEN_TABLE = "gmail_send_token"
+GMAIL_SEND_TOKEN_KEY = "oauth"
+
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-
-# Per-call timeout (each of connect/TLS/login/send individually) and the
-# hard wall-clock deadline for the *whole* connect+login+send operation --
-# see send_email()'s _do_send() for why both exist. Module-level so tests
-# can drive the real deadline-enforcement path with a short value instead
-# of mocking it away or waiting out the real one.
-SMTP_PER_CALL_TIMEOUT = 10
-SMTP_OVERALL_TIMEOUT = 18
-
-
-@contextlib.contextmanager
-def _force_ipv4():
-    """smtp.gmail.com resolves to both IPv4 and IPv6 addresses. Render's
-    containers have no outbound IPv6 route, and confirmed live: every
-    send_email() call failed with Errno 101 ("Network is unreachable")
-    before ever reaching Gmail's login step -- imap.gmail.com's login
-    over the same credentials worked fine in the same process, so this
-    was never a credentials problem, just this one host resolving to an
-    address family that can't actually be reached from here.
-
-    socket.create_connection()'s normal "try each getaddrinfo result in
-    turn, fall back on failure" behavior is the usual fix for exactly
-    this dual-stack situation, but isn't saving it here in practice --
-    forcing IPv4 explicitly removes the failing address family from the
-    picture entirely rather than depending on that fallback. Scoped to
-    only the one connection attempt inside this context (restored in
-    `finally` even if the connection itself raises), not a global,
-    process-wide patch of socket.getaddrinfo — nothing else in this
-    process is affected, including the IMAP connection in connect()
-    above, which was never broken and doesn't need this."""
-    original = socket.getaddrinfo
-
-    def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
-        return original(host, port, socket.AF_INET, type, proto, flags)
-
-    socket.getaddrinfo = _ipv4_only
-    try:
-        yield
-    finally:
-        socket.getaddrinfo = original
 
 
 class FridayGmail:
@@ -253,7 +235,7 @@ class FridayGmail:
         if entry:
             # Materialized on demand, not kept on disk between requests --
             # the store entry (JSON+Turso) is the durable copy; this is
-            # just scratch space for smtplib to read bytes from.
+            # just scratch space for send_email() to read bytes from.
             tmp_dir = Path(tempfile.gettempdir()) / "friday_generated_files"
             tmp_dir.mkdir(parents=True, exist_ok=True)
             tmp_path = tmp_dir / entry["name"]
@@ -261,14 +243,135 @@ class FridayGmail:
             return tmp_path
         return None
 
+    # --- OAuth2, for sending only (see module docstring) --------------
+    # Same shape as services/friday_calendar.py's OAuth methods -- kept
+    # here on FridayGmail rather than a separate class/singleton since
+    # send_email() below is the only caller and everything that already
+    # references `friday_gmail` doesn't need to know a second service
+    # object exists.
+
+    def send_is_configured(self) -> bool:
+        return bool(GMAIL_SEND_CLIENT_ID and GMAIL_SEND_CLIENT_SECRET and GMAIL_SEND_REDIRECT_URI)
+
+    def send_is_connected(self) -> bool:
+        """Distinct from send_is_configured(): configured means the app
+        has credentials to attempt OAuth; connected means the boss has
+        actually completed it and a token exists."""
+        return self.send_is_configured() and bool(self._load_send_token().get("refresh_token"))
+
+    def _load_send_token(self) -> dict:
+        """Turso first, local JSON as the fallback -- same pattern as
+        services/friday_habits.py and core/friday_memory.py, and for the
+        same reason it matters more here than anywhere: render.yaml
+        mounts no disk, so memory/ is ephemeral. A token kept only on
+        local disk is lost on every redeploy *and* every free-tier idle
+        spin-down, which would mean re-running the consent flow every
+        time FRIDAY wakes up -- sending would look broken again within
+        the hour. The refresh token is the one piece of state here that
+        genuinely has to outlive the container."""
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(GMAIL_SEND_TOKEN_TABLE)
+                row = turso.kv_get(GMAIL_SEND_TOKEN_TABLE, GMAIL_SEND_TOKEN_KEY)
+                if row:
+                    return row
+            except Exception as e:
+                print(f"[Turso] gmail send token read failed, falling back to local JSON: {e}")
+        return self._read_local_send_token()
+
+    def _read_local_send_token(self) -> dict:
+        if GMAIL_SEND_TOKEN_FILE.exists():
+            try:
+                return json.loads(GMAIL_SEND_TOKEN_FILE.read_text())
+            except Exception:
+                return {}
+        return {}
+
+    def _save_send_token(self, data: dict):
+        GMAIL_SEND_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GMAIL_SEND_TOKEN_FILE.write_text(json.dumps(data, indent=2))
+
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(GMAIL_SEND_TOKEN_TABLE)
+                turso.kv_set(GMAIL_SEND_TOKEN_TABLE, GMAIL_SEND_TOKEN_KEY, data)
+            except Exception as e:
+                print(f"[Turso] gmail send token write failed, local JSON already has it: {e}")
+
+    def _get_send_access_token(self) -> str:
+        data = self._load_send_token()
+        if not data.get("access_token"):
+            return ""
+        if time.time() >= data.get("expires_at", 0):
+            return self._refresh_send_token(data.get("refresh_token", ""))
+        return data["access_token"]
+
+    def _refresh_send_token(self, refresh_token: str) -> str:
+        if not refresh_token or not self.send_is_configured():
+            return ""
+        try:
+            r = httpx.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": GMAIL_SEND_CLIENT_ID, "client_secret": GMAIL_SEND_CLIENT_SECRET,
+                    "refresh_token": refresh_token, "grant_type": "refresh_token",
+                },
+                timeout=8,
+            )
+            if r.status_code != 200:
+                return ""
+            payload = r.json()
+            data = self._load_send_token()
+            data["access_token"] = payload["access_token"]
+            data["expires_at"] = time.time() + payload.get("expires_in", 3600) - 60
+            self._save_send_token(data)
+            return data["access_token"]
+        except Exception as e:
+            print(f"[FRIDAY Gmail] Send token refresh failed: {e}")
+            return ""
+
+    def send_auth_url(self) -> str:
+        return (
+            "https://accounts.google.com/o/oauth2/v2/auth"
+            f"?client_id={GMAIL_SEND_CLIENT_ID}&redirect_uri={GMAIL_SEND_REDIRECT_URI}"
+            f"&response_type=code&scope={GMAIL_SEND_SCOPE}"
+            "&access_type=offline&prompt=consent"
+        )
+
+    def send_exchange_code(self, code: str) -> dict:
+        if not self.send_is_configured():
+            return {"error": "Gmail sending not configured"}
+        try:
+            r = httpx.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": GMAIL_SEND_CLIENT_ID, "client_secret": GMAIL_SEND_CLIENT_SECRET,
+                    "code": code, "redirect_uri": GMAIL_SEND_REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                },
+                timeout=8,
+            )
+            if r.status_code != 200:
+                return {"error": f"Token exchange failed: {r.text[:200]}"}
+            payload = r.json()
+            self._save_send_token({
+                "access_token": payload["access_token"],
+                "refresh_token": payload.get("refresh_token", ""),
+                "expires_at": time.time() + payload.get("expires_in", 3600) - 60,
+            })
+            return {"ok": True}
+        except Exception as e:
+            return {"error": str(e)}
+
     def send_email(self, to: str = "", subject: str = "", body: str = "",
                     in_reply_to: str = "", attachments: list | None = None) -> dict:
-        """Actually sends, via the same SMTP app-password credentials the
-        IMAP side uses. No approval step here — the caller (a "send it"
-        confirmation, or an explicit compose-and-send request) is the
-        approval; this is the action, not another draft."""
-        if not GMAIL_USER or not GMAIL_PASS:
-            return {"ok": False, "error": "Gmail not configured"}
+        """Actually sends, via the Gmail API over HTTPS -- see the module
+        docstring for why this isn't raw SMTP anymore. No approval step
+        here — the caller (a "send it" confirmation, or an explicit
+        compose-and-send request) is the approval; this is the action,
+        not another draft."""
+        if not self.send_is_connected():
+            return {"ok": False, "error": "Gmail sending isn't connected yet, boss — visit /friday/gmail/auth"}
 
         address = self.extract_address(to)
         if not address:
@@ -299,98 +402,28 @@ class FridayGmail:
             part.add_header("Content-Disposition", f'attachment; filename="{path.name}"')
             msg.attach(part)
 
-        # Written by _do_send() as it progresses, read by the except branches
-        # below if the deadline fires -- a plain list because a timeout means
-        # the background thread is abandoned mid-stage (see shutdown(wait=False)
-        # below), not joined, so this is the only way to see how far it got.
-        # A stale read on a genuine race is an acceptable diagnostic tradeoff;
-        # nothing here needs to be exact, just far better than the previous
-        # "timed out" with no further detail, which left "hangs somewhere in
-        # the connect/login/send chain" and "the actual send keeps failing
-        # outright" indistinguishable from the logs alone.
-        stage = ["resolving smtp.gmail.com / opening connection"]
+        token = self._get_send_access_token()
+        if not token:
+            return {"ok": False, "error": "Gmail sending isn't connected yet, boss — visit /friday/gmail/auth"}
 
-        # Port 465 (implicit TLS, SMTP_SSL) was the original choice here,
-        # but confirmed live via the stage diagnostics above: every real
-        # attempt hung to the full per-call timeout stuck in "TCP connect +
-        # TLS handshake", never reaching login -- consistent with something
-        # on the network path silently dropping that connection rather than
-        # Gmail actively rejecting it (an active refusal fails in
-        # milliseconds, not exactly SMTP_PER_CALL_TIMEOUT seconds every
-        # time). Cloud hosts commonly block outbound 465 by default as an
-        # anti-spam measure while leaving 587 open, since 587 (STARTTLS --
-        # connect in plaintext, then upgrade) is the standard mail
-        # *submission* port MTAs expect clients to use, vs. 465 being the
-        # older implicit-TLS convention. Switched to 587/STARTTLS as the
-        # next real diagnostic/fix step, not a guess made blind -- if this
-        # still hangs in the same place, that would point past a
-        # port-specific block toward outbound SMTP being blocked
-        # altogether, which an HTTP-based mail API would be the real fix
-        # for, not another port/library tweak.
-        def _do_send():
-            with _force_ipv4():
-                stage[0] = "TCP connect"
-                with smtplib.SMTP("smtp.gmail.com", 587, timeout=SMTP_PER_CALL_TIMEOUT) as smtp:
-                    stage[0] = "STARTTLS handshake"
-                    smtp.starttls(context=ssl.create_default_context())
-                    stage[0] = "login"
-                    smtp.login(GMAIL_USER, GMAIL_PASS)
-                    stage[0] = "send_message"
-                    smtp.send_message(msg)
-                    stage[0] = "done"
-
-        # smtplib's own `timeout` bounds each individual blocking call
-        # (connect, TLS handshake, login, send) separately, not the whole
-        # operation -- raising it to 25s (an earlier fix here) helped a
-        # one-off cold-start blip, but confirmed live: on a more
-        # persistently degraded connection, several sequential stages can
-        # each eat close to that budget before proceeding, and they
-        # compound past the HUD's 45s client-side deadline even though no
-        # single stage looked slow on its own. Running the whole
-        # connect+login+send in a thread and capping *that* with one hard
-        # wall-clock deadline is what actually bounds total time,
-        # regardless of how many SMTP stages there are. The per-call
-        # timeout stays low as a fast first line of defense against one
-        # truly stuck stage.
-        #
-        # Deliberately NOT a `with ThreadPoolExecutor() as pool:` block --
-        # its __exit__ calls shutdown(wait=True), which blocks until the
-        # background thread actually finishes regardless of .result()
-        # already having raised TimeoutError, silently defeating the
-        # deadline entirely (caught by a real test, not just reasoned
-        # about: elapsed time matched the hang, not the timeout, until
-        # this was fixed). shutdown(wait=False) lets the timeout mean what
-        # it says; the thread isn't forcibly killed (Python threads can't
-        # be) and may still complete in the background afterward -- worst
-        # case a late/duplicate send once the network recovers, not data
-        # loss or a hung request, which is the actual problem this fixes.
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        started = time.time()
-        future = pool.submit(_do_send)
+        # A single HTTPS request, so httpx's own `timeout` genuinely bounds
+        # the whole connect+TLS+request+response as one operation -- unlike
+        # smtplib's timeout (which only bounds each blocking call
+        # separately), there's no multi-stage compounding here to work
+        # around, so no thread/deadline apparatus is needed either.
         try:
-            future.result(timeout=SMTP_OVERALL_TIMEOUT)
+            r = httpx.post(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                json={"raw": base64.urlsafe_b64encode(msg.as_bytes()).decode()},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15,
+            )
+            if r.status_code not in (200, 202):
+                print(f"[FRIDAY Gmail] send failed: {r.status_code} {r.text[:200]}")
+                return {"ok": False, "error": f"Gmail API send failed ({r.status_code})"}
         except Exception as e:
-            elapsed = time.time() - started
-            # future.done() is the real signal here, not the exception
-            # type: socket.timeout has been the *same class* as the
-            # builtin TimeoutError since Python 3.10, and
-            # concurrent.futures.TimeoutError became that same alias too
-            # in 3.11 -- so a genuine per-call smtplib/socket timeout
-            # (the thread already finished, with a real error) and this
-            # wall-clock deadline giving up on a thread that's still
-            # running are, on this interpreter, literally
-            # indistinguishable by `except` type alone. Caught live: a
-            # per-call socket timeout at 10.0s got logged as "stuck at
-            # stage" (the still-running wording) under the old
-            # type-based split, when the thread had actually already
-            # finished with its own real error at that point.
-            if future.done():
-                print(f"[FRIDAY Gmail] send failed: {elapsed:.1f}s elapsed, stage: {stage[0]}, error: {e!r}")
-            else:
-                print(f"[FRIDAY Gmail] send failed: {elapsed:.1f}s elapsed, still running -- abandoned at stage: {stage[0]}")
-            return {"ok": False, "error": "timed out" if not future.done() else str(e)}
-        finally:
-            pool.shutdown(wait=False)
+            print(f"[FRIDAY Gmail] send failed: {e!r}")
+            return {"ok": False, "error": str(e)}
 
         return {
             "ok": True, "to": address, "subject": msg["Subject"],
