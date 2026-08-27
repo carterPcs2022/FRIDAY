@@ -3,7 +3,7 @@ monolithic server.py. Registered onto the main Flask app in server.py
 via app.register_blueprint(email_bp); nothing here changes behavior,
 only where the code lives.
 """
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, redirect
 
 from core.app_state import (
     friday_gmail,
@@ -11,6 +11,33 @@ from core.app_state import (
 from core.verification_engine import verify_email_sent
 
 email_bp = Blueprint("email", __name__)
+
+
+@email_bp.route("/friday/gmail/auth")
+def gmail_send_auth():
+    """One-time OAuth2 setup for *sending* mail via the Gmail API (see
+    services/friday_gmail.py's module docstring for why sending moved off
+    raw SMTP). Same shape as /friday/calendar/auth — not in
+    core/access_auth.py's EXEMPT_PATHS, same as that route: reaching this
+    at all already requires the boss's own logged-in session, and the
+    Google redirect back to the callback below rides that same
+    same-origin cookie."""
+    if not friday_gmail or not friday_gmail.send_is_configured():
+        return "Gmail sending not configured", 500
+    return redirect(friday_gmail.send_auth_url())
+
+
+@email_bp.route("/friday/gmail/callback")
+def gmail_send_callback():
+    if not friday_gmail:
+        return "Gmail sending not configured", 500
+    code = request.args.get("code", "")
+    if not code:
+        return jsonify({"error": request.args.get("error", "No code provided")}), 400
+    result = friday_gmail.send_exchange_code(code)
+    if result.get("ok"):
+        return "Gmail sending connected. You can close this tab, boss."
+    return jsonify(result), 400
 
 
 @email_bp.route("/friday/email/summary")

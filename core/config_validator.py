@@ -15,6 +15,7 @@ _API_KEYS = [
     "EMAIL_ADDRESS", "EMAIL_PASSWORD",
     "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET",
     "GOOGLE_CALENDAR_CLIENT_ID", "GOOGLE_CALENDAR_CLIENT_SECRET",
+    "GOOGLE_GMAIL_CLIENT_ID", "GOOGLE_GMAIL_CLIENT_SECRET",
     "SERPER_API_KEY", "TAVILY_API_KEY", "SERPAPI_KEY",
     "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE",
     "TURSO_AUTH_TOKEN", "HA_TOKEN", "PUSHCUT_API_KEY", "FRIDAY_ACCESS_TOKEN",
@@ -30,7 +31,10 @@ _PLACEHOLDER_STRINGS = [
 # URL-shaped env vars that must actually be reachable off this box in
 # production — a Render deploy pointing at localhost/127.0.0.1 means
 # whoever set it never updated it after copying from a local .env.
-_URL_KEYS = ["MAC_BRIDGE_URL", "JARVIS_URL", "GOOGLE_CALENDAR_REDIRECT_URI", "HA_URL", "PUSHCUT_MOM_WEBHOOK_URL"]
+_URL_KEYS = [
+    "MAC_BRIDGE_URL", "JARVIS_URL", "GOOGLE_CALENDAR_REDIRECT_URI",
+    "GOOGLE_GMAIL_REDIRECT_URI", "HA_URL", "PUSHCUT_MOM_WEBHOOK_URL",
+]
 
 # (url_key, token_key) pairs — one configured without the other is
 # always a mistake, since either FRIDAY has no bridge to call or it has
@@ -41,6 +45,7 @@ _PAIRED_KEYS = [
     ("JARVIS_URL", "JARVIS_API_TOKEN"),
     ("SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"),
     ("GOOGLE_CALENDAR_CLIENT_ID", "GOOGLE_CALENDAR_CLIENT_SECRET"),
+    ("GOOGLE_GMAIL_CLIENT_ID", "GOOGLE_GMAIL_CLIENT_SECRET"),
     ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"),
     ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"),
     ("HA_URL", "HA_TOKEN"),

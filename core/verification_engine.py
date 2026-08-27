@@ -8,10 +8,10 @@ Extend by adding another verify_*() function alongside these, wired into
 a real call site, not by building an abstract plugin system nothing
 calls yet:
 
-- Email send (services/friday_gmail.py) — SMTP either raises or it
-  doesn't; there's no delivery-receipt API here to check further, so
-  verification is honest about that ceiling: VERIFIED means "the SMTP
-  server accepted it for delivery," not "it arrived."
+- Email send (services/friday_gmail.py) — the Gmail API either returns
+  ok or it doesn't; there's no delivery-receipt API here to check
+  further, so verification is honest about that ceiling: VERIFIED means
+  "Gmail accepted it for delivery," not "it arrived."
 - HulkBuster deploy (services/hulkbuster.py) — deploy()'s own
   ip_blocked flag only reflects "the try block didn't raise," not "the
   IP is actually in the blocklist right now." verify_hulkbuster_deploy
@@ -54,15 +54,15 @@ class VerificationResult:
 
 def verify_email_sent(send_result: dict) -> VerificationResult:
     """send_email()'s {"ok": bool, "error": ...} is already the only
-    signal plain SMTP offers — no message ID, no delivery webhook. This
-    doesn't invent depth that isn't there; it standardizes that existing
-    signal and says plainly that VERIFIED here means "accepted for
-    delivery," not "delivered."
+    signal the Gmail API offers here — no delivery webhook. This doesn't
+    invent depth that isn't there; it standardizes that existing signal
+    and says plainly that VERIFIED here means "accepted for delivery,"
+    not "delivered."
     """
     if send_result.get("ok"):
         return VerificationResult(
             VerificationStatus.VERIFIED,
-            f"SMTP accepted for delivery to {send_result.get('to', '?')}",
+            f"Gmail accepted for delivery to {send_result.get('to', '?')}",
         )
     return VerificationResult(VerificationStatus.FAILED, send_result.get("error", "send failed"))
 
