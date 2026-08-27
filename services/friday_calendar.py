@@ -25,7 +25,13 @@ import httpx
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+from db import turso_http_client as turso
+
 TOKEN_FILE = Path("memory/friday_calendar_token.json")
+# Mirrored to Turso as well -- see _load_token() for why the local file
+# alone isn't enough on this deploy.
+TOKEN_TABLE = "calendar_token"
+TOKEN_KEY = "oauth"
 CLIENT_ID = os.getenv("GOOGLE_CALENDAR_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET", "")
 REDIRECT_URI = os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "")
@@ -44,6 +50,25 @@ class FridayCalendar:
         return self.is_configured() and bool(self._load_token().get("refresh_token"))
 
     def _load_token(self) -> dict:
+        """Turso first, local JSON as the fallback -- same pattern as
+        services/friday_gmail.py's send token and services/friday_habits.py,
+        and for the same reason: render.yaml mounts no disk, so memory/ is
+        ephemeral. A token kept only on local disk is lost on every
+        redeploy *and* every free-tier idle spin-down, which would mean
+        re-running the consent flow every time FRIDAY wakes up. The
+        refresh token is the one piece of state here that genuinely has
+        to outlive the container."""
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(TOKEN_TABLE)
+                row = turso.kv_get(TOKEN_TABLE, TOKEN_KEY)
+                if row:
+                    return row
+            except Exception as e:
+                print(f"[Turso] calendar token read failed, falling back to local JSON: {e}")
+        return self._read_local_token()
+
+    def _read_local_token(self) -> dict:
         if TOKEN_FILE.exists():
             try:
                 return json.loads(TOKEN_FILE.read_text())
@@ -54,6 +79,13 @@ class FridayCalendar:
     def _save_token(self, data: dict):
         TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         TOKEN_FILE.write_text(json.dumps(data, indent=2))
+
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(TOKEN_TABLE)
+                turso.kv_set(TOKEN_TABLE, TOKEN_KEY, data)
+            except Exception as e:
+                print(f"[Turso] calendar token write failed, local JSON already has it: {e}")
 
     def _get_access_token(self) -> str:
         data = self._load_token()
