@@ -289,7 +289,12 @@ class FridayGmail:
             msg.attach(part)
 
         try:
-            with _force_ipv4(), smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+            # 15s was too tight right after a Render cold start (outbound
+            # networking not fully warmed up yet) -- confirmed live, this
+            # is what was behind a real "send failed: timed out". 25s
+            # gives it real room while staying well under the HUD's 45s
+            # client-side budget for the whole /command round trip.
+            with _force_ipv4(), smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=25) as smtp:
                 smtp.login(GMAIL_USER, GMAIL_PASS)
                 smtp.send_message(msg)
         except Exception as e:
