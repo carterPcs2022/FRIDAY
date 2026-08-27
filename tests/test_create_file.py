@@ -125,6 +125,24 @@ class TestCmdCreateFile:
         assert "/" not in name
 
 
+class TestClarifyHelper:
+    def test_returns_structured_options_the_hud_can_render_as_chips(self, app):
+        with app.test_request_context():
+            result = server._clarify(
+                "some prompt", "Which one, boss?",
+                [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
+                "test_mode",
+            )
+
+        body = result.get_json()
+        assert body["mode"] == "test_mode"
+        assert body["response"] == "Which one, boss?"
+        assert body["clarify"] == {
+            "question": "Which one, boss?",
+            "options": [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
+        }
+
+
 class TestCmdFileRecall:
     def test_no_trigger_returns_none(self, app):
         with app.test_request_context():
@@ -158,13 +176,38 @@ class TestCmdFileRecall:
         assert "file" not in body
         assert "nonexistent.txt" in body["response"]
 
-    def test_no_name_given_asks_which_file(self, app):
+    def test_no_name_given_and_nothing_saved_asks_which_file(self, app, tmp_path, monkeypatch):
+        monkeypatch.setattr(friday_memory, "FILES_FILE", tmp_path / "friday_files.json")
+        monkeypatch.setattr(friday_memory.turso, "is_configured", lambda: False)
+
         with app.test_request_context():
             prompt = "show me the file"
             result = server._cmd_file_recall(prompt, prompt.lower())
 
         assert result is not None
-        assert "which file" in result.get_json()["response"].lower()
+        body = result.get_json()
+        assert "which file" in body["response"].lower()
+        assert "clarify" not in body
+
+    def test_no_name_given_but_files_exist_offers_clickable_options(self, app, tmp_path, monkeypatch):
+        monkeypatch.setattr(friday_memory, "FILES_FILE", tmp_path / "friday_files.json")
+        monkeypatch.setattr(friday_memory.turso, "is_configured", lambda: False)
+        friday_memory.save_generated_file({"name": "todo.txt", "content": "milk"})
+        friday_memory.save_generated_file({"name": "ideas.txt", "content": "..."})
+
+        with app.test_request_context():
+            prompt = "show me the file"
+            result = server._cmd_file_recall(prompt, prompt.lower())
+
+        assert result is not None
+        body = result.get_json()
+        assert body["mode"] == "file_recall"
+        assert "clarify" in body
+        names = {opt["value"] for opt in body["clarify"]["options"]}
+        assert names == {"todo.txt", "ideas.txt"}
+        # Most recent first -- picking "the file" with no name given should
+        # offer the most likely match up top, not alphabetical/insertion order.
+        assert body["clarify"]["options"][0]["value"] == "ideas.txt"
 
 
 class TestEmailAttachmentResolvesGeneratedFile:

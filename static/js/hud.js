@@ -110,7 +110,7 @@ async function send() {
     const d = await r.json();
     hideThinking();
     setOfflineBadge(false);
-    addMsg('fri', 'FRIDAY', d.response || '...', {model: d.model || '', ms: d.ms || 0, emotion: d.emotion, file: d.file});
+    addMsg('fri', 'FRIDAY', d.response || '...', {model: d.model || '', ms: d.ms || 0, emotion: d.emotion, file: d.file, clarify: d.clarify});
     showFace();
     if (!muted && d.has_audio && d.audio_file) playAudio(d.audio_file);
   } catch(e) {
@@ -206,6 +206,28 @@ function addMsg(type, label, text, meta = {}) {
     btn.textContent = `⬇ ${meta.file.name}`;
     btn.addEventListener('click', () => downloadGeneratedFile(meta.file.name, meta.file.content || ''));
     wrap.appendChild(btn);
+  }
+  // A small enumerable set of answers (see server.py's _clarify()) --
+  // render real clickable chips instead of leaving the boss to type a
+  // free-text reply to a question that only ever has a few valid
+  // answers. Same DOM-construction-not-innerHTML reasoning as the file
+  // button above: an option's label/value is server data that can
+  // originate from the boss's own prior input (a file name they typed),
+  // so it goes through textContent, never string-interpolated HTML.
+  if (meta.clarify && Array.isArray(meta.clarify.options) && meta.clarify.options.length) {
+    const row = document.createElement('div');
+    row.className = 'msg-clarify-row';
+    meta.clarify.options.forEach((opt) => {
+      const btn = document.createElement('button');
+      btn.className = 'msg-clarify-btn';
+      btn.textContent = opt.label != null ? String(opt.label) : String(opt.value ?? '');
+      btn.addEventListener('click', () => {
+        row.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+        quickSend(opt.value != null ? String(opt.value) : btn.textContent);
+      });
+      row.appendChild(btn);
+    });
+    wrap.appendChild(row);
   }
   area.appendChild(wrap);
   area.scrollTop = area.scrollHeight;
