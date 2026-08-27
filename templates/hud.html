@@ -103,6 +103,17 @@
     </div>
 
     <div class="p-section">
+      <div class="p-section-title">VOICE ENROLLMENT</div>
+      <!-- One-time setup actions, not per-session controls -- moved off
+           the top bar (which was wrapping to 4 rows on a phone) since
+           these are used once in a while, not every conversation. VOICE
+           OFF itself stays on the top bar; that one's a per-session
+           toggle worth one tap, not a panel trip. -->
+      <button class="panel-toggle voice-mode-btn" id="enroll-voice-btn" onclick="enrollVoice()" title="Enroll your voice for speaker verification" style="width:100%;margin-bottom:8px">&#127908; ENROLL MY VOICE</button>
+      <button class="panel-toggle voice-mode-btn" id="reset-voice-btn" onclick="resetVoiceEnrollment()" title="Wipe the stored voice profile and start over" style="width:100%;font-size:9px">Reset &amp; Re-enroll</button>
+    </div>
+
+    <div class="p-section">
       <div class="p-section-title">TRAINING WHEELS</div>
       <div class="stat-card">
         <div class="stat-card-header"><span class="stat-card-label">TRUST TIER</span><span class="stat-card-value bright" id="trust-tier">-</span></div>
@@ -171,8 +182,6 @@
     <div class="top-right">
       <div class="clock-display" id="clock">--:--:--</div>
       <button class="panel-toggle voice-mode-btn" id="voice-mode-btn" onclick="toggleVoiceMode()" title="Hands-free wake-word listening">VOICE OFF</button>
-      <button class="panel-toggle voice-mode-btn" id="enroll-voice-btn" onclick="enrollVoice()" title="Enroll your voice for speaker verification">&#127908; ENROLL MY VOICE</button>
-      <button class="panel-toggle" id="reset-voice-btn" onclick="resetVoiceEnrollment()" title="Wipe the stored voice profile and start over" style="font-size:9px">Reset &amp; Re-enroll</button>
       <button class="panel-toggle" onclick="toggleLeft()" title="Systems">&#9881;</button>
       <button class="panel-toggle" onclick="toggleRight()" title="Intelligence">&#9670;</button>
       <button id="reticle-toggle-btn" onclick="toggleReticle()"
