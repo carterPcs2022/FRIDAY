@@ -1668,14 +1668,28 @@ def _cmd_calendar_add(prompt, p_lower):
     if is_pending_reply:
         context = f"{_pending_calendar_add.get('context', '')}\nBoss's follow-up reply: {prompt}"
 
+    # "September 1st Highschool Starts" is a perfectly ordinary calendar
+    # entry with a date and no clock time -- an all-day event. The older
+    # prompt asked for datetimes only and told the model to return empty
+    # strings when no *time* was given, so requests like that came back
+    # "wasn't sure what to schedule there, boss -- try again with a
+    # time?" (confirmed live), pushing the boss to invent a time for
+    # something that doesn't have one. Date-only values are now a
+    # first-class answer; friday_calendar.create_event() reads the shape
+    # of the value to pick Google's all-day vs. timed event fields.
     result = friday_brain.think(
         f"Extract a calendar event from: {context}\n"
         f"Current time: {datetime.datetime.now().isoformat()}\n\n"
-        f'Reply as JSON: {{"title": str, "start": "ISO 8601 datetime", '
-        f'"end": "ISO 8601 datetime"}}\n'
-        f"If no duration is given, default to 30 minutes. If the text "
-        f"doesn't actually specify a time, return empty strings for "
-        f"start/end rather than guessing. JSON only."
+        f'Reply as JSON: {{"title": str, "start": str, "end": str}}\n\n'
+        f"If the event has a specific time of day, use full ISO 8601 "
+        f'datetimes ("2026-09-01T15:00:00"); when no duration is given, '
+        f"default to 30 minutes.\n"
+        f"If it's an all-day event -- a date with no time of day -- use "
+        f'plain dates ("2026-09-01") for both start and end, where end is '
+        f"the last day the event covers (the same date for a single-day "
+        f"event).\n"
+        f"Only if the text specifies no date at all, return empty strings "
+        f"for start/end rather than guessing. JSON only."
     )
     try:
         clean = rex.sub(r"```json|```", "", result["response"]).strip()
@@ -1699,7 +1713,9 @@ def _cmd_calendar_add(prompt, p_lower):
             response = "Still wasn't sure what to schedule, boss — try the full request again?"
         else:
             _pending_calendar_add = {"context": context, "expires": time.time() + CALENDAR_ADD_PENDING_WINDOW}
-            response = "Wasn't sure what to schedule there, boss — try again with a time?"
+            # "with a time" was actively misleading once all-day events
+            # became valid -- a date is now enough on its own.
+            response = "Wasn't sure what to schedule there, boss — try again with a date?"
     _log(prompt, response, "calendar")
     return jsonify({"response": response, "mode": "calendar"})
 
