@@ -30,6 +30,7 @@ import email
 import tempfile
 import contextlib
 import concurrent.futures
+import time
 from email import encoders
 from email.header import decode_header
 from email.mime.text import MIMEText
@@ -297,10 +298,26 @@ class FridayGmail:
             part.add_header("Content-Disposition", f'attachment; filename="{path.name}"')
             msg.attach(part)
 
+        # Written by _do_send() as it progresses, read by the except branches
+        # below if the deadline fires -- a plain list because a timeout means
+        # the background thread is abandoned mid-stage (see shutdown(wait=False)
+        # below), not joined, so this is the only way to see how far it got.
+        # A stale read on a genuine race is an acceptable diagnostic tradeoff;
+        # nothing here needs to be exact, just far better than the previous
+        # "timed out" with no further detail, which left "hangs somewhere in
+        # the connect/login/send chain" and "the actual send keeps failing
+        # outright" indistinguishable from the logs alone.
+        stage = ["resolving smtp.gmail.com / opening connection"]
+
         def _do_send():
-            with _force_ipv4(), smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=SMTP_PER_CALL_TIMEOUT) as smtp:
-                smtp.login(GMAIL_USER, GMAIL_PASS)
-                smtp.send_message(msg)
+            with _force_ipv4():
+                stage[0] = "TCP connect + TLS handshake"
+                with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=SMTP_PER_CALL_TIMEOUT) as smtp:
+                    stage[0] = "login"
+                    smtp.login(GMAIL_USER, GMAIL_PASS)
+                    stage[0] = "send_message"
+                    smtp.send_message(msg)
+                    stage[0] = "done"
 
         # smtplib's own `timeout` bounds each individual blocking call
         # (connect, TLS handshake, login, send) separately, not the whole
@@ -328,13 +345,16 @@ class FridayGmail:
         # case a late/duplicate send once the network recovers, not data
         # loss or a hung request, which is the actual problem this fixes.
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        started = time.time()
         try:
             pool.submit(_do_send).result(timeout=SMTP_OVERALL_TIMEOUT)
         except concurrent.futures.TimeoutError:
-            print(f"[FRIDAY Gmail] send failed: overall {SMTP_OVERALL_TIMEOUT}s deadline exceeded")
+            elapsed = time.time() - started
+            print(f"[FRIDAY Gmail] send failed: {elapsed:.1f}s elapsed, stuck at stage: {stage[0]}")
             return {"ok": False, "error": "timed out"}
         except Exception as e:
-            print(f"[FRIDAY Gmail] send failed: {e}")
+            elapsed = time.time() - started
+            print(f"[FRIDAY Gmail] send failed: {elapsed:.1f}s elapsed, stage: {stage[0]}, error: {e!r}")
             return {"ok": False, "error": str(e)}
         finally:
             pool.shutdown(wait=False)
