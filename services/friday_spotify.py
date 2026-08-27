@@ -14,9 +14,13 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 SPOTIFY_TOKEN_FILE = Path("memory/friday_spotify_token.json")
-CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
-REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "")
+# .strip() for the same reason as services/friday_calendar.py's OAuth
+# config: a trailing newline picked up while pasting into a hosting
+# dashboard makes REDIRECT_URI unusable as a Location header, and the
+# failure surfaces only as a generic 500.
+CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "").strip()
 
 # Debug visibility into what actually loaded on this deploy — CLIENT_ID/
 # REDIRECT_URI printed in full since neither is secret (redirect_uri is

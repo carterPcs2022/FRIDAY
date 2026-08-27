@@ -54,9 +54,14 @@ GMAIL_PASS = os.getenv("EMAIL_PASSWORD", "")
 
 # OAuth2 config for *sending* only (see module docstring) -- reading still
 # uses GMAIL_USER/GMAIL_PASS above via IMAP.
-GMAIL_SEND_CLIENT_ID = os.getenv("GOOGLE_GMAIL_CLIENT_ID", "")
-GMAIL_SEND_CLIENT_SECRET = os.getenv("GOOGLE_GMAIL_CLIENT_SECRET", "")
-GMAIL_SEND_REDIRECT_URI = os.getenv("GOOGLE_GMAIL_REDIRECT_URI", "")
+# .strip() for the same reason as services/friday_calendar.py's OAuth
+# config: a trailing newline picked up while pasting into a hosting
+# dashboard makes REDIRECT_URI unusable as a Location header, and the
+# failure surfaces only as a generic 500. This path happens to have been
+# pasted cleanly, but it's the identical shape.
+GMAIL_SEND_CLIENT_ID = os.getenv("GOOGLE_GMAIL_CLIENT_ID", "").strip()
+GMAIL_SEND_CLIENT_SECRET = os.getenv("GOOGLE_GMAIL_CLIENT_SECRET", "").strip()
+GMAIL_SEND_REDIRECT_URI = os.getenv("GOOGLE_GMAIL_REDIRECT_URI", "").strip()
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GMAIL_SEND_TOKEN_FILE = Path("memory/friday_gmail_send_token.json")
 # Mirrored to Turso as well -- see _load_send_token() for why the local

@@ -32,9 +32,16 @@ TOKEN_FILE = Path("memory/friday_calendar_token.json")
 # alone isn't enough on this deploy.
 TOKEN_TABLE = "calendar_token"
 TOKEN_KEY = "oauth"
-CLIENT_ID = os.getenv("GOOGLE_CALENDAR_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET", "")
-REDIRECT_URI = os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "")
+# .strip() is load-bearing, not tidiness: pasting a value into a hosting
+# dashboard's env-var field very easily picks up a trailing newline, and
+# REDIRECT_URI goes straight into a Location header via redirect(), where
+# Werkzeug rejects newlines outright ("Header values must not contain
+# newline characters") as header-injection protection. Confirmed live --
+# that raised on /friday/calendar/auth and surfaced only as the generic
+# "Something went wrong, boss.", with the real cause buried in the logs.
+CLIENT_ID = os.getenv("GOOGLE_CALENDAR_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET", "").strip()
+REDIRECT_URI = os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "").strip()
 SCOPE = "https://www.googleapis.com/auth/calendar"
 
 
