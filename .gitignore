@@ -1,5 +1,10 @@
 .env
 .DS_Store
+# Google OAuth client-secret files download under exactly this name from
+# console.cloud.google.com. Nothing here reads them (credentials come
+# from env vars) -- this is purely so one landing in the repo folder
+# can't be committed by accident.
+client_secret*.json
 __pycache__/
 memory/
 # Runtime-generated files (voice output, etc.) live directly under
