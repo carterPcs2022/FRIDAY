@@ -43,3 +43,22 @@ def app():
 @pytest.fixture()
 def client(app):
     return app.test_client()
+
+
+@pytest.fixture(autouse=True)
+def _reset_pending_followup_state(app):
+    """server.py's _pending_compose_send and _pending_calendar_add are
+    deliberately module-level, real state (see _cmd_email_compose_send's
+    and _cmd_calendar_add's docstrings) -- exactly the kind of thing
+    that leaks between tests in the same process if one test leaves it
+    non-empty (an incomplete "send an email to..."/"schedule a
+    meeting..." that never got a valid follow-up) and a later, unrelated
+    test's prompt then gets misread as answering it. Reset before and
+    after every test so each one starts and ends clean regardless of
+    what ran before or after it."""
+    import server
+    server._pending_compose_send = {}
+    server._pending_calendar_add = {}
+    yield
+    server._pending_compose_send = {}
+    server._pending_calendar_add = {}
