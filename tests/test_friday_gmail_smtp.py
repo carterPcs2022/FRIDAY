@@ -49,7 +49,7 @@ def test_force_ipv4_restores_original_even_on_exception():
 
 
 def test_send_email_uses_force_ipv4_around_smtp_connection():
-    """The actual regression: send_email() must wrap its SMTP_SSL
+    """The actual regression: send_email() must wrap its SMTP
     connection in _force_ipv4(), not just have the helper exist unused."""
     seen_patched = {}
 
@@ -65,6 +65,9 @@ def test_send_email_uses_force_ipv4_around_smtp_connection():
         def __exit__(self, *a):
             return False
 
+        def starttls(self, *a, **kw):
+            pass
+
         def login(self, *a, **kw):
             pass
 
@@ -75,7 +78,7 @@ def test_send_email_uses_force_ipv4_around_smtp_connection():
 
     with mock.patch.object(friday_gmail_mod, "GMAIL_USER", "me@example.com"), \
          mock.patch.object(friday_gmail_mod, "GMAIL_PASS", "app-password"), \
-         mock.patch.object(friday_gmail_mod.smtplib, "SMTP_SSL", _FakeSMTP):
+         mock.patch.object(friday_gmail_mod.smtplib, "SMTP", _FakeSMTP):
         result = friday_gmail.send_email(to="a@b.com", subject="hi", body="test")
 
     assert result["ok"] is True
@@ -107,6 +110,9 @@ class TestOverallSendDeadline:
             def __exit__(self, *a):
                 return False
 
+            def starttls(self, *a, **kw):
+                pass
+
             def login(self, *a, **kw):
                 # Outlives the patched-short overall deadline below but
                 # not any real test timeout -- simulates a connection
@@ -121,7 +127,7 @@ class TestOverallSendDeadline:
         with mock.patch.object(friday_gmail_mod, "GMAIL_USER", "me@example.com"), \
              mock.patch.object(friday_gmail_mod, "GMAIL_PASS", "app-password"), \
              mock.patch.object(friday_gmail_mod, "SMTP_OVERALL_TIMEOUT", 0.05), \
-             mock.patch.object(friday_gmail_mod.smtplib, "SMTP_SSL", _HangingSMTP):
+             mock.patch.object(friday_gmail_mod.smtplib, "SMTP", _HangingSMTP):
             start = time.time()
             result = friday_gmail.send_email(to="a@b.com", subject="hi", body="test")
             elapsed = time.time() - start
@@ -146,6 +152,9 @@ class TestOverallSendDeadline:
             def __exit__(self, *a):
                 return False
 
+            def starttls(self, *a, **kw):
+                pass
+
             def login(self, *a, **kw):
                 pass
 
@@ -154,7 +163,40 @@ class TestOverallSendDeadline:
 
         with mock.patch.object(friday_gmail_mod, "GMAIL_USER", "me@example.com"), \
              mock.patch.object(friday_gmail_mod, "GMAIL_PASS", "app-password"), \
-             mock.patch.object(friday_gmail_mod.smtplib, "SMTP_SSL", _FastSMTP):
+             mock.patch.object(friday_gmail_mod.smtplib, "SMTP", _FastSMTP):
             result = friday_gmail.send_email(to="a@b.com", subject="hi", body="test")
 
         assert result["ok"] is True
+
+
+class TestFinishedErrorNotReportedAsAbandoned:
+    """Caught live: socket.timeout has been the same class as the builtin
+    TimeoutError since Python 3.10, and concurrent.futures.TimeoutError
+    became that same alias too in 3.11 -- so a real per-call smtplib
+    timeout (the background thread already finished, with a real error)
+    and this wall-clock deadline giving up on a thread that's still
+    running were, under the old type-based except split, indistinguishable
+    by exception type alone. A real attempt logged a 10s per-call socket
+    timeout as "stuck at stage" (the still-running wording) when the
+    thread had actually already finished. send_email() now checks
+    future.done() instead of relying on exception type."""
+
+    def test_a_call_that_raises_promptly_is_reported_as_finished_not_abandoned(self):
+        class _PromptlyFailingSMTP:
+            def __init__(self, *a, **kw):
+                raise TimeoutError("[Errno 110] Connection timed out")
+
+        with mock.patch.object(friday_gmail_mod, "GMAIL_USER", "me@example.com"), \
+             mock.patch.object(friday_gmail_mod, "GMAIL_PASS", "app-password"), \
+             mock.patch.object(friday_gmail_mod, "SMTP_OVERALL_TIMEOUT", 5), \
+             mock.patch.object(friday_gmail_mod.smtplib, "SMTP", _PromptlyFailingSMTP):
+            start = time.time()
+            result = friday_gmail.send_email(to="a@b.com", subject="hi", body="test")
+            elapsed = time.time() - start
+
+        # The thread finished (with its own real error) almost instantly --
+        # nowhere near the 5s overall deadline -- so this must be reported
+        # as a completed failure, not treated as if the deadline gave up on
+        # a thread that's still running.
+        assert elapsed < 1
+        assert result == {"ok": False, "error": "[Errno 110] Connection timed out"}

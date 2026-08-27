@@ -31,6 +31,7 @@ import tempfile
 import contextlib
 import concurrent.futures
 import time
+import ssl
 from email import encoders
 from email.header import decode_header
 from email.mime.text import MIMEText
@@ -309,10 +310,29 @@ class FridayGmail:
         # outright" indistinguishable from the logs alone.
         stage = ["resolving smtp.gmail.com / opening connection"]
 
+        # Port 465 (implicit TLS, SMTP_SSL) was the original choice here,
+        # but confirmed live via the stage diagnostics above: every real
+        # attempt hung to the full per-call timeout stuck in "TCP connect +
+        # TLS handshake", never reaching login -- consistent with something
+        # on the network path silently dropping that connection rather than
+        # Gmail actively rejecting it (an active refusal fails in
+        # milliseconds, not exactly SMTP_PER_CALL_TIMEOUT seconds every
+        # time). Cloud hosts commonly block outbound 465 by default as an
+        # anti-spam measure while leaving 587 open, since 587 (STARTTLS --
+        # connect in plaintext, then upgrade) is the standard mail
+        # *submission* port MTAs expect clients to use, vs. 465 being the
+        # older implicit-TLS convention. Switched to 587/STARTTLS as the
+        # next real diagnostic/fix step, not a guess made blind -- if this
+        # still hangs in the same place, that would point past a
+        # port-specific block toward outbound SMTP being blocked
+        # altogether, which an HTTP-based mail API would be the real fix
+        # for, not another port/library tweak.
         def _do_send():
             with _force_ipv4():
-                stage[0] = "TCP connect + TLS handshake"
-                with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=SMTP_PER_CALL_TIMEOUT) as smtp:
+                stage[0] = "TCP connect"
+                with smtplib.SMTP("smtp.gmail.com", 587, timeout=SMTP_PER_CALL_TIMEOUT) as smtp:
+                    stage[0] = "STARTTLS handshake"
+                    smtp.starttls(context=ssl.create_default_context())
                     stage[0] = "login"
                     smtp.login(GMAIL_USER, GMAIL_PASS)
                     stage[0] = "send_message"
@@ -346,16 +366,29 @@ class FridayGmail:
         # loss or a hung request, which is the actual problem this fixes.
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         started = time.time()
+        future = pool.submit(_do_send)
         try:
-            pool.submit(_do_send).result(timeout=SMTP_OVERALL_TIMEOUT)
-        except concurrent.futures.TimeoutError:
-            elapsed = time.time() - started
-            print(f"[FRIDAY Gmail] send failed: {elapsed:.1f}s elapsed, stuck at stage: {stage[0]}")
-            return {"ok": False, "error": "timed out"}
+            future.result(timeout=SMTP_OVERALL_TIMEOUT)
         except Exception as e:
             elapsed = time.time() - started
-            print(f"[FRIDAY Gmail] send failed: {elapsed:.1f}s elapsed, stage: {stage[0]}, error: {e!r}")
-            return {"ok": False, "error": str(e)}
+            # future.done() is the real signal here, not the exception
+            # type: socket.timeout has been the *same class* as the
+            # builtin TimeoutError since Python 3.10, and
+            # concurrent.futures.TimeoutError became that same alias too
+            # in 3.11 -- so a genuine per-call smtplib/socket timeout
+            # (the thread already finished, with a real error) and this
+            # wall-clock deadline giving up on a thread that's still
+            # running are, on this interpreter, literally
+            # indistinguishable by `except` type alone. Caught live: a
+            # per-call socket timeout at 10.0s got logged as "stuck at
+            # stage" (the still-running wording) under the old
+            # type-based split, when the thread had actually already
+            # finished with its own real error at that point.
+            if future.done():
+                print(f"[FRIDAY Gmail] send failed: {elapsed:.1f}s elapsed, stage: {stage[0]}, error: {e!r}")
+            else:
+                print(f"[FRIDAY Gmail] send failed: {elapsed:.1f}s elapsed, still running -- abandoned at stage: {stage[0]}")
+            return {"ok": False, "error": "timed out" if not future.done() else str(e)}
         finally:
             pool.shutdown(wait=False)
 
