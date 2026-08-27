@@ -90,13 +90,25 @@ async function send() {
   inp.value = '';
   addMsg('user', 'YOU', text);
   showThinking();
+
+  // Render's free tier spins the service down after ~15 minutes idle --
+  // the next request has to cold-boot the container first, which can
+  // take well past a normal response time. A wake-up notice after a few
+  // seconds keeps that from looking hung/broken; it's cleared the
+  // moment the real response (or a real failure) comes back, so a
+  // request that was never slow never shows it.
+  const wakeTimer = setTimeout(() => {
+    showThinking("WAKING FRIDAY UP, BOSS — ONE SEC");
+  }, 5000);
+
+  let d;
   try {
-    // A short client-side timeout, not just relying on the fetch ever
-    // rejecting -- a request into a dead network (ship wifi, dropped
-    // connection) can hang far longer than it's worth waiting before
-    // falling back to the local model.
+    // A generous but still finite client-side timeout -- long enough to
+    // ride out a Render cold start, short enough that a genuinely dead
+    // network (ship wifi, dropped connection) still falls back to the
+    // local model in reasonable time instead of hanging forever.
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
+    const timer = setTimeout(() => controller.abort(), 45000);
     let r;
     try {
       r = await fetch(`${BASE}/command`, {
@@ -107,15 +119,23 @@ async function send() {
     } finally {
       clearTimeout(timer);
     }
-    const d = await r.json();
-    hideThinking();
-    setOfflineBadge(false);
-    addMsg('fri', 'FRIDAY', d.response || '...', {model: d.model || '', ms: d.ms || 0, emotion: d.emotion, file: d.file, clarify: d.clarify});
-    showFace();
-    if (!muted && d.has_audio && d.audio_file) playAudio(d.audio_file);
-  } catch(e) {
+    d = await r.json();
+  } catch (e) {
+    // Cleared before sendOffline(), not in a shared finally -- otherwise
+    // a still-pending wake-up notice can fire mid-way through
+    // sendOffline()'s own "LOADING LOCAL MODEL X%" progress text and
+    // stomp it.
+    clearTimeout(wakeTimer);
     await sendOffline(text);
+    return;
   }
+
+  clearTimeout(wakeTimer);
+  hideThinking();
+  setOfflineBadge(false);
+  addMsg('fri', 'FRIDAY', d.response || '...', {model: d.model || '', ms: d.ms || 0, emotion: d.emotion, file: d.file, clarify: d.clarify});
+  showFace();
+  if (!muted && d.has_audio && d.audio_file) playAudio(d.audio_file);
 }
 
 async function sendOffline(text) {
