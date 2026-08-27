@@ -11,7 +11,12 @@ class FridayTranslator:
 
         result = friday_brain.think(
             f"Translate to {target_lang}:\n{text}\n\n"
-            f"Reply as JSON: {{translation, source_language, notes}}"
+            f"Reply as JSON: {{translation, source_language, notes}}",
+            # raw=True: this parses the reply as JSON, so it must skip
+            # think()'s speech pipeline -- see core/friday_brain.py. The
+            # length cap in particular would truncate a longer
+            # translation into invalid JSON.
+            raw=True,
         )["response"]
 
         try:

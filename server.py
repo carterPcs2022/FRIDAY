@@ -1238,7 +1238,8 @@ def _cmd_sms_send(prompt, p_lower):
             f"From this: '{prompt}'\n"
             f"Extract who to text and what to say. If it's addressed "
             f"to the boss themself ('text me'), use \"me\" for 'to'.\n"
-            f'JSON: {{"to": str, "message": str}}'
+            f'JSON: {{"to": str, "message": str}}',
+            raw=True,
         )
         try:
             clean = rex.sub(r"```json|```", "", extract["response"]).strip()
@@ -1807,7 +1808,8 @@ def _cmd_goal_add(prompt, p_lower):
         import re as rex
         extract = friday_brain.think(
             f"Extract goal from: '{prompt}'\n"
-            f'Reply as JSON: {{"name": str, "description": str}}'
+            f'Reply as JSON: {{"name": str, "description": str}}',
+            raw=True,
         )
         try:
             clean = rex.sub(r"```json|```", "", extract["response"]).strip()
@@ -1841,7 +1843,8 @@ def _cmd_email_draft(prompt, p_lower):
         extract = friday_brain.think(
             f"From this: '{prompt}'\n"
             f"Extract: who to reply to and what to say.\n"
-            f'JSON: {{"to": str, "instruction": str}}'
+            f'JSON: {{"to": str, "instruction": str}}',
+            raw=True,
         )
         try:
             clean = rex.sub(r"```json|```", "", extract["response"]).strip()
@@ -1918,7 +1921,8 @@ def _cmd_email_compose_send(prompt, p_lower):
         f"attach if the boss names one (e.g. 'email them the "
         f"shopping-list file'), otherwise null. If the text doesn't "
         f"actually specify a recipient or message content, return "
-        f"empty strings rather than guessing."
+        f"empty strings rather than guessing.",
+        raw=True,
     )
     try:
         clean = rex.sub(r"```json|```", "", extract["response"]).strip()
@@ -2124,7 +2128,10 @@ def _cmd_reminder(prompt, p_lower):
             f"Examples:\n"
             f"'remind me in 30 minutes to call back' -> {{\"task\":\"call back\",\"minutes\":30}}\n"
             f"'remind me at 3pm' -> {{\"task\":\"reminder\",\"minutes\": calculated from now}}\n"
-            f"JSON only."
+            f"JSON only.",
+            # raw=True: this parses the reply as JSON, so it must skip
+            # think()'s speech pipeline -- see core/friday_brain.py.
+            raw=True,
         )["response"]
         try:
             clean = rex.sub(r"```json|```", "", result).strip()
@@ -2227,7 +2234,8 @@ def _cmd_med_add(prompt, p_lower):
             f"Extract medicine tracking info from: '{prompt}'\n"
             f"Reply as JSON: {{\"name\": str, \"times\": [\"HH:MM\"], \"dosage\": str}}\n"
             f"If time isn't specified, use a reasonable default "
-            f"like [\"08:00\"]. JSON only."
+            f"like [\"08:00\"]. JSON only.",
+            raw=True,
         )
         try:
             clean = medrex.sub(r"```json|```", "", extract["response"]).strip()

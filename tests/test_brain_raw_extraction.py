@@ -135,3 +135,46 @@ class TestCacheKeyingIsPerMode:
 
         assert raw_out["response"] == '{"a": 1}'
         assert normal_out["response"] == "Sure thing, boss."
+
+
+class TestRealCallSitesUseRawMode:
+    """The instant-response guard matches on keywords, and extraction
+    prompts quote the boss's own words back -- so ordinary requests
+    hijack FRIDAY's own internal prompt. Measured before the fix:
+    "send an email ... saying thanks for the help" returned "Always.",
+    "... saying good morning" returned "Morning, boss.", and "... asking
+    what time the meeting is" returned the clock. Four of five realistic
+    phrasings never reached the model."""
+
+    @pytest.mark.parametrize("user_text,would_hijack", [
+        ("send an email to jane@x.com saying thanks for the help", "Always."),
+        ("send an email to bob@x.com saying good morning, see you at 9", "Morning"),
+        ("send an email to sam@x.com asking what time the meeting is", "It's"),
+        ("send an email to pat@x.com about any events this weekend", "calendar"),
+    ])
+    def test_email_extraction_reaches_the_model(self, fake_llm, user_text, would_hijack):
+        import server
+        fake_llm["reply"] = (
+            '{"to": "x@y.com", "subject": "s", "body": "b", "attachment": null}'
+        )
+        fake_gmail = mock.Mock()
+        fake_gmail.extract_address.return_value = "x@y.com"
+        fake_gmail.send_email.return_value = {"ok": True, "to": "x@y.com", "subject": "s"}
+
+        with server.app.test_request_context(), \
+             mock.patch("server.friday_brain", friday_brain), \
+             mock.patch("server.friday_gmail", fake_gmail):
+            server._pending_compose_send = {}
+            result = server._cmd_email_compose_send(user_text, user_text.lower())
+
+        # The point: it actually sent, rather than the canned line
+        # reaching the JSON parser and failing.
+        assert result is not None
+        fake_gmail.send_email.assert_called_once()
+
+    def test_a_prompt_quoting_the_boss_would_still_trip_the_guard_unprotected(self):
+        """Guards the reasoning itself: if _instant_response ever stops
+        matching these, this fix is no longer load-bearing and the test
+        above would pass for the wrong reason."""
+        prompt = "From this: 'send an email to jane@x.com saying thanks'\nExtract who to email"
+        assert friday_brain._instant_response(prompt) == "Always."
