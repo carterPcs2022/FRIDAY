@@ -21,6 +21,10 @@
   --warn:     #f77f00;
   --danger:   #e63946;
   --green:    #2dc653;
+  /* FRIDAY's own canonical accent (the actual F.R.I.D.A.Y. HUD dial is
+     amber, not cyan) -- used deliberately in one place (the boot
+     sequence's status text) rather than diluting --bright everywhere. */
+  --amber:    #ffb627;
   /* Fallback for the single-line-desktop case, before hud.js's
      syncTopBarClearance() measures the real, possibly-wrapped .top-bar
      height and overwrites this -- see that function for why a fixed
@@ -31,13 +35,20 @@
 
 * { box-sizing:border-box; margin:0; padding:0; }
 
+.mono { font-family: 'Share Tech Mono', ui-monospace, monospace; }
+
+@media (prefers-reduced-motion: reduce) {
+  .boot { display: none; }
+  .shard-inner { transition: none; }
+}
+
 body {
   background: var(--space);
   background-image:
     radial-gradient(ellipse at 20% 50%, rgba(2,62,138,0.15) 0%, transparent 60%),
     radial-gradient(ellipse at 80% 20%, rgba(0,150,199,0.1) 0%, transparent 50%);
   color: var(--text);
-  font-family: -apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif;
+  font-family: 'Rajdhani', -apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif;
   /* 100vh on iOS Safari is the viewport with the address bar hidden, not
      the visible one — content gets cut off behind the toolbar/home
      indicator, or leaves a scrollable gap, depending on scroll state.
@@ -86,9 +97,10 @@ body {
 
 .top-pills { display: flex; gap: 8px; align-items: center; }
 .pill {
-  padding: 4px 12px; border-radius: 20px; font-size: 10px; letter-spacing: 1px;
+  padding: 4px 12px; font-size: 10px; letter-spacing: 1px;
   backdrop-filter: blur(10px); border: 1px solid var(--border2); background: var(--glass);
   color: var(--text); white-space: nowrap;
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
 }
 .pill.online { border-color: rgba(45,198,83,0.4); background: rgba(45,198,83,0.08); color: var(--green); }
 .pill.warn   { border-color: rgba(247,127,0,0.4); background: rgba(247,127,0,0.08); color: var(--warn); }
@@ -203,9 +215,10 @@ body {
   pointer-events: none;
 }
 .qa-btn {
-  padding: 5px 14px; border-radius: 16px; border: 1px solid var(--border2); background: var(--glass);
+  padding: 5px 14px; border: 1px solid var(--border2); background: var(--glass);
   color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap;
   backdrop-filter: blur(10px); transition: all 0.2s; flex-shrink: 0;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
 }
 .qa-btn:hover { border-color: var(--border); color: var(--bright); background: var(--glass2); }
 
@@ -273,7 +286,10 @@ body {
 .p-section { margin-bottom: 20px; }
 .p-section-title { font-size: 9px; letter-spacing: 3px; color: var(--muted); margin-bottom: 10px; text-transform: uppercase; }
 
-.stat-card { background: var(--glass); border: 1px solid var(--border2); border-radius: 12px; padding: 12px 14px; margin-bottom: 8px; transition: border-color 0.2s; }
+.stat-card {
+  background: var(--glass); border: 1px solid var(--border2); padding: 12px 14px; margin-bottom: 8px; transition: border-color 0.2s;
+  clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+}
 .stat-card:hover { border-color: var(--border); }
 .stat-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .stat-card-label { font-size: 10px; letter-spacing: 1px; color: var(--muted); }
@@ -297,7 +313,10 @@ body {
 .info-val.danger { color: var(--danger); }
 
 .veronica-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.ver-card { background: var(--glass); border: 1px solid var(--border2); border-radius: 10px; padding: 10px 12px; text-align: center; }
+.ver-card {
+  background: var(--glass); border: 1px solid var(--border2); padding: 10px 12px; text-align: center;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+}
 .ver-card-val { font-size: 20px; font-weight: 700; color: var(--bright); }
 .ver-card-label { font-size: 9px; letter-spacing: 2px; color: var(--muted); margin-top: 2px; }
 
@@ -306,17 +325,19 @@ body {
 
 .protocol-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .proto-btn {
-  padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border2); background: var(--glass);
+  padding: 8px 10px; border: 1px solid var(--border2); background: var(--glass);
   color: var(--muted); font-size: 9px; letter-spacing: 1px; cursor: pointer; text-align: center;
   transition: all 0.2s; font-family: inherit;
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
 }
 .proto-btn:hover { border-color: var(--border); color: var(--bright); background: var(--glass2); }
 
 .mode-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
 .mode-btn {
-  padding: 8px 4px; border-radius: 8px; border: 1px solid var(--border2); background: var(--glass);
+  padding: 8px 4px; border: 1px solid var(--border2); background: var(--glass);
   color: var(--muted); font-size: 9px; letter-spacing: 1px; cursor: pointer; text-align: center;
   transition: all 0.2s; font-family: inherit;
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
 }
 .mode-btn:hover, .mode-btn.active { border-color: rgba(72,202,228,0.4); color: var(--bright); background: rgba(72,202,228,0.08); }
 
@@ -376,7 +397,7 @@ body {
   pointer-events: auto;
   background: linear-gradient(160deg, var(--glass2), var(--glass));
   border: 1px solid var(--border);
-  border-radius: 12px;
+  clip-path: polygon(12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%, 0 12px);
   padding: 14px 16px;
   backdrop-filter: blur(14px);
   box-shadow: 0 0 24px rgba(0,180,216,0.15), inset 0 0 30px rgba(72,202,228,0.03);
@@ -413,6 +434,60 @@ body {
 .ar-widget-row-val { color: var(--ice); }
 .ar-widget-audio-bar { margin-top: 8px; height: 2px; background: var(--border2); border-radius: 1px; overflow: hidden; }
 .ar-widget-audio-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--bright)); transition: width 0.1s linear; }
+
+/* ---------- Boot sequence: plays once on load, fades out on its own
+   (see initBoot() in hud.js). Four brackets converge on center with a
+   systems-check readout ticking through -- a sensor system calibrating,
+   not a car's ignition ring (the one-glowing-ring version reads as
+   exactly that). Purely a one-time entrance animation, not a
+   persistent readout. ---------- */
+.boot {
+  position: fixed; inset: 0; z-index: 200; background: var(--space);
+  display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 22px;
+  animation: boot-out 0.6s ease-out 2.6s forwards;
+}
+.boot-frame { width: 200px; height: 130px; position: relative; }
+.boot-bracket {
+  position: absolute; width: 26px; height: 26px; border: 2px solid var(--bright);
+  opacity: 0; transform: translate(var(--bx), var(--by));
+  animation: boot-bracket-in 0.65s cubic-bezier(.16,.85,.2,1) forwards;
+}
+@keyframes boot-bracket-in { from { opacity: 0; } to { opacity: 1; transform: translate(0,0); } }
+.boot-bracket.tl { top: 0; left: 0; border-right: none; border-bottom: none; --bx: -70px; --by: -70px; animation-delay: 0.15s; }
+.boot-bracket.tr { top: 0; right: 0; border-left: none; border-bottom: none; --bx: 70px; --by: -70px; animation-delay: 0.3s; }
+.boot-bracket.bl { bottom: 0; left: 0; border-right: none; border-top: none; --bx: -70px; --by: 70px; animation-delay: 0.3s; }
+.boot-bracket.br { bottom: 0; right: 0; border-left: none; border-top: none; --bx: 70px; --by: 70px; animation-delay: 0.15s; }
+.boot-status { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.boot-line {
+  font-size: 10px; letter-spacing: 2.5px; color: var(--amber); opacity: 0;
+  animation: boot-line-in 0.35s ease-out forwards; animation-delay: var(--d);
+}
+@keyframes boot-line-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 0.85; transform: translateY(0); } }
+@keyframes boot-out { to { opacity: 0; visibility: hidden; } }
+
+/* ---------- Shard cluster: real CSS 3D geometry (perspective +
+   preserve-3d + translateZ per facet), ambient decoration in the same
+   category as .particles above -- not tied to any real value, claims
+   nothing, exactly like the particle field already does. Sits behind
+   the reticle/messages, in front of the plain background. ---------- */
+.shard-stage {
+  position: fixed; top: 50%; left: 50%; z-index: 0;
+  width: min(70vw, 520px); height: min(70vw, 520px);
+  margin: calc(min(70vw, 520px) / -2) 0 0 calc(min(70vw, 520px) / -2);
+  perspective: 900px; pointer-events: none; opacity: 0.55;
+}
+.shard-inner {
+  position: absolute; inset: 0; transform-style: preserve-3d;
+  transform: rotateX(0deg) rotateY(0deg);
+  transition: transform 0.4s cubic-bezier(.2,.7,.3,1);
+}
+.shard-facet {
+  position: absolute; top: 50%; left: 50%; width: 2px;
+  background: linear-gradient(180deg, rgba(72,202,228,0.35), rgba(72,202,228,0.02));
+  transform-origin: top center;
+}
+.shard-facet.accent { background: linear-gradient(180deg, rgba(255,182,39,0.4), rgba(255,182,39,0.03)); }
+@media (prefers-reduced-motion: reduce) { .shard-inner { transition: none; } }
 
 @media (max-width: 700px) {
   /* .top-bar packs a logo, 3 status pills, a clock, and 6 buttons into

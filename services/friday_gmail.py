@@ -29,6 +29,7 @@ import smtplib
 import email
 import tempfile
 import contextlib
+import concurrent.futures
 from email import encoders
 from email.header import decode_header
 from email.mime.text import MIMEText
@@ -40,6 +41,14 @@ GMAIL_USER = os.getenv("EMAIL_ADDRESS", "")
 GMAIL_PASS = os.getenv("EMAIL_PASSWORD", "")
 
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
+# Per-call timeout (each of connect/TLS/login/send individually) and the
+# hard wall-clock deadline for the *whole* connect+login+send operation --
+# see send_email()'s _do_send() for why both exist. Module-level so tests
+# can drive the real deadline-enforcement path with a short value instead
+# of mocking it away or waiting out the real one.
+SMTP_PER_CALL_TIMEOUT = 10
+SMTP_OVERALL_TIMEOUT = 18
 
 
 @contextlib.contextmanager
@@ -288,13 +297,47 @@ class FridayGmail:
             part.add_header("Content-Disposition", f'attachment; filename="{path.name}"')
             msg.attach(part)
 
-        try:
-            with _force_ipv4(), smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+        def _do_send():
+            with _force_ipv4(), smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=SMTP_PER_CALL_TIMEOUT) as smtp:
                 smtp.login(GMAIL_USER, GMAIL_PASS)
                 smtp.send_message(msg)
+
+        # smtplib's own `timeout` bounds each individual blocking call
+        # (connect, TLS handshake, login, send) separately, not the whole
+        # operation -- raising it to 25s (an earlier fix here) helped a
+        # one-off cold-start blip, but confirmed live: on a more
+        # persistently degraded connection, several sequential stages can
+        # each eat close to that budget before proceeding, and they
+        # compound past the HUD's 45s client-side deadline even though no
+        # single stage looked slow on its own. Running the whole
+        # connect+login+send in a thread and capping *that* with one hard
+        # wall-clock deadline is what actually bounds total time,
+        # regardless of how many SMTP stages there are. The per-call
+        # timeout stays low as a fast first line of defense against one
+        # truly stuck stage.
+        #
+        # Deliberately NOT a `with ThreadPoolExecutor() as pool:` block --
+        # its __exit__ calls shutdown(wait=True), which blocks until the
+        # background thread actually finishes regardless of .result()
+        # already having raised TimeoutError, silently defeating the
+        # deadline entirely (caught by a real test, not just reasoned
+        # about: elapsed time matched the hang, not the timeout, until
+        # this was fixed). shutdown(wait=False) lets the timeout mean what
+        # it says; the thread isn't forcibly killed (Python threads can't
+        # be) and may still complete in the background afterward -- worst
+        # case a late/duplicate send once the network recovers, not data
+        # loss or a hung request, which is the actual problem this fixes.
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            pool.submit(_do_send).result(timeout=SMTP_OVERALL_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            print(f"[FRIDAY Gmail] send failed: overall {SMTP_OVERALL_TIMEOUT}s deadline exceeded")
+            return {"ok": False, "error": "timed out"}
         except Exception as e:
             print(f"[FRIDAY Gmail] send failed: {e}")
             return {"ok": False, "error": str(e)}
+        finally:
+            pool.shutdown(wait=False)
 
         return {
             "ok": True, "to": address, "subject": msg["Subject"],

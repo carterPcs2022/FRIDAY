@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>F.R.I.D.A.Y</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/hud.css') }}">
 <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
 <link rel="icon" href="{{ url_for('static', filename='icons/icon.svg') }}">
@@ -11,6 +14,31 @@
 </head>
 <body>
 
+<!-- Boot sequence: plays once on load, fades out on its own -- see
+     .boot in hud.css and initBoot() in hud.js. Purely a one-time
+     entrance animation, never a persistent readout, so it doesn't
+     conflict with the "every readout is real" rule below. -->
+<div class="boot" id="boot">
+  <div class="boot-frame">
+    <div class="boot-bracket tl"></div>
+    <div class="boot-bracket tr"></div>
+    <div class="boot-bracket bl"></div>
+    <div class="boot-bracket br"></div>
+  </div>
+  <div class="boot-status">
+    <div class="boot-line mono" style="--d:0.5s">OPTICS ARRAY — ONLINE</div>
+    <div class="boot-line mono" style="--d:0.95s">TARGETING SOLUTION — ONLINE</div>
+    <div class="boot-line mono" style="--d:1.4s">F.R.I.D.A.Y — NEURAL LINK SYNCED</div>
+  </div>
+</div>
+
+<!-- Shard cluster: real CSS 3D geometry (perspective + translateZ per
+     facet), ambient decoration in the same category as .particles
+     below -- ties to nothing, claims nothing, ambient only. See
+     buildShardCluster() in hud.js. -->
+<div class="shard-stage" id="shard-stage">
+  <div class="shard-inner" id="shard-inner"></div>
+</div>
 
 <div class="particles" id="particles"></div>
 <canvas id="friday-face" width="220" height="220"></canvas>
@@ -205,7 +233,7 @@
     <div class="quick-actions-wrap">
       <div class="quick-actions">
         <button class="qa-btn" onclick="quickSend('FRIDAY run a morning brief')">Morning Brief</button>
-        <button class="qa-btn" onclick="quickSend('FRIDAY threat assessment')">Threat Scan</button>
+        <button class="qa-btn" onclick="quickSend('FRIDAY scan for threats')">Threat Scan</button>
         <button class="qa-btn" onclick="quickSend('What is your status')">Status</button>
         <button class="qa-btn" onclick="window.FridayOfflineSync && window.FridayOfflineSync.showOfflineData()" title="Last-synced tasks/notes/calendar — works with no internet">Cached Data</button>
         <button class="qa-btn" onclick="testOfflineMode()" title="Force the local model right now, while you still have signal, to verify offline mode actually works">Test Offline Model</button>
