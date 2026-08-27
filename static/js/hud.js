@@ -17,6 +17,35 @@ if ('serviceWorker' in navigator) {
   });
 }
 
+// .top-bar wraps to however many rows a given phone's width forces (a
+// wide phone: one row; a narrow one with VOICE OFF/ENROLL/HELMET VIEW
+// all present: three or four) -- no fixed breakpoint value can predict
+// that height, which is exactly what caused HELMET VIEW/gear/diamond to
+// render on top of the LOCK/PWR readout on a real device instead of
+// below it. Measuring the actual rendered box and driving
+// --top-bar-clearance (static/css/hud.css) from it replaces guessing
+// with fact, and keeps working if the bar's content ever changes again.
+function syncTopBarClearance() {
+  const bar = document.querySelector('.top-bar');
+  if (!bar) return;
+  const height = bar.getBoundingClientRect().height;
+  if (height > 0) {
+    document.documentElement.style.setProperty('--top-bar-clearance', `${Math.ceil(height) + 8}px`);
+  }
+}
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  if ('ResizeObserver' in window) {
+    window.addEventListener('load', () => {
+      const bar = document.querySelector('.top-bar');
+      if (bar) new ResizeObserver(syncTopBarClearance).observe(bar);
+    });
+  } else {
+    window.addEventListener('load', syncTopBarClearance);
+    window.addEventListener('resize', syncTopBarClearance);
+    window.addEventListener('orientationchange', syncTopBarClearance);
+  }
+}
+
 (function() {
   const container = document.getElementById('particles');
   for (let i = 0; i < 30; i++) {
@@ -81,7 +110,7 @@ async function send() {
     const d = await r.json();
     hideThinking();
     setOfflineBadge(false);
-    addMsg('fri', 'FRIDAY', d.response || '...', {model: d.model || '', ms: d.ms || 0, emotion: d.emotion});
+    addMsg('fri', 'FRIDAY', d.response || '...', {model: d.model || '', ms: d.ms || 0, emotion: d.emotion, file: d.file});
     showFace();
     if (!muted && d.has_audio && d.audio_file) playAudio(d.audio_file);
   } catch(e) {
@@ -167,8 +196,31 @@ function addMsg(type, label, text, meta = {}) {
     </div>`;
   }
   wrap.innerHTML = `<div class="msg-who">${label}</div><div class="msg-bubble">${clean}</div>${metaHtml}`;
+  // Built via DOM APIs rather than string-interpolated into innerHTML --
+  // meta.file.name can be whatever the boss said ("create a file called
+  // <anything>"), and textContent/addEventListener keep that safe no
+  // matter what it contains, instead of trusting it inside HTML/attrs.
+  if (meta.file && meta.file.name) {
+    const btn = document.createElement('button');
+    btn.className = 'msg-file-btn';
+    btn.textContent = `⬇ ${meta.file.name}`;
+    btn.addEventListener('click', () => downloadGeneratedFile(meta.file.name, meta.file.content || ''));
+    wrap.appendChild(btn);
+  }
   area.appendChild(wrap);
   area.scrollTop = area.scrollHeight;
+}
+
+function downloadGeneratedFile(name, content) {
+  const blob = new Blob([content], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 let thinkEl = null;

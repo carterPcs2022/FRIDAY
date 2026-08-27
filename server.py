@@ -674,6 +674,18 @@ NOTE_TRIGGERS = [
     "jot that down",
 ]
 
+FILE_TRIGGERS = [
+    "create a file", "make a file",
+    "create a document", "make a document",
+    "write a file", "generate a file",
+]
+
+FILE_RECALL_TRIGGERS = [
+    "open the file", "show me the file",
+    "get the file", "pull up the file",
+    "find the file", "resend the file",
+]
+
 REMINDER_TRIGGERS = [
     "remind me", "set a reminder",
     "don't let me forget", "alert me",
@@ -1713,12 +1725,14 @@ def _cmd_email_compose_send(prompt, p_lower):
         extract = friday_brain.think(
             f"From this: '{prompt}'\n"
             f"Extract who to email and what to say.\n"
-            f'JSON: {{"to": str, "subject": str, "body": str}}\n'
+            f'JSON: {{"to": str, "subject": str, "body": str, "attachment": str|null}}\n'
             f"'to' should be the raw email address if one appears in the "
             f"text, otherwise the name/description as given. 'subject' "
             f"should be short and inferred from the message if none is "
             f"stated. 'body' should be the message to send, written out "
-            f"in full sentences."
+            f"in full sentences. 'attachment' is the name of a file to "
+            f"attach if the boss names one (e.g. 'email them the "
+            f"shopping-list file'), otherwise null."
         )
         try:
             clean = rex.sub(r"```json|```", "", extract["response"]).strip()
@@ -1726,8 +1740,9 @@ def _cmd_email_compose_send(prompt, p_lower):
             to = data.get("to", "")
             subject = data.get("subject", "")
             body = data.get("body", "")
+            attachment = data.get("attachment") or None
         except Exception:
-            to, subject, body = "", "", ""
+            to, subject, body, attachment = "", "", "", None
 
         if not friday_gmail.extract_address(to):
             # No bare address in the prompt or the extraction — try
@@ -1748,7 +1763,10 @@ def _cmd_email_compose_send(prompt, p_lower):
             _log(prompt, response, "email_compose_send")
             return jsonify({"response": response, "mode": "email_compose_send"})
 
-        result = friday_gmail.send_email(to=to, subject=subject, body=body)
+        result = friday_gmail.send_email(
+            to=to, subject=subject, body=body,
+            attachments=[attachment] if attachment else None,
+        )
         if result.get("ok"):
             response = f"Sent, boss. On its way to {result.get('to', '')}."
         else:
@@ -1791,6 +1809,89 @@ def _cmd_note(prompt, p_lower):
         response = "Noted, boss."
         _log(prompt, response, "note")
         return jsonify({"response": response, "mode": "note"})
+
+
+def _extract_file_name(prompt: str, p_lower: str) -> str:
+    for marker in (" called ", " named ", " titled "):
+        if marker in p_lower:
+            tail = prompt[p_lower.index(marker) + len(marker):]
+            name = tail.split(":", 1)[0].strip().rstrip(".,!?")
+            if name:
+                return name
+    return ""
+
+
+def _safe_filename(name: str) -> str:
+    """A name spoken in a chat prompt ends up in a filesystem Path join
+    later (services/friday_gmail.py materializes it as an email
+    attachment) -- strip path separators and ".." before that ever
+    happens, rather than trusting free text as a path component."""
+    import re as rex
+    name = name.strip().replace("/", "-").replace("\\", "-")
+    name = rex.sub(r"\.\.+", ".", name)
+    name = rex.sub(r"[^A-Za-z0-9 ._-]", "", name)
+    return name.strip(" .-")
+
+
+def _cmd_create_file(prompt, p_lower):
+    if any(t in p_lower for t in FILE_TRIGGERS):
+        import re as rex
+        from core.friday_memory import save_generated_file
+
+        name = _extract_file_name(prompt, p_lower)
+        # An explicit ":" is the strongest signal of "here's the actual
+        # content" -- anything short of that gets drafted, same as a
+        # "draft an email" request with no body dictated.
+        content = prompt.split(":", 1)[1].strip() if ":" in prompt else ""
+
+        if not content and friday_brain:
+            drafted = friday_brain.think(
+                f"The boss asked: \"{prompt}\"\n"
+                f"Write only the content that file should contain -- no "
+                f"preamble, no explanation, just the text of the file itself."
+            )["response"]
+            content = drafted.strip()
+
+        if not name:
+            seed = content or prompt
+            words = rex.sub(r"[^a-z0-9\s]", "", seed.lower()).split()[:5]
+            name = "-".join(words) or "note"
+        name = _safe_filename(name) or "note"
+        if "." not in name:
+            name = f"{name}.txt"
+
+        entry = {
+            "name": name, "content": content,
+            "created_at": datetime.datetime.now().isoformat(), "context": prompt,
+        }
+        save_generated_file(entry)
+
+        response = f"Made it, boss — \"{name}\", ready to download or send."
+        _log(prompt, response, "create_file")
+        return jsonify({
+            "response": response, "mode": "create_file",
+            "file": {"name": name, "content": content},
+        })
+
+
+def _cmd_file_recall(prompt, p_lower):
+    if any(t in p_lower for t in FILE_RECALL_TRIGGERS):
+        from core.friday_memory import get_generated_file
+
+        name = _extract_file_name(prompt, p_lower)
+        entry = get_generated_file(name) if name else None
+        if not entry:
+            response = (f"Couldn't find a file called \"{name}\", boss." if name
+                        else "Which file, boss? Give me the name.")
+            _log(prompt, response, "file_recall")
+            return jsonify({"response": response, "mode": "file_recall"})
+
+        response = f"Here's \"{entry['name']}\", boss."
+        _log(prompt, response, "file_recall")
+        return jsonify({
+            "response": response, "mode": "file_recall",
+            "file": {"name": entry["name"], "content": entry.get("content", "")},
+        })
 
 
 def _cmd_reminder(prompt, p_lower):
@@ -2267,6 +2368,16 @@ def command():
 
         # ── Note that ─────────────────────────────────────────────────────────
         result = _cmd_note(prompt, p_lower)
+        if result is not None:
+            return result
+
+        # ── Create a file (checked before recall — "open the file" etc.
+        # never mentions "create", so there's no overlap either way) ────────
+        result = _cmd_create_file(prompt, p_lower)
+        if result is not None:
+            return result
+
+        result = _cmd_file_recall(prompt, p_lower)
         if result is not None:
             return result
 
