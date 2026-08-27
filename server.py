@@ -606,6 +606,15 @@ CALENDAR_ADD_TRIGGERS = [
     "create an event", "book a meeting",
 ]
 
+# Same pending-follow-up shape as _pending_compose_send above, and the
+# same reason: "wasn't sure what to schedule there -- try again with a
+# time?" invites a bare reply ("3pm tomorrow") that carries none of
+# CALENDAR_ADD_TRIGGERS' phrases. Without this, that reply falls through
+# to the plain conversational model, which can describe "scheduling" the
+# event in prose without ever calling create_event().
+_pending_calendar_add: dict = {}
+CALENDAR_ADD_PENDING_WINDOW = 300  # seconds
+
 DRAFT_TRIGGERS = [
     "draft a reply", "reply to",
     "write a reply", "respond to",
@@ -633,6 +642,20 @@ COMPOSE_SEND_TRIGGERS = [
     "compose an email to", "shoot an email to",
     "fire off an email to",
 ]
+
+# Follow-up state for compose-send's own clarifying question ("who's it
+# going to, and what should it say"). Without this, a reply that answers
+# that question ("jane@x.com, tell her I'm running late") carries none of
+# COMPOSE_SEND_TRIGGERS' phrases, falls through every dispatcher below,
+# and lands on the plain conversational model -- which happily describes
+# "sending" the email in prose without ever calling send_email(). That's
+# not a wording bug, it's FRIDAY claiming to have done something she
+# didn't do. Tracking the incomplete attempt for a short window lets the
+# very next ambiguous-looking reply get folded back into the real flow
+# instead of becoming a fabricated confirmation.
+_pending_compose_send: dict = {}
+COMPOSE_SEND_PENDING_WINDOW = 300  # seconds -- long enough for a natural pause replying to "who's it going to", short enough not to hijack an unrelated later message indefinitely
+CANCEL_TRIGGERS = ["never mind", "nevermind", "cancel that", "forget it", "cancel it"]
 
 # "inbox"/"what emails" (EMAIL_TRIGGERS) are substrings of "triage my
 # inbox"/"organize my inbox"/"what emails need attention" — this list
@@ -1589,34 +1612,71 @@ def _cmd_spotify_play(prompt, p_lower):
 
 
 def _cmd_calendar_add(prompt, p_lower):
-    if any(t in p_lower for t in CALENDAR_ADD_TRIGGERS) and friday_brain:
-        if not (friday_calendar and friday_calendar.is_connected()):
-            response = "Your calendar isn't connected yet, boss."
-            _log(prompt, response, "calendar")
-            return jsonify({"response": response, "mode": "calendar"})
+    global _pending_calendar_add
 
-        import re as rex
-        result = friday_brain.think(
-            f"Extract a calendar event from: {prompt}\n"
-            f"Current time: {datetime.datetime.now().isoformat()}\n\n"
-            f'Reply as JSON: {{"title": str, "start": "ISO 8601 datetime", '
-            f'"end": "ISO 8601 datetime"}}\n'
-            f"If no duration is given, default to 30 minutes. JSON only."
-        )
-        try:
-            clean = rex.sub(r"```json|```", "", result["response"]).strip()
-            data = json.loads(clean)
-            created = friday_calendar.create_event(
-                data.get("title", "Event"), data["start"], data["end"]
-            )
-            if created.get("ok"):
-                response = f"Added \"{data.get('title', 'Event')}\" to your calendar, boss."
-            else:
-                response = created.get("error", "Couldn't add that to your calendar, boss.")
-        except Exception:
-            response = "Wasn't sure what to schedule there, boss — try again with a time?"
+    if _pending_calendar_add and time.time() > _pending_calendar_add.get("expires", 0):
+        _pending_calendar_add = {}
+
+    is_new_request = any(t in p_lower for t in CALENDAR_ADD_TRIGGERS)
+    is_pending_reply = bool(_pending_calendar_add) and not is_new_request
+
+    if is_pending_reply and any(t in p_lower for t in CANCEL_TRIGGERS):
+        _pending_calendar_add = {}
+        response = "Scrapped it, boss."
         _log(prompt, response, "calendar")
         return jsonify({"response": response, "mode": "calendar"})
+
+    if not (is_new_request or is_pending_reply) or not friday_brain:
+        return
+
+    if not (friday_calendar and friday_calendar.is_connected()):
+        _pending_calendar_add = {}
+        response = "Your calendar isn't connected yet, boss."
+        _log(prompt, response, "calendar")
+        return jsonify({"response": response, "mode": "calendar"})
+
+    import re as rex
+    # Same reasoning as _cmd_email_compose_send: a pending reply only
+    # makes sense folded in with the original ask -- "3pm tomorrow"
+    # is nothing on its own without "schedule a meeting with Jane".
+    context = prompt
+    if is_pending_reply:
+        context = f"{_pending_calendar_add.get('context', '')}\nBoss's follow-up reply: {prompt}"
+
+    result = friday_brain.think(
+        f"Extract a calendar event from: {context}\n"
+        f"Current time: {datetime.datetime.now().isoformat()}\n\n"
+        f'Reply as JSON: {{"title": str, "start": "ISO 8601 datetime", '
+        f'"end": "ISO 8601 datetime"}}\n'
+        f"If no duration is given, default to 30 minutes. If the text "
+        f"doesn't actually specify a time, return empty strings for "
+        f"start/end rather than guessing. JSON only."
+    )
+    try:
+        clean = rex.sub(r"```json|```", "", result["response"]).strip()
+        data = json.loads(clean)
+        if not data.get("start") or not data.get("end"):
+            raise ValueError("no time given")
+        created = friday_calendar.create_event(
+            data.get("title", "Event"), data["start"], data["end"]
+        )
+        if created.get("ok"):
+            response = f"Added \"{data.get('title', 'Event')}\" to your calendar, boss."
+        else:
+            response = created.get("error", "Couldn't add that to your calendar, boss.")
+        _pending_calendar_add = {}
+    except Exception:
+        if is_pending_reply:
+            # One miss already used -- give up rather than re-arming
+            # pending state and risking a later unrelated message
+            # getting folded into this same attempt.
+            _pending_calendar_add = {}
+            response = "Still wasn't sure what to schedule, boss — try the full request again?"
+        else:
+            _pending_calendar_add = {"context": context, "expires": time.time() + CALENDAR_ADD_PENDING_WINDOW}
+            response = "Wasn't sure what to schedule there, boss — try again with a time?"
+    _log(prompt, response, "calendar")
+    return jsonify({"response": response, "mode": "calendar"})
 
 
 def _cmd_goal_report(prompt, p_lower):
@@ -1720,59 +1780,95 @@ def _cmd_email_send(prompt, p_lower):
 
 
 def _cmd_email_compose_send(prompt, p_lower):
-    if any(t in p_lower for t in COMPOSE_SEND_TRIGGERS) and friday_gmail and friday_brain:
-        import re as rex
-        extract = friday_brain.think(
-            f"From this: '{prompt}'\n"
-            f"Extract who to email and what to say.\n"
-            f'JSON: {{"to": str, "subject": str, "body": str, "attachment": str|null}}\n'
-            f"'to' should be the raw email address if one appears in the "
-            f"text, otherwise the name/description as given. 'subject' "
-            f"should be short and inferred from the message if none is "
-            f"stated. 'body' should be the message to send, written out "
-            f"in full sentences. 'attachment' is the name of a file to "
-            f"attach if the boss names one (e.g. 'email them the "
-            f"shopping-list file'), otherwise null."
-        )
-        try:
-            clean = rex.sub(r"```json|```", "", extract["response"]).strip()
-            data = json.loads(clean)
-            to = data.get("to", "")
-            subject = data.get("subject", "")
-            body = data.get("body", "")
-            attachment = data.get("attachment") or None
-        except Exception:
-            to, subject, body, attachment = "", "", "", None
+    global _pending_compose_send
 
-        if not friday_gmail.extract_address(to):
-            # No bare address in the prompt or the extraction — try
-            # the contact book first (a name FRIDAY actually has an
-            # address for), then fall back to matching it against a
-            # recent inbox sender by name, the same lookup the
-            # reply-draft flow uses.
-            contact = friday_contacts.find_by_name(to) if friday_contacts else {}
-            if contact.get("email"):
-                to = contact["email"]
-            else:
-                found = friday_gmail.find_email(to)
-                if found:
-                    to = found.get("from", "")
+    if _pending_compose_send and time.time() > _pending_compose_send.get("expires", 0):
+        _pending_compose_send = {}
 
-        if not to or not body:
-            response = "Who's it going to, and what should it say, boss?"
-            _log(prompt, response, "email_compose_send")
-            return jsonify({"response": response, "mode": "email_compose_send"})
+    is_new_request = any(t in p_lower for t in COMPOSE_SEND_TRIGGERS)
+    is_pending_reply = bool(_pending_compose_send) and not is_new_request
 
-        result = friday_gmail.send_email(
-            to=to, subject=subject, body=body,
-            attachments=[attachment] if attachment else None,
-        )
-        if result.get("ok"):
-            response = f"Sent, boss. On its way to {result.get('to', '')}."
-        else:
-            response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
+    if is_pending_reply and any(t in p_lower for t in CANCEL_TRIGGERS):
+        _pending_compose_send = {}
+        response = "Scrapped it, boss."
         _log(prompt, response, "email_compose_send")
-        return jsonify({"response": response, "mode": "email_compose_send", **result})
+        return jsonify({"response": response, "mode": "email_compose_send"})
+
+    if not (is_new_request or is_pending_reply) or not friday_gmail or not friday_brain:
+        return
+
+    import re as rex
+    # A pending reply gets folded in with the original ask, not extracted
+    # alone -- "jane@x.com, running late" only makes sense as a recipient
+    # + body next to "send an email to my boss", not by itself.
+    context = prompt
+    if is_pending_reply:
+        context = f"{_pending_compose_send.get('context', '')}\nBoss's follow-up reply: {prompt}"
+
+    extract = friday_brain.think(
+        f"From this: '{context}'\n"
+        f"Extract who to email and what to say.\n"
+        f'JSON: {{"to": str, "subject": str, "body": str, "attachment": str|null}}\n'
+        f"'to' should be the raw email address if one appears in the "
+        f"text, otherwise the name/description as given. 'subject' "
+        f"should be short and inferred from the message if none is "
+        f"stated. 'body' should be the message to send, written out "
+        f"in full sentences. 'attachment' is the name of a file to "
+        f"attach if the boss names one (e.g. 'email them the "
+        f"shopping-list file'), otherwise null. If the text doesn't "
+        f"actually specify a recipient or message content, return "
+        f"empty strings rather than guessing."
+    )
+    try:
+        clean = rex.sub(r"```json|```", "", extract["response"]).strip()
+        data = json.loads(clean)
+        to = data.get("to", "")
+        subject = data.get("subject", "")
+        body = data.get("body", "")
+        attachment = data.get("attachment") or None
+    except Exception:
+        to, subject, body, attachment = "", "", "", None
+
+    if not friday_gmail.extract_address(to):
+        # No bare address in the prompt or the extraction — try
+        # the contact book first (a name FRIDAY actually has an
+        # address for), then fall back to matching it against a
+        # recent inbox sender by name, the same lookup the
+        # reply-draft flow uses.
+        contact = friday_contacts.find_by_name(to) if friday_contacts else {}
+        if contact.get("email"):
+            to = contact["email"]
+        else:
+            found = friday_gmail.find_email(to)
+            if found:
+                to = found.get("from", "")
+
+    if not to or not body:
+        if is_pending_reply:
+            # Already gave the boss one chance to answer -- re-asking the
+            # identical question and re-arming pending state again risks
+            # silently capturing whatever they say *next* too, including
+            # something completely unrelated they've moved on to. One
+            # miss ends the attempt instead of looping.
+            _pending_compose_send = {}
+            response = "Still couldn't tell who or what to send, boss — try the full request again?"
+        else:
+            _pending_compose_send = {"context": context, "expires": time.time() + COMPOSE_SEND_PENDING_WINDOW}
+            response = "Who's it going to, and what should it say, boss?"
+        _log(prompt, response, "email_compose_send")
+        return jsonify({"response": response, "mode": "email_compose_send"})
+
+    _pending_compose_send = {}
+    result = friday_gmail.send_email(
+        to=to, subject=subject, body=body,
+        attachments=[attachment] if attachment else None,
+    )
+    if result.get("ok"):
+        response = f"Sent, boss. On its way to {result.get('to', '')}."
+    else:
+        response = f"Couldn't send that, boss — {result.get('error', 'unknown error')}."
+    _log(prompt, response, "email_compose_send")
+    return jsonify({"response": response, "mode": "email_compose_send", **result})
 
 
 def _cmd_email_triage(prompt, p_lower):
