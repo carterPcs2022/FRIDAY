@@ -207,3 +207,111 @@ class TestSpotifyDoesNotSwallowSpecificCommands:
         assert "put on my list" in server._SPOTIFY_SHADOWED_TRIGGERS
         # Only genuinely-shadowed phrases, not the whole trigger lists.
         assert "add task" not in server._SPOTIFY_SHADOWED_TRIGGERS
+
+
+class TestFailuresAreDistinguishable:
+    """Previously one bare `except Exception` wrapped parse + create, so
+    a malformed model reply, a genuine "no date given", and Google
+    rejecting the event all produced the same "wasn't sure what to
+    schedule" answer, with nothing logged. That's the same shape that
+    made the SMTP outage take four passes to diagnose -- an opaque
+    message hiding several unrelated causes."""
+
+    def test_a_chatty_model_reply_still_creates_the_event(self, app):
+        """The realistic failure: the model wraps correct JSON in prose.
+        json.loads() alone raises on this, which used to read as "wasn't
+        sure what to schedule" even though the extraction was fine."""
+        fake_brain = mock.Mock()
+        fake_brain.think.return_value = _think(
+            'Sure thing, boss! Here you go:\n'
+            '{"title": "Highschool Starts", "start": "2026-09-01", "end": "2026-09-01"}\n'
+            'Let me know if you want it moved.'
+        )
+        fake_cal = mock.Mock()
+        fake_cal.is_connected.return_value = True
+        fake_cal.create_event.return_value = {"ok": True}
+
+        with app.test_request_context(), \
+             mock.patch("server.friday_brain", fake_brain), \
+             mock.patch("server.friday_calendar", fake_cal):
+            prompt = "put on my calendar September 1st Highschool Starts"
+            result = server._cmd_calendar_add(prompt, prompt.lower())
+
+        assert "added" in result.get_json()["response"].lower()
+        fake_cal.create_event.assert_called_once_with(
+            "Highschool Starts", "2026-09-01", "2026-09-01"
+        )
+
+    def test_a_google_side_rejection_does_not_claim_it_misunderstood(self, app):
+        """A rejected event parsed fine -- telling the boss to reword it
+        sends them off fixing a request that was never the problem."""
+        fake_brain = mock.Mock()
+        fake_brain.think.return_value = _think(
+            '{"title": "Lunch", "start": "2026-09-01T12:00:00", "end": "2026-09-01T12:30:00"}'
+        )
+        fake_cal = mock.Mock()
+        fake_cal.is_connected.return_value = True
+        fake_cal.create_event.return_value = {"error": "Failed to create event: 403"}
+
+        with app.test_request_context(), \
+             mock.patch("server.friday_brain", fake_brain), \
+             mock.patch("server.friday_calendar", fake_cal):
+            prompt = "put on my calendar lunch at noon"
+            result = server._cmd_calendar_add(prompt, prompt.lower())
+
+        body = result.get_json()["response"]
+        assert "403" in body
+        assert "wasn't sure" not in body.lower()
+        # Nothing left pending -- the request was understood.
+        assert server._pending_calendar_add == {}
+
+    def test_an_unparseable_reply_is_reported_as_such(self, app):
+        fake_brain = mock.Mock()
+        fake_brain.think.return_value = _think("I have no idea what you mean.")
+        fake_cal = mock.Mock()
+        fake_cal.is_connected.return_value = True
+
+        with app.test_request_context(), \
+             mock.patch("server.friday_brain", fake_brain), \
+             mock.patch("server.friday_calendar", fake_cal):
+            prompt = "put on my calendar something"
+            result = server._cmd_calendar_add(prompt, prompt.lower())
+
+        assert "read that one back" in result.get_json()["response"].lower()
+        fake_cal.create_event.assert_not_called()
+
+    def test_create_event_raising_does_not_escape_as_a_500(self, app):
+        """An exception from the calendar service must become an honest
+        message, not an uncaught error the global handler turns into
+        "Something went wrong, boss.\""""
+        fake_brain = mock.Mock()
+        fake_brain.think.return_value = _think(
+            '{"title": "X", "start": "2026-09-01", "end": "2026-09-01"}'
+        )
+        fake_cal = mock.Mock()
+        fake_cal.is_connected.return_value = True
+        fake_cal.create_event.side_effect = RuntimeError("connection reset")
+
+        with app.test_request_context(), \
+             mock.patch("server.friday_brain", fake_brain), \
+             mock.patch("server.friday_calendar", fake_cal):
+            prompt = "put on my calendar X on September 1st"
+            result = server._cmd_calendar_add(prompt, prompt.lower())
+
+        assert "couldn't add that" in result.get_json()["response"].lower()
+
+
+class TestJsonFromModel:
+    def test_plain_json(self):
+        assert server._json_from_model('{"a": 1}') == {"a": 1}
+
+    def test_fenced_json(self):
+        assert server._json_from_model('```json\n{"a": 1}\n```') == {"a": 1}
+
+    def test_json_surrounded_by_prose(self):
+        assert server._json_from_model('Here: {"a": 1} — done!') == {"a": 1}
+
+    def test_genuinely_unparseable_raises(self):
+        import pytest
+        with pytest.raises(Exception):
+            server._json_from_model("no json here at all")

@@ -122,6 +122,7 @@ def login():
 
 
 import os
+import re
 import json
 import datetime
 import logging
@@ -1636,6 +1637,30 @@ def _cmd_spotify_play(prompt, p_lower):
             return jsonify({"response": response, "mode": "spotify"})
 
 
+def _json_from_model(text: str):
+    """Parse a JSON object out of an LLM reply.
+
+    The bare `re.sub("```json|```")` + json.loads pattern used in a
+    dozen places here needs the reply to be *exactly* JSON and nothing
+    else -- one "Here's the event:" preamble or a trailing sentence and
+    it raises, which upstream turns into a generic "wasn't sure"
+    message. Falling back to the outermost {...} span makes the common
+    chatty-model case work instead of failing indistinguishably from a
+    genuine "no date given".
+
+    Raises (rather than returning None) on genuinely unparseable input,
+    so callers can tell "the model said something unusable" apart from
+    "the model correctly reported nothing to extract"."""
+    clean = re.sub(r"```json|```", "", text or "").strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        start, end = clean.find("{"), clean.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(clean[start:end + 1])
+
+
 def _cmd_calendar_add(prompt, p_lower):
     global _pending_calendar_add
 
@@ -1660,7 +1685,6 @@ def _cmd_calendar_add(prompt, p_lower):
         _log(prompt, response, "calendar")
         return jsonify({"response": response, "mode": "calendar"})
 
-    import re as rex
     # Same reasoning as _cmd_email_compose_send: a pending reply only
     # makes sense folded in with the original ask -- "3pm tomorrow"
     # is nothing on its own without "schedule a meeting with Jane".
@@ -1691,20 +1715,29 @@ def _cmd_calendar_add(prompt, p_lower):
         f"Only if the text specifies no date at all, return empty strings "
         f"for start/end rather than guessing. JSON only."
     )
+    # Previously one bare `except Exception` around parse + create, so a
+    # malformed model reply, a genuine "no date in the request", and
+    # Google rejecting the event all produced the identical "wasn't sure
+    # what to schedule" answer -- and nothing was logged, so the actual
+    # cause wasn't recoverable afterwards either. Same failure shape that
+    # made the SMTP outage take four passes to diagnose. Split up so each
+    # cause says what it is and leaves a log line behind.
     try:
-        clean = rex.sub(r"```json|```", "", result["response"]).strip()
-        data = json.loads(clean)
-        if not data.get("start") or not data.get("end"):
-            raise ValueError("no time given")
-        created = friday_calendar.create_event(
-            data.get("title", "Event"), data["start"], data["end"]
+        data = _json_from_model(result["response"])
+    except Exception as e:
+        logging.warning(
+            f"[calendar] couldn't parse event JSON ({e}); "
+            f"model said: {result.get('response', '')[:300]!r}"
         )
-        if created.get("ok"):
-            response = f"Added \"{data.get('title', 'Event')}\" to your calendar, boss."
-        else:
-            response = created.get("error", "Couldn't add that to your calendar, boss.")
-        _pending_calendar_add = {}
-    except Exception:
+        data = None
+
+    if data is None:
+        _pending_calendar_add = {} if is_pending_reply else {
+            "context": context, "expires": time.time() + CALENDAR_ADD_PENDING_WINDOW
+        }
+        response = "Couldn't read that one back, boss — say it again?"
+    elif not data.get("start") or not data.get("end"):
+        # The model followed instructions and reported no date present.
         if is_pending_reply:
             # One miss already used -- give up rather than re-arming
             # pending state and risking a later unrelated message
@@ -1716,6 +1749,27 @@ def _cmd_calendar_add(prompt, p_lower):
             # "with a time" was actively misleading once all-day events
             # became valid -- a date is now enough on its own.
             response = "Wasn't sure what to schedule there, boss — try again with a date?"
+    else:
+        title = data.get("title") or "Event"
+        try:
+            created = friday_calendar.create_event(title, data["start"], data["end"])
+        except Exception as e:
+            logging.warning(f"[calendar] create_event raised: {e!r}")
+            created = {"error": "Couldn't add that to your calendar, boss."}
+
+        if created.get("ok"):
+            response = f'Added "{title}" to your calendar, boss.'
+        else:
+            # A Google-side rejection is its own thing, not "I didn't
+            # understand you" -- saying the latter would send the boss
+            # off rewording a request that parsed perfectly well.
+            logging.warning(
+                f"[calendar] create_event failed for {title!r} "
+                f"({data['start']} -> {data['end']}): {created.get('error')}"
+            )
+            response = created.get("error", "Couldn't add that to your calendar, boss.")
+        _pending_calendar_add = {}
+
     _log(prompt, response, "calendar")
     return jsonify({"response": response, "mode": "calendar"})
 
