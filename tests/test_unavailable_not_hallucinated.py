@@ -70,9 +70,13 @@ class TestSelfRepair:
         stubbed.think.assert_not_called()
 
     def test_a_working_self_repair_is_untouched(self, app, stubbed, monkeypatch):
+        """A finished run still reports its result -- the unavailable
+        guard must not swallow the working path."""
         monkeypatch.setattr(server, "SELF_REPAIR_OK", True)
         sr = mock.Mock()
-        sr.attempt_repair.return_value = {"status": "nothing_to_repair"}
+        sr.run_state.return_value = {
+            "running": False, "result": {"status": "nothing_to_repair"},
+        }
         monkeypatch.setattr(server, "self_repair", sr)
 
         with app.test_request_context():

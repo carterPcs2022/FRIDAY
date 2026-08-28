@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -169,10 +170,69 @@ def _make_sandbox() -> Path:
     return sandbox_dir
 
 
+# A repair run takes as long as the whole test suite -- twice, when a fix
+# reaches the sandbox stage. Gunicorn kills any worker still busy after
+# its timeout (30s by default), so calling attempt_repair() straight from
+# the request handler could never work on the deploy: confirmed live,
+# every attempt ended in "[CRITICAL] WORKER TIMEOUT ... Error handling
+# request POST /command", the worker was killed mid-run, and the HUD lost
+# the connection and fell back to offline mode.
+#
+# The run itself was fine. It just can't be something a web request waits
+# on, so it happens in a thread and the answer is collected afterwards.
+_run_lock = threading.Lock()
+_run_state: dict = {"running": False, "started_at": None, "result": None,
+                    "finished_at": None}
+
+
+def run_state() -> dict:
+    """Snapshot of the background run, for the caller to report."""
+    with _run_lock:
+        return dict(_run_state)
+
+
+def clear_run_state():
+    """Drop a finished result once it's been reported, so the next ask
+    starts a fresh run instead of replaying a stale answer. Deliberately
+    won't discard a run that's still in flight."""
+    with _run_lock:
+        if not _run_state["running"]:
+            _run_state.update(result=None, finished_at=None, started_at=None)
+
+
+def start_background_repair() -> dict:
+    """Kick off attempt_repair() off-request. Returns immediately with
+    {"started": bool} -- False when one is already in flight, since two
+    concurrent runs would fight over the same sandbox and staged fix."""
+    with _run_lock:
+        if _run_state["running"]:
+            return {"started": False, "already_running": True,
+                    "started_at": _run_state["started_at"]}
+        _run_state.update(running=True, started_at=datetime.now().isoformat(),
+                          result=None, finished_at=None)
+
+    def _work():
+        try:
+            result = attempt_repair()
+        except Exception as e:
+            result = {"status": "crashed", "reason": repr(e)}
+            _log({"type": "repair_crashed", "error": repr(e),
+                  "ts": datetime.now().isoformat()})
+        with _run_lock:
+            _run_state.update(running=False, result=result,
+                              finished_at=datetime.now().isoformat())
+
+    threading.Thread(target=_work, daemon=True, name="friday-self-repair").start()
+    return {"started": True}
+
+
 def attempt_repair() -> dict:
     """Full pipeline: diagnose -> localize -> propose a minimal patch ->
     prove it in an isolated sandbox -> stage a confirmation request. Never
-    touches the live file itself -- see confirm_repair()."""
+    touches the live file itself -- see confirm_repair().
+
+    Blocking and slow by nature (it runs the suite). Call it via
+    start_background_repair() from anything request-shaped."""
     diag = diagnose()
     if diag["passed"]:
         return {"status": "nothing_to_repair", "diagnose": diag}
