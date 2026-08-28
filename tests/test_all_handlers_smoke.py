@@ -204,6 +204,7 @@ def test_every_dispatch_handler_is_covered_or_explicitly_exempt():
                                    # persists it, so the next boot comes up LOCKED.
                                    # Covered by tests/test_security.py instead.
         "_cmd_mayday",             # emergency broadcast, has its own tests
+        "_cmd_safety_near_miss",   # covered by tests/test_safety_near_miss.py
         "_cmd_security_screen",    # runs the real screening pipeline
         "_cmd_learn_voice_mode",   # depends on enrolled voice state
         "_cmd_dark_mode",

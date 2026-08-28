@@ -22,6 +22,7 @@ def _post(client, prompt):
 # silent drift this test is meant to catch.
 DISPATCHER_FUNCTIONS = [
     "_cmd_lockdown_locked", "_cmd_lockdown_trigger", "_cmd_mayday",
+    "_cmd_safety_near_miss",
     "_cmd_safe_checkin", "_cmd_security_screen", "_cmd_learn_voice_mode",
     "_cmd_dark_mode", "_cmd_capabilities", "_cmd_weather", "_cmd_news", "_cmd_translate",
     "_cmd_code_review", "_cmd_remember_this", "_cmd_people_brief",
