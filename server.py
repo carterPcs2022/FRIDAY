@@ -783,6 +783,59 @@ _REMINDER_SHADOWED_TRIGGERS = [
     if any(r in t for r in REMINDER_TRIGGERS)
 ]
 
+# Trigger lists that name a real feature, mapped to how FRIDAY should
+# describe it. Only lists whose phrases are specific enough that matching
+# one is genuinely a request for that feature -- deliberately excludes
+# vague ones (CANCEL_TRIGGERS, SEND_TRIGGERS, CALL_TRIGGERS' bare
+# "call ") that turn up inside ordinary conversation, since claiming a
+# feature is unavailable when the boss was just talking is its own kind
+# of wrong answer.
+_FEATURE_TRIGGERS = {
+    "EMAIL_TRIGGERS": "reading your inbox",
+    "TRIAGE_TRIGGERS": "inbox triage",
+    "DRAFT_TRIGGERS": "drafting an email reply",
+    "COMPOSE_SEND_TRIGGERS": "sending email",
+    "CALENDAR_ADD_TRIGGERS": "adding a calendar event",
+    "MED_ADD_TRIGGERS": "medication tracking",
+    "MED_TAKEN_TRIGGERS": "medication tracking",
+    "MED_SKIP_TRIGGERS": "medication tracking",
+    "MED_SCHEDULE_TRIGGERS": "your medication schedule",
+    "TASK_ADD_TRIGGERS": "your task list",
+    "TASK_SHOW_TRIGGERS": "your task list",
+    "NOTE_TRIGGERS": "notes",
+    "GOAL_REPORT_TRIGGERS": "goals",
+    "GOAL_ADD_TRIGGERS": "goals",
+    "GOAL_PROGRESS_TRIGGERS": "goals",
+    "HABIT_LOG_TRIGGERS": "habit tracking",
+    "JOURNAL_TRIGGERS": "your journal",
+    "REMINDER_TRIGGERS": "reminders",
+    "SPOTIFY_PLAY_TRIGGERS": "Spotify",
+    "SPOTIFY_STOP_TRIGGERS": "Spotify",
+    "TRAVEL_TRIGGERS": "travel intel",
+    "FOCUS_TRIGGERS": "focus mode",
+    "CATCHUP_TRIGGERS": "catching you up",
+    "SMS_TRIGGERS": "sending a text",
+}
+
+
+def _matched_but_unavailable(p_lower: str) -> str | None:
+    """Name the feature a request was clearly asking for when no handler
+    claimed it -- see the call site for why silence here is dangerous.
+
+    Returns the longest-matching feature so a specific phrase wins over a
+    vague one ("put on my calendar" naming the calendar rather than
+    Spotify's "put on")."""
+    best, best_len = None, 0
+    for list_name, feature in _FEATURE_TRIGGERS.items():
+        phrases = globals().get(list_name)
+        if not isinstance(phrases, list):
+            continue
+        for phrase in phrases:
+            if phrase in p_lower and len(phrase) > best_len:
+                best, best_len = feature, len(phrase)
+    return best
+
+
 MED_TAKEN_TRIGGERS = [
     "i took my", "took my medicine", "just took my",
 ]
@@ -1493,6 +1546,35 @@ def _cmd_self_repair(prompt, p_lower):
         "confirm the repair", "confirm repair", "apply the repair",
         "apply the fix", "go ahead and repair yourself",
     ]
+    RUN_TRIGGERS = [
+        "self repair", "repair yourself", "diagnose yourself",
+        "fix yourself", "check yourself for bugs",
+    ]
+
+    # Confirmed live: "run a self repair" came back "Self repair
+    # initiated, boss. Calendar still not connected." -- an answer
+    # invented wholesale by the conversational model, with its badge on
+    # it, in 321ms (a real run shells out to pytest and takes seconds).
+    #
+    # The mechanism: SELF_REPAIR_OK was False on that deploy, so both
+    # branches below were skipped, this returned None, and the request
+    # fell through the rest of the chain to the plain model -- which has
+    # no idea whether self-repair exists and improvised something
+    # confident and wrong.
+    #
+    # Answering honestly here is the whole point. "I can't run that right
+    # now" is a useful answer; a fabricated "initiated" is worse than
+    # silence, because the boss believes a diagnostic ran when nothing
+    # did. Same failure as FRIDAY denying she could read Gmail, in the
+    # opposite direction.
+    if not SELF_REPAIR_OK and any(t in p_lower for t in CONFIRM_TRIGGERS + RUN_TRIGGERS):
+        response = ("Self-repair isn't loaded on this deploy, boss — I can't "
+                    "diagnose myself right now. Nothing else is necessarily wrong.")
+        logging.warning("[self_repair] asked to run but SELF_REPAIR_OK is False")
+        _log(prompt, response, "self_repair")
+        return jsonify({"response": response, "mode": "self_repair",
+                         "status": "unavailable"})
+
     if any(t in p_lower for t in CONFIRM_TRIGGERS) and SELF_REPAIR_OK:
         result = self_repair.confirm_repair()
         response = (f"Done, boss — {result['target']} is patched and live."
@@ -1502,10 +1584,6 @@ def _cmd_self_repair(prompt, p_lower):
         return jsonify({"response": response, "mode": "self_repair",
                          "has_audio": bool(audio_file), "audio_file": audio_file, **result})
 
-    RUN_TRIGGERS = [
-        "self repair", "repair yourself", "diagnose yourself",
-        "fix yourself", "check yourself for bugs",
-    ]
     if any(t in p_lower for t in RUN_TRIGGERS) and SELF_REPAIR_OK:
         result = self_repair.attempt_repair()
         status = result["status"]
@@ -2812,6 +2890,30 @@ def _handle_prompt(prompt, allow_split=True):
         result = _cmd_jarvis_proxy(prompt, p_lower)
         if result is not None:
             return result
+
+        # Nothing claimed it, but a real trigger phrase matched -- so a
+        # handler wanted this and declined, almost always because the
+        # service behind it is unavailable (25 handlers gate their
+        # trigger check on `and <service>`, and return None when it's
+        # missing).
+        #
+        # Falling through to the model here is what produced the worst
+        # answers of this whole branch: "I'm not able to access your
+        # Gmail account" while IMAP was working, and "Self repair
+        # initiated, boss" when self-repair hadn't loaded and nothing
+        # ran at all. The model has no idea what FRIDAY can do, so it
+        # invents in whichever direction sounds plausible.
+        #
+        # Saying "that isn't available right now" is a worse answer than
+        # doing the thing, and a far better one than pretending to.
+        unavailable = _matched_but_unavailable(p_lower)
+        if unavailable:
+            response = (f"I'd normally handle that ({unavailable}), boss, but that "
+                        f"system isn't available right now — so I haven't done anything.")
+            logging.warning(f"[dispatch] {unavailable} matched but its handler declined")
+            _log(prompt, response, "unavailable")
+            return jsonify({"response": response, "mode": "unavailable",
+                             "feature": unavailable})
 
         # FRIDAY handles it herself
         if friday_brain:
