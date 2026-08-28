@@ -247,3 +247,57 @@ class TestCorsCheckRoute:
         everything else, not exempt."""
         import core.access_auth as access_auth
         assert not access_auth.is_exempt("/cors-check")
+
+
+class TestCorsCheckIsReadableInABrowser:
+    """This route exists to be read off a phone screen mid-debug, so the
+    browser path is the one that actually matters.
+
+    Served as JSON it arrived in Safari as a "cors-check.json (29 bytes)
+    — Save..." download prompt, which is not something you can copy an
+    origin out of.
+    """
+
+    def _html(self, client, path="/cors-check"):
+        return client.get(path, headers={"Accept": "text/html"})
+
+    def test_navigation_gets_html_not_a_download(self, client):
+        res = self._html(client)
+        assert res.mimetype == "text/html"
+
+    def test_scripted_client_still_gets_json(self, client):
+        """fetch() and URLSession default to Accept: */*. Anything
+        parsing this must keep getting JSON."""
+        res = client.get("/cors-check", headers={"Accept": "*/*"})
+        assert res.mimetype == "application/json"
+        assert "allowed_origins" in res.get_json()
+
+    def test_blocked_origin_appears_in_the_page(self, client, cors_allowing):
+        cors_allowing("https://allowed.example")
+        client.post("/friday/ask", headers={"Origin": "https://stranger.example"},
+                    json={"message": "hi"})
+
+        assert "https://stranger.example" in self._html(client).get_data(as_text=True)
+
+    def test_origins_are_escaped(self, client, cors_allowing):
+        """The origin is attacker-controlled -- it's whatever arrived in
+        a header -- and it gets echoed straight back onto a page the boss
+        opens while signed in."""
+        cors_allowing("https://allowed.example")
+        import core.cors as cors
+        cors._record_blocked('"><script>alert(1)</script>')
+
+        page = self._html(client).get_data(as_text=True)
+        assert "<script>alert(1)</script>" not in page
+        assert "&lt;script&gt;" in page
+
+    def test_empty_record_says_which_kind_of_empty(self, client):
+        """"Nothing blocked since the last restart" and "nothing ever
+        blocked" lead to different next steps, and the page is useless if
+        it can't tell them apart."""
+        page = self._html(client).get_data(as_text=True)
+        assert "since the last restart" in page
+
+    def test_unconfigured_allow_list_is_stated_plainly(self, client):
+        page = self._html(client).get_data(as_text=True)
+        assert "FRIDAY_CORS_ORIGINS" in page
