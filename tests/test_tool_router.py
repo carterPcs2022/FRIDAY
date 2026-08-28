@@ -249,12 +249,55 @@ class TestRephrasing:
         assert tool_router.rephrase("teleport", "") is None
 
 
+@pytest.fixture
+def chain_falls_through(all_services, monkeypatch):
+    """Every handler declines, so a prompt really does reach the router.
+
+    all_services alone is not enough, and CI proved it: with bare Mocks
+    the two always-on handlers claim everything, because a Mock's return
+    value is truthy. suit_lockdown.is_locked() reads as locked, and
+    friday_security.screen_request()["blocked"] reads as blocked. Both
+    return before the chain ever gets near the router.
+
+    These two tests passed locally and failed in CI for exactly this
+    reason -- which handler swallowed the prompt depended on which
+    optional packages happened to import, so the result was environment
+    luck rather than a property of the code."""
+    server.suit_lockdown.is_locked.return_value = False
+    server.friday_security.screen_request.return_value = {"blocked": False}
+    server.friday_security.client_ip.return_value = "127.0.0.1"
+
+
+def _unclaimed_prompt():
+    """A phrase no handler's trigger or inline condition matches. Asserted
+    rather than assumed -- see test_the_probe_prompt_is_really_unclaimed."""
+    return "mm hrm okay then"
+
+
 class TestWiredIntoDispatch:
     """Tested against _handle_prompt rather than in isolation, because the
     piece that actually matters is that the gap it fills is the real one
     -- after every handler declined, before the model improvises."""
 
-    def test_routing_reruns_dispatch_with_the_rephrasing(self, app, routing_on, monkeypatch):
+    def test_the_probe_prompt_is_really_unclaimed(self, app, chain_falls_through):
+        """The tests below only mean something if their prompt genuinely
+        reaches the router. If some handler starts claiming it, they would
+        silently stop testing the wiring."""
+        with app.test_request_context():
+            for handler in _dispatch_order():
+                fn = getattr(server, handler, None)
+                if fn is None:
+                    continue
+                phrase = _unclaimed_prompt()
+                args = (phrase,) if handler in _ONE_ARG else (phrase, phrase.lower())
+                try:
+                    claimed = fn(*args) is not None
+                except Exception:
+                    claimed = True
+                assert not claimed, f"{handler} claims the probe prompt"
+
+    def test_routing_reruns_dispatch_with_the_rephrasing(
+            self, app, routing_on, chain_falls_through, monkeypatch):
         seen = []
         real = server._handle_prompt
 
@@ -268,11 +311,12 @@ class TestWiredIntoDispatch:
                             lambda *_: {"tool": "weather", "detail": ""})
 
         with app.test_request_context():
-            server._handle_prompt("is it gonna pour on me later")
+            server._handle_prompt(_unclaimed_prompt())
 
         assert "what's the weather" in seen
 
-    def test_the_rephrasing_cannot_route_again(self, app, routing_on, monkeypatch):
+    def test_the_rephrasing_cannot_route_again(
+            self, app, routing_on, chain_falls_through, monkeypatch):
         """A rephrasing the chain still doesn't claim would otherwise come
         back here and be rephrased forever."""
         calls = []
@@ -281,17 +325,18 @@ class TestWiredIntoDispatch:
                             lambda *a: (calls.append(1), {"tool": "note", "detail": "x"})[1])
 
         with app.test_request_context():
-            server._handle_prompt("something nothing claims")
+            server._handle_prompt(_unclaimed_prompt())
 
         assert len(calls) == 1
 
-    def test_off_by_default_leaves_dispatch_untouched(self, app, monkeypatch):
+    def test_off_by_default_leaves_dispatch_untouched(
+            self, app, chain_falls_through, monkeypatch):
         called = []
         monkeypatch.setattr(tool_router, "select",
                             lambda *a: called.append(1))
         monkeypatch.setattr(server, "friday_brain", _brain_picking("weather"))
 
         with app.test_request_context():
-            server._handle_prompt("something nothing claims")
+            server._handle_prompt(_unclaimed_prompt())
 
         assert not called
