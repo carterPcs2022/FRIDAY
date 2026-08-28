@@ -1099,6 +1099,49 @@ def _cmd_lockdown_trigger(prompt):
         return jsonify({"response": response, "mode": "lockdown_activate"})
 
 
+# Safety commands that only *nearly* match. Confirmed live: "lockdown"
+# on its own matches none of LOCKDOWN_TRIGGERS ("lockdown now",
+# "emergency lockdown", ...), so it fell through the whole chain to the
+# conversational model, which answered "Boss, lockdown initiated." --
+# with its badge on it, and nothing locked.
+#
+# That is the most dangerous shape of the improvisation problem this
+# branch has been chasing. A fabricated "diagnostics ran" wastes time; a
+# fabricated "you are locked down" means believing the system is secured
+# during exactly the situation where it isn't.
+#
+# Deliberately does NOT activate on a near miss. Lockdown is one-way
+# without ENDGAME_PASSPHRASE or a redeploy with RESET_LOCKDOWN, and
+# "lockdown" turns up in ordinary talk about lockdown. Guessing wrong in
+# the activating direction is worse than asking for the exact words. So
+# this fails closed and loudly: nothing happens, and it says so.
+_SAFETY_NEAR_MISS = {
+    "lockdown": (
+        "lockdown", "lock down", "lock it down", "lock the suit",
+        "secure the system", "seal it up",
+    ),
+    "mayday": ("mayday", "distress call", "emergency broadcast"),
+}
+
+
+def _cmd_safety_near_miss(prompt, p_lower):
+    """Runs after the real safety handlers, so an exact trigger has
+    already been claimed and returned before this sees anything."""
+    for kind, phrases in _SAFETY_NEAR_MISS.items():
+        if not any(ph in p_lower for ph in phrases):
+            continue
+        if kind == "lockdown":
+            response = ("I have not locked anything down, boss — that wasn't the "
+                        "phrase. Say \"lockdown now\" and I'll do it.")
+        else:
+            response = (f"I have not sent a mayday, boss — that wasn't the phrase. "
+                        f"Say \"{MAYDAY_PHRASE}\" and I will.")
+        logging.warning(f"[safety] near-miss on {kind}: {prompt[:120]!r} — took no action")
+        _log(prompt, response, "safety_near_miss")
+        return jsonify({"response": response, "mode": "safety_near_miss",
+                         "acted": False, "kind": kind})
+
+
 def _cmd_mayday(prompt):
     if MAYDAY_PHRASE in prompt.lower():
         response = "Mayday received. What's happening, boss?"
@@ -2639,6 +2682,12 @@ def _handle_prompt(prompt, allow_split=True):
 
         # ── Mayday — no LLM call, responds immediately ────────────────────────
         result = _cmd_mayday(prompt)
+        if result is not None:
+            return result
+
+        # After the real safety handlers above -- an exact trigger has
+        # already returned by here, so this only sees near misses.
+        result = _cmd_safety_near_miss(prompt, prompt.lower())
         if result is not None:
             return result
 
