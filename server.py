@@ -203,6 +203,100 @@ def _render_cors_check_page(payload: dict) -> str:
 </body></html>"""
 
 
+def _render_converse_page(snap: dict) -> str:
+    """Watch page for /converse. Auto-refreshes while a run is in flight
+    -- polling from script would need the token in JS, and this page is
+    reached by an authenticated navigation, so a meta refresh rides the
+    session cookie instead."""
+    def esc(v):
+        return (str(v).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+    turns = []
+    for m in snap["transcript"]:
+        if m["speaker"] == "system":
+            turns.append(f'<div class="sys">{esc(m["text"])}</div>')
+            continue
+        who = "FRIDAY" if m["speaker"] == "friday" else "PARTNER"
+        # The model is named on every partner line rather than once at the
+        # top: the fallback can kick in mid-conversation when the Anthropic
+        # balance runs out, and "FRIDAY talked to Claude" would then be a
+        # false claim about some of these lines.
+        model = f'<span class="model">{esc(m.get("model") or "")}</span>' if m.get("model") else ""
+        turns.append(
+            f'<div class="turn {esc(m["speaker"])}">'
+            f'<div class="who">{who}{model}</div>'
+            f'<div class="text">{esc(m["text"])}</div></div>'
+        )
+
+    if snap["error"]:
+        turns.append(f'<div class="err">{esc(snap["error"])}</div>')
+    if not snap["transcript"] and not snap["error"]:
+        turns.append('<div class="sys">Nothing yet. POST to /converse to start one.</div>')
+
+    running = snap["running"]
+    refresh = '<meta http-equiv="refresh" content="4">' if running else ""
+    status = "talking…" if running else "idle"
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">{refresh}
+<title>F.R.I.D.A.Y — Conversation</title>
+<style>
+  body {{ background:#000814; color:#caf0f8; margin:0; padding:24px 20px 60px;
+    font-family:-apple-system,'SF Pro Display','Helvetica Neue',sans-serif;
+    line-height:1.55; }}
+  h1 {{ font-size:13px; letter-spacing:5px; color:#48cae4; margin:0 0 4px; }}
+  .status {{ font-size:12px; color:#5a8296; margin-bottom:24px; }}
+  .turn {{ border-radius:12px; padding:12px 14px; margin-bottom:10px;
+    border:1px solid rgba(72,202,228,0.16); }}
+  .turn.friday {{ background:rgba(0,150,199,0.10); }}
+  .turn.partner {{ background:rgba(120,120,160,0.10);
+    border-color:rgba(160,160,200,0.18); }}
+  .who {{ font-size:10px; letter-spacing:2px; color:#48cae4; margin-bottom:6px;
+    display:flex; justify-content:space-between; gap:10px; }}
+  .turn.partner .who {{ color:#a9a9d0; }}
+  .model {{ color:#5a8296; letter-spacing:0; font-weight:400; }}
+  .text {{ font-size:15px; white-space:pre-wrap; }}
+  .sys {{ font-size:12px; color:#5a8296; margin-bottom:14px; }}
+  .err {{ font-size:13px; color:#e63946; border:1px solid rgba(230,57,70,0.3);
+    border-radius:10px; padding:12px 14px; margin-top:10px; }}
+</style></head>
+<body>
+<h1>F.R.I.D.A.Y</h1>
+<div class="status">{status}</div>
+{"".join(turns)}
+</body></html>"""
+
+
+@app.route("/converse", methods=["GET", "POST"])
+def converse():
+    """FRIDAY and another model talking to each other, unattended.
+
+    POST starts one (topic, turns); GET polls it. Split that way because
+    gunicorn kills a worker at 30s and even a short exchange is a dozen
+    model calls -- core/converse.py runs it on a thread, same as
+    self_repair runs the suite.
+
+    Nothing here can act: converse.py answers through the brain's
+    conversational path, never the dispatch chain, so a remote model's
+    output can't match a trigger and lock the suit or send a draft.
+    """
+    from core import converse as _converse
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        return jsonify(_converse.start(
+            topic=(data.get("topic", "") or "").strip(),
+            turns=data.get("turns", _converse.DEFAULT_TURNS),
+        ))
+
+    snap = _converse.state()
+    if "text/html" in request.headers.get("Accept", ""):
+        return Response(_render_converse_page(snap), mimetype="text/html")
+    return jsonify(snap)
+
+
 @app.route("/cors-check")
 def cors_check():
     """Reads back what cross-origin access is currently configured, and
