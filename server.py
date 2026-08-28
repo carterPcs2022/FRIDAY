@@ -1585,7 +1585,34 @@ def _cmd_self_repair(prompt, p_lower):
                          "has_audio": bool(audio_file), "audio_file": audio_file, **result})
 
     if any(t in p_lower for t in RUN_TRIGGERS) and SELF_REPAIR_OK:
-        result = self_repair.attempt_repair()
+        # A repair run takes as long as the test suite, and gunicorn kills
+        # any worker still busy after its timeout -- confirmed live, every
+        # attempt died as "[CRITICAL] WORKER TIMEOUT ... Error handling
+        # request POST /command" with the worker killed mid-run, which is
+        # why the HUD kept dropping to offline mode instead of getting an
+        # answer. So this starts the run and returns; the result is
+        # collected by asking again.
+        state = self_repair.run_state()
+
+        if state["running"]:
+            response = ("Still running diagnostics, boss — ask me again in a "
+                        "minute and I'll have the answer.")
+            _log(prompt, response, "self_repair")
+            return jsonify({"response": response, "mode": "self_repair",
+                             "status": "running"})
+
+        # A finished run that hasn't been reported yet is the answer to
+        # this question -- reporting it here is what makes "ask again"
+        # work as the way to collect it.
+        result = state.get("result")
+        if result is None:
+            started = self_repair.start_background_repair()
+            response = ("Running full diagnostics now, boss — that's the whole "
+                        "test suite, so give me a minute, then ask again.")
+            _log(prompt, response, "self_repair")
+            return jsonify({"response": response, "mode": "self_repair",
+                             "status": "started", **started})
+
         status = result["status"]
         RESPONSES = {
             "nothing_to_repair": "Ran full diagnostics — every test passes, nothing to repair, boss.",
@@ -1612,6 +1639,12 @@ def _cmd_self_repair(prompt, p_lower):
                                       f"fix\" and I'll make it live.",
         }
         response = RESPONSES.get(status, f"Self-repair status: {status}")
+        # Reported -- drop it so the next ask runs fresh diagnostics
+        # rather than replaying this answer. The one exception is a fix
+        # waiting on "apply the fix": clearing that would strand the
+        # staged patch with no way to refer to it.
+        if status != "awaiting_confirmation":
+            self_repair.clear_run_state()
         _log(prompt, response, "self_repair")
         audio_file = friday_speak(response) if VOICE_OK else None
         return jsonify({"response": response, "mode": "self_repair",

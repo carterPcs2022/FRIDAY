@@ -115,19 +115,53 @@ class TestExtractedTriggerBlocks:
             result = server._cmd_diagnostics("how are you", "how are you")
         assert result is None
 
-    def test_self_repair_run_trigger_reports_nothing_to_repair(self, app):
+    def test_self_repair_run_trigger_starts_a_background_run(self, app):
+        """A run takes as long as the test suite, and gunicorn kills the
+        worker long before that -- confirmed live as "[CRITICAL] WORKER
+        TIMEOUT ... Error handling request POST /command". So the first
+        ask starts it and returns immediately rather than blocking."""
         with app.test_request_context(), \
              mock.patch("server.SELF_REPAIR_OK", True), \
              mock.patch("server.self_repair") as sr, \
              mock.patch("server.VOICE_OK", False):
-            sr.attempt_repair.return_value = {"status": "nothing_to_repair"}
+            sr.run_state.return_value = {"running": False, "result": None}
+            sr.start_background_repair.return_value = {"started": True}
             result = server._cmd_self_repair("run a self repair", "run a self repair")
-            assert result is not None
             body = result.get_json()
+
             assert body["mode"] == "self_repair"
+            assert body["status"] == "started"
+            assert "ask again" in body["response"].lower()
+            sr.start_background_repair.assert_called_once()
+            # The blocking call must not happen on the request thread.
+            sr.attempt_repair.assert_not_called()
+
+    def test_self_repair_reports_the_finished_result_on_the_next_ask(self, app):
+        with app.test_request_context(), \
+             mock.patch("server.SELF_REPAIR_OK", True), \
+             mock.patch("server.self_repair") as sr, \
+             mock.patch("server.VOICE_OK", False):
+            sr.run_state.return_value = {
+                "running": False, "result": {"status": "nothing_to_repair"},
+            }
+            body = server._cmd_self_repair("run a self repair", "run a self repair").get_json()
+
             assert "nothing to repair" in body["response"].lower()
-        sr.attempt_repair.assert_called_once()
-        sr.confirm_repair.assert_not_called()
+            # Reported once, then cleared so the next ask runs fresh.
+            sr.clear_run_state.assert_called_once()
+            sr.start_background_repair.assert_not_called()
+
+    def test_self_repair_says_it_is_still_running(self, app):
+        with app.test_request_context(), \
+             mock.patch("server.SELF_REPAIR_OK", True), \
+             mock.patch("server.self_repair") as sr, \
+             mock.patch("server.VOICE_OK", False):
+            sr.run_state.return_value = {"running": True, "result": None}
+            body = server._cmd_self_repair("run a self repair", "run a self repair").get_json()
+
+            assert body["status"] == "running"
+            # Must not start a second run alongside the first.
+            sr.start_background_repair.assert_not_called()
 
     def test_self_repair_confirm_trigger_applies_staged_fix(self, app):
         with app.test_request_context(), \
