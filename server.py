@@ -533,6 +533,18 @@ EMAIL_TRIGGERS = [
     "check my email", "what emails",
     "inbox", "any emails", "email summary",
     "unread emails", "check mail",
+    # "gmail" appeared in no trigger list at all, and neither did "read
+    # my ...", so "Can you read my Gmail" fell through every dispatcher
+    # to the plain conversational model -- which answered "I'm not able
+    # to access your Gmail account" (confirmed live). That's the #16
+    # failure inverted: not a fabricated claim that something happened,
+    # but a fabricated claim that a working capability doesn't exist.
+    # The model has no idea what FRIDAY can actually do, so anything
+    # that misses a trigger risks it confidently denying a real feature.
+    # Safe to add here: _cmd_email_summary dispatches after compose/send,
+    # so "send an email to my gmail" still reaches the sender first.
+    "read my gmail", "check my gmail", "my gmail", "read my email",
+    "read my mail", "read my inbox",
 ]
 
 CATCHUP_TRIGGERS = [
@@ -757,6 +769,20 @@ MED_ADD_TRIGGERS = [
     "add medicine", "track my medicine", "remind me to take",
     "i take", "add my medication", "track medication",
 ]
+# Same shadowing shape as _SPOTIFY_SHADOWED_TRIGGERS above, found by
+# checking every trigger list against every other in dispatch order:
+# REMINDER_TRIGGERS' "remind me" is a substring of MED_ADD_TRIGGERS'
+# "remind me to take", and _cmd_reminder dispatches well before
+# _cmd_med_add -- so "remind me to take my blood pressure pill at 8am",
+# the most natural way to ask, became a generic reminder and the
+# medication was never actually tracked. The reminder still fired, which
+# is why this could sit unnoticed: the visible half worked and only the
+# adherence record silently didn't happen.
+_REMINDER_SHADOWED_TRIGGERS = [
+    t for t in MED_ADD_TRIGGERS
+    if any(r in t for r in REMINDER_TRIGGERS)
+]
+
 MED_TAKEN_TRIGGERS = [
     "i took my", "took my medicine", "just took my",
 ]
@@ -1485,6 +1511,14 @@ def _cmd_self_repair(prompt, p_lower):
         status = result["status"]
         RESPONSES = {
             "nothing_to_repair": "Ran full diagnostics — every test passes, nothing to repair, boss.",
+            # Distinct from cannot_localize on purpose: "I couldn't run
+            # my tests" and "a test failed in a place I don't watch" are
+            # completely different problems, and reporting the second
+            # when it's really the first sends the boss hunting a bug
+            # that doesn't exist.
+            "cannot_run_tests": "Couldn't run my own test suite here, boss — pytest isn't "
+                                 "installed in this deploy, so I can't diagnose myself. "
+                                 "Nothing's necessarily wrong.",
             "cannot_localize": "Found a failing test but couldn't trace it back to one of my "
                                 "watched files — needs a human look.",
             "propose_failed": f"Found the failure in {result.get('target')} but couldn't "
@@ -2120,6 +2154,11 @@ def _cmd_file_recall(prompt, p_lower):
 
 
 def _cmd_reminder(prompt, p_lower):
+    # Defer to medication tracking when the ask is specifically about
+    # taking a medicine -- see _REMINDER_SHADOWED_TRIGGERS.
+    if any(t in p_lower for t in _REMINDER_SHADOWED_TRIGGERS):
+        return None
+
     if any(t in p_lower for t in REMINDER_TRIGGERS) and friday_brain:
         import re as rex
         result = friday_brain.think(
