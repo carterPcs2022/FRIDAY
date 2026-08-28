@@ -124,6 +124,7 @@ def login():
 import os
 import re
 import json
+from core.action_claims import claims_action
 import datetime
 import logging
 import threading
@@ -3068,6 +3069,28 @@ def _handle_prompt(prompt, allow_split=True):
                         response = prefix + response
 
                 clean = safe(response)
+
+                # This path performed no action -- it has no tools,
+                # touched no service and wrote nothing. That's structural,
+                # so a reply claiming something happened is false by
+                # construction, and the code already knows it.
+                #
+                # Every hallucination found on this branch was this shape:
+                # "Sending an email..." with nothing sent, "Self repair
+                # initiated, boss." with nothing run, "Boss, lockdown
+                # initiated." with nothing locked. Each was patched where
+                # it surfaced; this catches the class, including the ones
+                # nobody has hit yet.
+                claim = claims_action(clean)
+                if claim:
+                    logging.warning(
+                        f"[claim] conversational reply asserted an action it "
+                        f"didn't take ({claim!r}) -- replaced. prompt={prompt[:120]!r}"
+                    )
+                    clean = ("I didn't actually do anything there, boss — I don't have "
+                             "a way to handle that one yet. Tell me another way and "
+                             "I'll have a proper go at it.")
+
                 save_turn(prompt, clean)
                 _log(prompt, clean, "friday-coverage" if COVERAGE_MODE else "friday")
 
