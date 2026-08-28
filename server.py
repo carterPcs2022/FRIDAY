@@ -377,6 +377,7 @@ import os
 import re
 import json
 from core.action_claims import claims_action
+from core import tool_router
 import datetime
 import logging
 import threading
@@ -2908,7 +2909,7 @@ def command():
     return _handle_prompt(prompt)
 
 
-def _handle_prompt(prompt, allow_split=True):
+def _handle_prompt(prompt, allow_split=True, allow_route=True):
     """The whole dispatch chain for one request.
 
     Split out of command() so a message carrying several requests can run
@@ -2916,6 +2917,11 @@ def _handle_prompt(prompt, allow_split=True):
     on those re-entries, so a segment can't be split again -- and so the
     safety gates below, which are about the message as a whole, run once
     against the original text rather than per fragment.
+
+    allow_route=False likewise stops the tool router (see its call site
+    near the bottom) from re-entering: a rephrasing that still doesn't
+    match any handler would otherwise arrive back at the router and be
+    rephrased again, without end.
     """
     try:
         # ── Suit Lockdown — checked before EVERYTHING else, including Mayday.
@@ -3249,6 +3255,30 @@ def _handle_prompt(prompt, allow_split=True):
             _log(prompt, response, "unavailable")
             return jsonify({"response": response, "mode": "unavailable",
                              "feature": unavailable})
+
+        # ── Level 3: route before improvising ─────────────────────────
+        # Everything above matched on substrings, so it only fires on
+        # phrasings someone thought to list. Ask in words nobody
+        # anticipated and every handler declines -- and the model below
+        # has no tools and no idea what she can do, so it invents.
+        #
+        # This asks which capability the request wanted, rewrites it into
+        # that capability's own trigger phrase, and sends it back through
+        # this same function. Not a second invocation path: dispatch
+        # stays the one way in, with its safety ordering intact.
+        #
+        # allow_route=False on the re-entry. Without it a rephrasing the
+        # chain still doesn't claim comes straight back here and asks
+        # again, forever.
+        if allow_route and tool_router.ENABLED:
+            choice = tool_router.select(prompt, friday_brain)
+            if choice:
+                rephrased = tool_router.rephrase(choice["tool"], choice["detail"])
+                if rephrased and rephrased.lower() != p_lower:
+                    logging.info("[route] %r -> %s -> %r",
+                                 prompt[:80], choice["tool"], rephrased[:80])
+                    return _handle_prompt(rephrased, allow_split=False,
+                                          allow_route=False)
 
         # FRIDAY handles it herself
         if friday_brain:
