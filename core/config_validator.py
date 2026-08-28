@@ -4,6 +4,7 @@ Mac Bridge URL still pointing at localhost, a token set with no matching
 URL) otherwise just fails silently downstream in whatever service tries
 to use it, hours later, far from the actual cause.
 """
+import logging
 import os
 
 # Keys worth checking for "did the boss forget to replace the placeholder"
@@ -36,9 +37,9 @@ _URL_KEYS = [
     "GOOGLE_GMAIL_REDIRECT_URI", "HA_URL", "PUSHCUT_MOM_WEBHOOK_URL",
 ]
 
-# (url_key, token_key) pairs — one configured without the other is
-# always a mistake, since either FRIDAY has no bridge to call or it has
-# a bridge it can't authenticate to.
+# (url_key, token_key) pairs. Which half is missing changes how bad it
+# is -- see the asymmetry in check(): a URL with no token is broken, a
+# token with no URL is just an integration that's off.
 _PAIRED_KEYS = [
     ("MAC_BRIDGE_URL", "MAC_BRIDGE_TOKEN"),
     ("PUSHOVER_USER_KEY", "PUSHOVER_APP_TOKEN"),
@@ -69,9 +70,14 @@ def _is_localhost_in_prod(value: str) -> bool:
 
 
 def check() -> dict:
-    """Returns {"ok": bool, "issues": [str, ...]}. Never raises — a broken
-    validator must not be the thing that takes the boot down."""
+    """Returns {"ok": bool, "issues": [...], "notes": [...]}. Never raises
+    — a broken validator must not be the thing that takes the boot down.
+
+    issues are things that will actually misbehave and are worth an alert.
+    notes are worth seeing but not worth waking anyone for; `ok` and the
+    alert in check_and_alert() key off issues only."""
     issues = []
+    notes = []
 
     try:
         seen_values = {}
@@ -97,12 +103,35 @@ def check() -> dict:
             elif _is_localhost_in_prod(value):
                 issues.append(f"{key} points at localhost while running in production (RENDER is set)")
 
+        # The two halves of a pair are not equally broken, and treating
+        # them the same made FRIDAY email a HIGH-priority "Config Check
+        # Failed" every boot over a leftover MAC_BRIDGE_TOKEN -- now every
+        # 30 minutes, since she stopped being spun down between requests.
+        #
+        #   URL without token  -> she will call it and fail to
+        #                         authenticate. Genuinely broken.
+        #   token without URL  -> there is nothing to call. The
+        #                         integration is simply off, which is
+        #                         indistinguishable from never having
+        #                         configured it.
+        #
+        # The second is a stray credential worth knowing about, not a
+        # failure worth waking the boss for. It stays visible as a note;
+        # it just stops being an alert. An alert nobody can act on is one
+        # they learn to ignore, which costs more than it's worth the day
+        # a real one arrives.
         for url_key, token_key in _PAIRED_KEYS:
             has_url = bool(os.environ.get(url_key, ""))
             has_token = bool(os.environ.get(token_key, ""))
-            if has_url != has_token:
-                present, missing = (url_key, token_key) if has_url else (token_key, url_key)
-                issues.append(f"{present} is set but {missing} isn't — that pair only works together")
+            if has_url and not has_token:
+                issues.append(
+                    f"{url_key} is set but {token_key} isn't — that pair only works together"
+                )
+            elif has_token and not has_url:
+                notes.append(
+                    f"{token_key} is set but {url_key} isn't — that integration is "
+                    f"off, nothing will use the credential"
+                )
 
         # Unlike every other key above, FRIDAY_ACCESS_TOKEN being unset
         # isn't "that integration is disabled" — it means /command and
@@ -117,13 +146,18 @@ def check() -> dict:
     except Exception as e:
         issues.append(f"config validator itself failed: {e}")
 
-    return {"ok": not issues, "issues": issues}
+    return {"ok": not issues, "issues": issues, "notes": notes}
 
 
 def check_and_alert():
     """Called once at startup. Only alerts on failure — a clean config
     check is not something worth waking anyone up for."""
     result = check()
+    # Notes are logged, never alerted -- they describe config that is off
+    # rather than broken, and an alert nobody can act on is one they learn
+    # to ignore.
+    for note in result.get("notes", []):
+        logging.info("[config] %s", note)
     if result["ok"]:
         return result
     try:
