@@ -9,7 +9,7 @@ would error at collection if it weren't) — the rest pins the actual
 shape so a future change that drops or duplicates a route fails loudly
 here instead of showing up as a 404 in production.
 """
-KNOWN_ROUTE_COUNT = 171  # 167 (see above) + /friday/policy/evaluate (V3 Phase 5) + /cors-check
+KNOWN_ROUTE_COUNT = 172  # 167 (see above) + /friday/policy/evaluate (V3 Phase 5) + /cors-check + /converse
                          # + /friday/gmail/auth and /friday/gmail/callback (the
                          # OAuth2 flow sending moved onto when raw SMTP turned
                          # out to be blocked outbound -- see friday_gmail.py).
