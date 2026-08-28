@@ -29,9 +29,23 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=0, x_port=0, x_
 BOOT_TIME = time.time()
 
 
+def _self_origin() -> str:
+    """FRIDAY's own origin as the browser sees it, for telling
+    same-origin traffic apart from cross-origin.
+
+    ProxyFix(x_proto=1) above already rewrites request.scheme from
+    X-Forwarded-Proto, so this reads https on Render rather than the
+    http the proxy actually speaks to gunicorn -- which would never
+    match the Origin the browser sent. request.host carries the port
+    only when it's non-default, and browsers leave default ports out of
+    Origin too, so the two agree."""
+    return f"{request.scheme}://{request.host}"
+
+
 @app.after_request
 def _apply_cors(response):
-    return _cors.apply(response, request.headers.get("Origin", ""))
+    return _cors.apply(response, request.headers.get("Origin", ""),
+                       self_origin=_self_origin())
 
 
 @app.route("/health")
@@ -87,7 +101,8 @@ def _check_access():
     # headers only, with no body.
     if request.method == "OPTIONS":
         return _cors.apply(app.make_default_options_response(),
-                           request.headers.get("Origin", ""))
+                           request.headers.get("Origin", ""),
+                           self_origin=_self_origin())
 
     if not access_auth.is_configured():
         return  # not set up yet — config_validator flags this; don't lock the boss out before he's configured it

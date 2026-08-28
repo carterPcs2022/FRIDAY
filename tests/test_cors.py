@@ -301,3 +301,74 @@ class TestCorsCheckIsReadableInABrowser:
     def test_unconfigured_allow_list_is_stated_plainly(self, client):
         page = self._html(client).get_data(as_text=True)
         assert "FRIDAY_CORS_ORIGINS" in page
+
+
+class TestSameOriginIsNotARejection:
+    """Browsers attach Origin to same-origin POSTs, not just cross-origin
+    ones, so the HUD posting to /command arrives carrying FRIDAY's own
+    origin.
+
+    Treated as a rejection that warned on every single HUD command, and
+    -- worse -- filled the /cors-check record with the boss's own origin,
+    crowding out the one value the whole route exists to surface. It was
+    the first thing that showed up there in production.
+
+    Same-origin requests aren't subject to CORS at all: the browser never
+    looks at the response headers. So this is neither an allowance nor a
+    rejection, and the right behaviour is to do nothing.
+    """
+
+    def test_same_origin_is_not_recorded_as_blocked(self, cors_allowing):
+        cors = cors_allowing("https://allowed.example")
+        from flask import Response
+        cors.apply(Response(), "https://friday.example",
+                   self_origin="https://friday.example")
+
+        assert cors.blocked_origins() == []
+
+    def test_same_origin_is_not_logged(self, cors_allowing, caplog):
+        cors = cors_allowing("https://allowed.example")
+        from flask import Response
+        with caplog.at_level("WARNING"):
+            cors.apply(Response(), "https://friday.example",
+                       self_origin="https://friday.example")
+
+        assert "blocked origin" not in caplog.text
+
+    def test_same_origin_gets_no_cors_headers(self, cors_allowing):
+        """It doesn't need them, and sending Allow-Origin for the server's
+        own origin would be a quiet way of allow-listing something the
+        boss never put in FRIDAY_CORS_ORIGINS."""
+        cors = cors_allowing("https://allowed.example")
+        from flask import Response
+        resp = cors.apply(Response(), "https://friday.example",
+                          self_origin="https://friday.example")
+
+        assert _ac(resp) == {}
+
+    def test_a_different_origin_is_still_blocked(self, cors_allowing):
+        """The exemption must be exactly equality -- not a prefix or
+        suffix match, which would let evil-friday.example through."""
+        cors = cors_allowing("https://allowed.example")
+        from flask import Response
+        for other in ("https://evil-friday.example",
+                      "https://friday.example.evil.com",
+                      "http://friday.example"):
+            cors.apply(Response(), other, self_origin="https://friday.example")
+
+        blocked = {b["origin"] for b in cors.blocked_origins()}
+        assert blocked == {"https://evil-friday.example",
+                           "https://friday.example.evil.com",
+                           "http://friday.example"}
+
+    def test_hud_request_does_not_pollute_the_record(self, client, cors_allowing):
+        """End to end through the real after_request hook, which is where
+        the production bug actually lived -- the unit above passes even
+        if server.py forgets to pass self_origin at all."""
+        cors_allowing("https://allowed.example")
+        client.post("/friday/ask",
+                    headers={"Origin": "http://localhost"},
+                    json={"message": "hi"})
+
+        body = client.get("/cors-check", headers={"Accept": "*/*"}).get_json()
+        assert body["blocked"] == []
