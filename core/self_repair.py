@@ -42,17 +42,33 @@ _last_token: str | None = None
 def _run_pytest(cwd: Path) -> dict:
     """Run the full suite inside cwd, stopping at the first failure --
     one bug fixed and verified at a time, not a batch of simultaneous
-    speculative patches."""
+    speculative patches.
+
+    `ran` distinguishes "the suite executed and something failed" from
+    "the suite never executed at all". Confirmed live and the reason this
+    exists: render.yaml installs requirements.txt, pytest lives in
+    requirements-dev.txt, so on the deploy `python -m pytest` exits
+    non-zero with "No module named pytest". That looked identical to a
+    failing test, and since the ImportError traceback contains no watched
+    component, every self-repair run on the deploy reported "Found a
+    failing test but couldn't trace it back to one of my watched files"
+    -- a phantom bug that doesn't exist, reported forever."""
     args = [sys.executable, "-m", "pytest", "-x", "--tb=short", "-q"]
     try:
         result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=180)
+        output = (result.stdout + "\n" + result.stderr)[-8000:]
+        # pytest itself exits 0 (pass) or 1 (tests failed); anything else,
+        # or a missing module, means the run never really happened.
+        ran = ("No module named pytest" not in output
+               and result.returncode in (0, 1))
         return {
             "passed": result.returncode == 0,
+            "ran": ran,
             "returncode": result.returncode,
-            "output": (result.stdout + "\n" + result.stderr)[-8000:],
+            "output": output,
         }
     except Exception as e:
-        return {"passed": False, "returncode": -1, "output": str(e)}
+        return {"passed": False, "ran": False, "returncode": -1, "output": str(e)}
 
 
 def diagnose() -> dict:
@@ -160,6 +176,12 @@ def attempt_repair() -> dict:
     diag = diagnose()
     if diag["passed"]:
         return {"status": "nothing_to_repair", "diagnose": diag}
+
+    # Checked before localizing: a suite that never ran has no traceback
+    # to localize, so this would otherwise fall through to
+    # "cannot_localize" and blame a bug that doesn't exist.
+    if not diag.get("ran", True):
+        return {"status": "cannot_run_tests", "diagnose": diag}
 
     hit = _localize(diag["output"])
     if not hit:

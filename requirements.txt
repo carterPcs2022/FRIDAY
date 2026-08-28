@@ -12,3 +12,11 @@ python-docx>=1.1.0
 yfinance>=0.2.37
 cryptography>=42.0.0
 argon2-cffi>=23.1.0
+# Not just a test dependency here: core/self_repair.py runs the real
+# suite to diagnose FRIDAY's own bugs, and render.yaml installs only
+# this file. Without pytest on the deploy, self-repair can never
+# actually run -- it reported a phantom failing test on every attempt
+# (confirmed live). The tests/ directory ships with the repo anyway, so
+# this is what makes the feature real in the one environment that
+# matters. requirements-dev.txt still pins it for local work.
+pytest>=8.0.0
