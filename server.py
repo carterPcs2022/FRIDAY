@@ -2402,16 +2402,115 @@ def _cmd_jarvis_proxy(prompt, p_lower):
             pass
 
 
+# A message with none of these is certainly a single request, so the
+# common case never pays for an extra LLM round trip.
+_MULTI_HINT = re.compile(r",|;| and | then | also | plus ", re.I)
+
+
+def _split_commands(prompt: str) -> list[str]:
+    """Split a message carrying several distinct requests.
+
+    The dispatch chain returns on its first match, so "run a self repair,
+    can you read my Gmail, and remind me to take my vitamins at 8am" ran
+    the self-repair and silently dropped the other two -- three handlers
+    matched, one executed, no indication the rest were skipped.
+
+    Splitting is done by the model rather than by punctuation, because
+    punctuation is genuinely ambiguous here: "email Jane, Bob and Sam
+    about the meeting" is one request whose commas must not be cut, while
+    the example above is three. A regex confident enough to separate
+    those would break working commands, which is worse than the bug.
+
+    Fails closed in every uncertain case -- any error, any malformed
+    reply, or a split whose pieces don't reconstruct the original returns
+    [prompt], i.e. exactly today's behavior."""
+    if not _MULTI_HINT.search(prompt) or not friday_brain:
+        return [prompt]
+
+    try:
+        raw = friday_brain.think(
+            "Split this message into the separate requests it contains.\n\n"
+            f"Message: {prompt}\n\n"
+            'Reply as JSON: {"requests": [str, ...]}\n\n'
+            "One entry per distinct thing being asked for. Keep each "
+            "entry's original wording so it can be acted on by itself. "
+            "Most messages are a single request -- return one entry then. "
+            "Commas inside one request (a list of recipients, a list of "
+            "items) are NOT separate requests. JSON only.",
+            raw=True,
+        )["response"]
+        parts = [p.strip() for p in _json_from_model(raw).get("requests", []) if str(p).strip()]
+    except Exception as e:
+        logging.warning(f"[multi] split failed, treating as one request: {e}")
+        return [prompt]
+
+    if len(parts) < 2:
+        return [prompt]
+
+    # Guard against a model that paraphrases or invents: every piece has
+    # to be recognisable in the original, or the segments would be acted
+    # on as requests the boss never actually made.
+    low = prompt.lower()
+    if not all(p.lower() in low for p in parts):
+        logging.warning("[multi] split pieces are not verbatim; treating as one request")
+        return [prompt]
+
+    return parts
+
+
+def _run_segments(segments: list[str]):
+    """Run each request in turn and report every outcome.
+
+    In order, not concurrently: "add a task and then show my list" only
+    makes sense sequentially, and two handlers touching the same store at
+    once is a real way to lose a write.
+
+    One failing segment doesn't abandon the rest -- the boss asked for
+    all of them, and a silent stop after the second is the same class of
+    problem this whole feature exists to fix."""
+    lines, modes = [], []
+    for seg in segments:
+        try:
+            resp = _handle_prompt(seg, allow_split=False)
+            body = resp[0] if isinstance(resp, tuple) else resp
+            payload = body.get_json() if hasattr(body, "get_json") else {}
+            text = (payload.get("response") or "").strip()
+            modes.append(payload.get("mode", "friday"))
+        except Exception as e:
+            logging.warning(f"[multi] segment failed: {seg!r}: {e}")
+            text = f"Couldn't do that one, boss: {seg}"
+            modes.append("error")
+        lines.append(text or f"Nothing came back for: {seg}")
+
+    combined = "\n\n".join(lines)
+    _log(" | ".join(segments), combined, "multi")
+    audio_file = friday_speak(combined) if VOICE_OK else None
+    return jsonify({
+        "response": combined, "mode": "multi",
+        "segments": segments, "segment_modes": modes,
+        "has_audio": bool(audio_file), "audio_file": audio_file,
+    })
+
+
 @app.route("/command", methods=["POST"])
 def command():
-    prompt = ""
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt", "") or "").strip()
+    if not prompt:
+        return jsonify({"response": "Say something, boss."})
+    return _handle_prompt(prompt)
+
+
+def _handle_prompt(prompt, allow_split=True):
+    """The whole dispatch chain for one request.
+
+    Split out of command() so a message carrying several requests can run
+    each one through it in turn (see _split_commands). allow_split=False
+    on those re-entries, so a segment can't be split again -- and so the
+    safety gates below, which are about the message as a whole, run once
+    against the original text rather than per fragment.
+    """
     try:
-        data = request.get_json(silent=True) or {}
-        prompt = data.get("prompt", "").strip()
-
-        if not prompt:
-            return jsonify({"response": "Say something, boss."})
-
         # ── Suit Lockdown — checked before EVERYTHING else, including Mayday.
         # While locked, the only thing this system will do with any message
         # is compare it to ENDGAME_PASSPHRASE — no trigger word, no prefix
@@ -2444,6 +2543,15 @@ def command():
         result = _cmd_security_screen(prompt)
         if result is not None:
             return result
+
+        # Several requests in one message. Deliberately placed after the
+        # safety gates above -- those judge the whole message, and a
+        # splitter running first could hand them fragments that read
+        # differently than the original.
+        if allow_split:
+            segments = _split_commands(prompt)
+            if len(segments) > 1:
+                return _run_segments(segments)
 
         # Learn from every request up front (not gated behind any one
         # response branch) so it applies regardless of which handler below
@@ -2795,6 +2903,12 @@ def command():
         return jsonify({"response": response, "mode": "emergency"})
 
     except Exception:
+        # Was a bare swallow with no logging, so any crash in the whole
+        # dispatch chain vanished behind "I'm here, boss" with nothing
+        # recorded -- the same opaque-failure shape that made the SMTP
+        # and calendar bugs take several passes each. The reply to the
+        # boss stays deliberately calm; the traceback goes to the log.
+        logging.exception(f"[command] unhandled error on prompt: {prompt[:200]!r}")
         return jsonify({"response": "I'm here, boss. Give me a moment.", "mode": "critical"}), 200
 
 
