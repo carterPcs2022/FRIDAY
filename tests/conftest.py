@@ -97,3 +97,26 @@ def _reset_pending_followup_state(app):
     yield
     server._pending_compose_send = {}
     server._pending_calendar_add = {}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_action_ledger(tmp_path, monkeypatch):
+    """Point the ledger at a temp file for every test.
+
+    Without this the suite writes real rows into
+    memory/friday_action_ledger.json -- 86 of them on the first run after
+    the ledger was wired in, all invented test prompts. The file is
+    gitignored so none of it would have shipped, but it is the same shape
+    as the smoke test that once ran the real suit_lockdown and left the
+    next boot LOCKED: a test suite must not be able to write the state
+    the application reads back.
+
+    It also keeps the tests honest about each other. A shared ledger
+    accumulating across tests would let one test's entries satisfy
+    another's assertions about counts or recency."""
+    from core import action_ledger
+    monkeypatch.setattr(action_ledger, "LEDGER_FILE",
+                        tmp_path / "action_ledger.json")
+    # Belt and braces: even with the path redirected, a configured Turso
+    # would have the suite writing rows to the real database.
+    monkeypatch.setattr(action_ledger, "_turso", lambda: None)

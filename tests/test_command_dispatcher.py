@@ -27,6 +27,7 @@ DISPATCHER_FUNCTIONS = [
     "_cmd_dark_mode", "_cmd_capabilities", "_cmd_weather", "_cmd_news", "_cmd_translate",
     "_cmd_code_review", "_cmd_remember_this", "_cmd_people_brief",
     "_cmd_caller_id", "_cmd_call_initiate", "_cmd_sms_send", "_cmd_catchup",
+    "_cmd_self_audit",
     "_cmd_focus", "_cmd_habit_log", "_cmd_journal", "_cmd_probability",
     "_cmd_recon", "_cmd_diagnostics", "_cmd_self_repair", "_cmd_cross_check", "_cmd_combat_mode",
     "_cmd_normal_mode", "_cmd_priority", "_cmd_travel", "_cmd_spotify_stop",
