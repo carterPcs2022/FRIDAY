@@ -29,12 +29,18 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=0, x_port=0, x_
 BOOT_TIME = time.time()
 
 
+@app.after_request
+def _apply_cors(response):
+    return _cors.apply(response, request.headers.get("Origin", ""))
+
+
 @app.route("/health")
 def health():
     return "OK", 200
 
 
 from core import access_auth
+from core import cors as _cors
 
 _LOGIN_PAGE_HTML = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -72,6 +78,17 @@ def _render_login_page(next_path: str, error_html: str = "") -> str:
 
 @app.before_request
 def _check_access():
+    # A CORS preflight carries no credentials by design -- the browser
+    # sends it before deciding whether it may send the real request, and
+    # never attaches an Authorization header or cookie to it. Gating it
+    # would 401 the preflight, the browser would refuse to send the
+    # actual request, and the failure would surface as an opaque CORS
+    # error rather than an auth one. It exposes nothing: the response is
+    # headers only, with no body.
+    if request.method == "OPTIONS":
+        return _cors.apply(app.make_default_options_response(),
+                           request.headers.get("Origin", ""))
+
     if not access_auth.is_configured():
         return  # not set up yet — config_validator flags this; don't lock the boss out before he's configured it
     if access_auth.is_exempt(request.path):
