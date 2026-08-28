@@ -379,6 +379,7 @@ import json
 from core.action_claims import claims_action
 from core import tool_router
 from core import action_ledger
+from core import outcome_verify
 import datetime
 import logging
 import threading
@@ -2158,6 +2159,13 @@ def _json_from_model(text: str):
 def _cmd_calendar_add(prompt, p_lower):
     global _pending_calendar_add
 
+    # Function-scoped because several paths below return without ever
+    # calling create_event -- an incomplete extraction that asks a
+    # follow-up, or a reply that still doesn't parse. The response
+    # carries event_id either way, so verification gets a definite
+    # "nothing to check" rather than a crash.
+    created = {}
+
     if _pending_calendar_add and time.time() > _pending_calendar_add.get("expires", 0):
         _pending_calendar_add = {}
 
@@ -2271,7 +2279,11 @@ def _cmd_calendar_add(prompt, p_lower):
         _pending_calendar_add = {}
 
     _log(prompt, response, "calendar")
-    return jsonify({"response": response, "mode": "calendar"})
+    # event_id rides along so core/outcome_verify.py can read the event
+    # back and confirm it exists, rather than trusting that create_event
+    # returning ok means Google actually stored anything.
+    return jsonify({"response": response, "mode": "calendar",
+                    "event_id": (created or {}).get("event_id", "")})
 
 
 def _cmd_goal_report(prompt, p_lower):
@@ -3001,9 +3013,60 @@ def _handle_prompt(prompt, allow_split=True, allow_route=True):
         if outermost:
             _ledger_depth.active = False
 
-    if entry:
+    if outermost:
+        result = _verify_outcome(result, entry)
+    elif entry:
         action_ledger.resolve(entry, "ok", _outcome_mode(result))
     return result
+
+
+def _verify_outcome(result, entry):
+    """Check that an action the handler reported actually happened, and
+    correct the reply if it didn't.
+
+    A handler returning is not the same fact as the thing having
+    happened, and until now only the first was ever checked -- which is
+    exactly how "sending an email, boss" survived a send that timed out
+    inside a library call.
+
+    Only runs at the outermost level and only for the few modes with a
+    verifier, so it costs a round trip on the actions that are expensive
+    to get wrong, and nothing at all on the rest.
+    """
+    mode = _outcome_mode(result)
+    if not outcome_verify.is_verifiable(mode):
+        if entry:
+            action_ledger.resolve(entry, "ok", mode)
+        return result
+
+    try:
+        payload = result.get_json() or {}
+    except Exception:
+        if entry:
+            action_ledger.resolve(entry, "ok", mode)
+        return result
+
+    check = outcome_verify.verify(mode, payload)
+    state = check["state"]
+
+    if entry:
+        # "unknown" is recorded as ok, not failed. She did the work and
+        # the service accepted it; all that's missing is confirmation,
+        # and logging that as a failure would fill the ledger with
+        # phantom breakage every time the network hiccuped.
+        action_ledger.resolve(
+            entry, "failed" if state == "contradicted" else "ok",
+            f"{mode}: {state}" + (f" ({check['detail']})" if check["detail"] else ""),
+        )
+
+    if state == "confirmed":
+        return result
+
+    logging.warning("[verify] %s came back %s: %s", mode, state, check["detail"])
+    amended = outcome_verify.amend(payload.get("response", ""), mode, check)
+    payload["response"] = amended
+    payload["verified"] = state
+    return jsonify(payload)
 
 
 def _outcome_mode(result) -> str:

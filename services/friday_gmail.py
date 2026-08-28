@@ -459,10 +459,59 @@ class FridayGmail:
             print(f"[FRIDAY Gmail] send failed: {e!r}")
             return {"ok": False, "error": str(e)}
 
+        # The Gmail API hands back the stored message id, and it was
+        # being thrown away. It is the only artifact that proves this
+        # send became a real message rather than a request that merely
+        # returned 200 -- core/outcome_verify.py reads it back to confirm
+        # the message actually exists and carries the SENT label.
+        try:
+            message_id = (r.json() or {}).get("id", "")
+        except Exception:
+            message_id = ""
+
         return {
             "ok": True, "to": address, "subject": msg["Subject"],
             "attachments": [p.name for p in files],
+            "message_id": message_id,
         }
+
+    def message_exists(self, message_id: str) -> dict:
+        """Read a sent message back by id.
+
+        Returns {"state": ...} where state is "confirmed", "contradicted"
+        or "unknown". The third is not a hedge -- it is the honest answer
+        when the network is down or the token expired, and collapsing it
+        into "contradicted" would have FRIDAY telling the boss a message
+        failed when she simply could not check.
+        """
+        if not message_id:
+            return {"state": "unknown", "detail": "no message id was returned"}
+        token = self._get_send_access_token()
+        if not token:
+            return {"state": "unknown", "detail": "Gmail send token unavailable"}
+        try:
+            r = httpx.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+                params={"format": "minimal"},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=8,
+            )
+        except Exception as e:
+            return {"state": "unknown", "detail": f"couldn't reach Gmail: {e}"}
+
+        if r.status_code == 404:
+            return {"state": "contradicted", "detail": "no such message in the mailbox"}
+        if r.status_code != 200:
+            return {"state": "unknown", "detail": f"Gmail returned {r.status_code}"}
+        try:
+            labels = (r.json() or {}).get("labelIds", [])
+        except Exception:
+            return {"state": "unknown", "detail": "unreadable Gmail response"}
+        if "SENT" in labels:
+            return {"state": "confirmed", "detail": message_id}
+        # It exists but isn't in Sent -- a draft, or filed somewhere else.
+        return {"state": "contradicted",
+                "detail": f"message exists but isn't in Sent (labels: {labels})"}
 
     def send_draft(self, to: str = "", body: str = "", attachments: list | None = None) -> dict:
         """Sends whatever draft_reply() last produced. `to`/`body` let the
