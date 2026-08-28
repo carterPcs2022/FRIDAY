@@ -103,6 +103,38 @@ def _check_access():
     return jsonify({"error": "Unauthorized"}), 401
 
 
+@app.route("/cors-check")
+def cors_check():
+    """Reads back what cross-origin access is currently configured, and
+    which origins have actually been turned away.
+
+    This exists because the alternative is a log dig. A page that needs
+    allow-listing -- a Claude artifact, a sandboxed iframe -- does not
+    have a guessable origin: it can arrive as "null", or as a per-page
+    domain nobody would predict. The origin is written to the log on
+    rejection, but reading Render's logs to copy one string out is a
+    round trip, and getting it wrong costs another.
+
+    So: open this in the same browser that's already signed in, click
+    Connect on the page that's failing, reload, and the origin to paste
+    into FRIDAY_CORS_ORIGINS is right there.
+
+    Authenticated like everything else. It reports origins that tried to
+    call her and the allow-list she booted with -- no credentials, and
+    nothing a caller didn't already send.
+
+    One caveat worth stating: `blocked` is per-process memory, so it
+    empties on every deploy and restart. If it's empty, that means
+    nothing has been rejected *since the last restart*, not that nothing
+    ever was -- try the failing page again and reload.
+    """
+    return jsonify({
+        "allowed_origins": sorted(_cors.ALLOWED_ORIGINS),
+        "configured": bool(_cors.ALLOWED_ORIGINS),
+        "blocked": _cors.blocked_origins(),
+    })
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if not access_auth.is_configured():

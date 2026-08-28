@@ -18,13 +18,16 @@ boss's email, calendar, notes and location. Three deliberate choices:
   Authorization header, which only something he deliberately handed the
   token to can do.
 
-  Rejections are logged with the origin. A sandboxed iframe can report
-  its origin as "null" or as a per-page domain, and guessing wrong costs
-  a round of "try it again" -- so she records what actually arrived and
-  the right value can be read off the log instead of guessed.
+  Rejections are logged with the origin, and the last few are kept in
+  memory for /cors-check to read back. A sandboxed iframe can report its
+  origin as "null" or as a per-page domain, and guessing wrong costs a
+  round of "try it again" -- so she records what actually arrived and the
+  right value can be read off instead of guessed.
 """
 import logging
 import os
+import threading
+import time
 
 # Comma-separated. Empty (the default) means no cross-origin access at
 # all, which is the behavior every deploy has had until now.
@@ -38,8 +41,44 @@ _ALLOW_HEADERS = "Content-Type, Authorization"
 _ALLOW_METHODS = "GET, POST, OPTIONS"
 
 
+# Recent rejections, newest first, so /cors-check can read back the exact
+# origin that was turned away. Bounded because this is a diagnostic, not a
+# log: the value of interest is always the most recent attempt, and an
+# unbounded dict here would grow forever on a long-lived process being
+# probed from the open internet.
+_MAX_BLOCKED = 10
+_blocked_lock = threading.Lock()
+_blocked = {}  # origin -> {"count": int, "last_seen": float}
+
+
 def is_allowed(origin: str) -> bool:
     return bool(origin) and origin in ALLOWED_ORIGINS
+
+
+def _record_blocked(origin: str):
+    with _blocked_lock:
+        entry = _blocked.get(origin)
+        if entry is None:
+            # Evict the least recently seen rather than the oldest-added:
+            # a page retrying its handshake should not be aged out by a
+            # burst of one-off probes that arrived after it.
+            if len(_blocked) >= _MAX_BLOCKED:
+                oldest = min(_blocked, key=lambda o: _blocked[o]["last_seen"])
+                del _blocked[oldest]
+            entry = _blocked[origin] = {"count": 0, "last_seen": 0.0}
+        entry["count"] += 1
+        entry["last_seen"] = time.time()
+
+
+def blocked_origins() -> list:
+    """Recently rejected origins, most recent first."""
+    with _blocked_lock:
+        items = [
+            {"origin": o, "count": e["count"], "last_seen": e["last_seen"]}
+            for o, e in _blocked.items()
+        ]
+    items.sort(key=lambda i: i["last_seen"], reverse=True)
+    return items
 
 
 def apply(response, origin: str):
@@ -55,6 +94,7 @@ def apply(response, origin: str):
         logging.warning(
             "[cors] blocked origin %r — add it to FRIDAY_CORS_ORIGINS to allow", origin
         )
+        _record_blocked(origin)
         return response
 
     response.headers["Access-Control-Allow-Origin"] = origin
