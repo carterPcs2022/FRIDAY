@@ -55,6 +55,16 @@ def is_allowed(origin: str) -> bool:
     return bool(origin) and origin in ALLOWED_ORIGINS
 
 
+def is_same_origin(origin: str, self_origin: str) -> bool:
+    """Browsers attach Origin to same-origin POSTs as well as
+    cross-origin ones, so the HUD talking to /command arrives carrying
+    FRIDAY's own origin. Those requests are not subject to CORS at all --
+    the browser never checks the response headers -- so treating them as
+    rejections warned on every HUD command and buried the one origin the
+    boss opens /cors-check to find."""
+    return bool(origin) and bool(self_origin) and origin == self_origin
+
+
 def _record_blocked(origin: str):
     with _blocked_lock:
         entry = _blocked.get(origin)
@@ -81,10 +91,19 @@ def blocked_origins() -> list:
     return items
 
 
-def apply(response, origin: str):
+def apply(response, origin: str, self_origin: str = ""):
     """Attach CORS headers when `origin` is allow-listed. Returns the
-    response either way, so callers can use it unconditionally."""
+    response either way, so callers can use it unconditionally.
+
+    `self_origin` is FRIDAY's own scheme://host for this request. Passing
+    it keeps same-origin traffic out of both the log and the blocked
+    record; omitting it only costs noise, never correctness."""
     if not origin:
+        return response
+
+    # Not a rejection and not an allowance -- CORS simply doesn't apply,
+    # so send no headers and record nothing.
+    if is_same_origin(origin, self_origin):
         return response
 
     if not is_allowed(origin):

@@ -89,3 +89,60 @@ class TestLoginOpenRedirect:
             query_string={"next": "/friday/tasks"},
         )
         assert resp.headers.get("Location", "") == "/friday/tasks"
+
+
+class TestUnauthenticatedNavigationGetsTheLoginForm:
+    """A signed-out browser used to get {"error":"Unauthorized"} on every
+    page except /hud.
+
+    That reads as a broken deploy rather than "you aren't signed in", and
+    it leaves no obvious way forward except appending ?token= to the URL
+    -- which works, but puts the access token in browser history. The
+    gate now shows the login form to anything that navigated to a page,
+    while API clients keep the 401 they can handle.
+    """
+
+    def test_page_navigation_redirects_to_login(self, client, configured_token):
+        res = client.get("/cors-check", headers={"Accept": "text/html"})
+        assert res.status_code == 302
+        assert res.headers["Location"] == "/login?next=/cors-check"
+
+    def test_hud_still_redirects(self, client, configured_token):
+        """The behaviour that already existed, kept."""
+        res = client.get("/hud", headers={"Accept": "text/html"})
+        assert res.status_code == 302
+        assert res.headers["Location"].startswith("/login")
+
+    def test_api_client_still_gets_401(self, client, configured_token):
+        """fetch() and URLSession default to Accept: */*. A redirect to
+        an HTML login form would be useless to them and would turn a
+        clean 401 into a confusing 200-with-HTML."""
+        res = client.get("/cors-check", headers={"Accept": "*/*"})
+        assert res.status_code == 401
+        assert res.get_json()["error"] == "Unauthorized"
+
+    def test_post_is_never_redirected(self, client, configured_token):
+        """Redirecting a POST loses the body, so a browser form landing
+        on an expired session would silently discard what was typed.
+        Method is part of the condition for that reason."""
+        res = client.post("/command", headers={"Accept": "text/html"},
+                          json={"prompt": "hi"})
+        assert res.status_code == 401
+
+    def test_relay_page_handshake_is_unaffected(self, client, configured_token):
+        """The exact shape the relay page sends: a cross-origin fetch
+        with a bearer token and no Accept override."""
+        res = client.post(
+            "/friday/ask",
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer test-secret-token",
+                     "Origin": "https://relay.example"},
+            json={"message": "__relay_handshake__"},
+        )
+        assert res.status_code != 401
+
+    def test_authenticated_navigation_is_not_redirected(self, client, configured_token):
+        res = client.get("/cors-check",
+                         headers={"Accept": "text/html"},
+                         query_string={"token": configured_token})
+        assert res.status_code == 200

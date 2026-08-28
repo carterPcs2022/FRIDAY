@@ -29,9 +29,23 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=0, x_port=0, x_
 BOOT_TIME = time.time()
 
 
+def _self_origin() -> str:
+    """FRIDAY's own origin as the browser sees it, for telling
+    same-origin traffic apart from cross-origin.
+
+    ProxyFix(x_proto=1) above already rewrites request.scheme from
+    X-Forwarded-Proto, so this reads https on Render rather than the
+    http the proxy actually speaks to gunicorn -- which would never
+    match the Origin the browser sent. request.host carries the port
+    only when it's non-default, and browsers leave default ports out of
+    Origin too, so the two agree."""
+    return f"{request.scheme}://{request.host}"
+
+
 @app.after_request
 def _apply_cors(response):
-    return _cors.apply(response, request.headers.get("Origin", ""))
+    return _cors.apply(response, request.headers.get("Origin", ""),
+                       self_origin=_self_origin())
 
 
 @app.route("/health")
@@ -87,7 +101,8 @@ def _check_access():
     # headers only, with no body.
     if request.method == "OPTIONS":
         return _cors.apply(app.make_default_options_response(),
-                           request.headers.get("Origin", ""))
+                           request.headers.get("Origin", ""),
+                           self_origin=_self_origin())
 
     if not access_auth.is_configured():
         return  # not set up yet — config_validator flags this; don't lock the boss out before he's configured it
@@ -98,9 +113,94 @@ def _check_access():
     header_token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     if access_auth.check_token(header_token) or access_auth.check_token(request.args.get("token", "")):
         return
-    if request.path == "/hud":
+    # A browser navigating to a page should be shown the login form, not
+    # a wall of JSON with no way forward. /hud was the only path that
+    # did this, so every other page-shaped route dead-ended at
+    # {"error":"Unauthorized"} -- which looks like a broken deploy rather
+    # than "you aren't signed in", and leaves no obvious next step but
+    # putting the token in the query string, where it lands in history.
+    #
+    # Keyed on the request looking like a navigation (a GET asking for
+    # HTML) so API clients still get the 401 they can actually handle:
+    # fetch() and URLSession default to Accept: */*, so the relay page,
+    # the Shortcuts integration and the uptime monitor are unaffected.
+    # login()'s existing next= guard covers the open-redirect shape.
+    wants_html = "text/html" in request.headers.get("Accept", "")
+    if request.method == "GET" and wants_html:
         return redirect(f"/login?next={request.path}")
     return jsonify({"error": "Unauthorized"}), 401
+
+
+def _render_cors_check_page(payload: dict) -> str:
+    """The HTML half of /cors-check. Deliberately plain: this gets read
+    once, on a phone, mid-debug."""
+    def esc(v):
+        return (str(v).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+    blocked = payload["blocked"]
+    if blocked:
+        rows = "".join(
+            f'<li><code>{esc(b["origin"])}</code>'
+            f'<span class="meta">{b["count"]} attempt'
+            f'{"s" if b["count"] != 1 else ""}</span></li>'
+            for b in blocked
+        )
+        body = (
+            "<h2>Blocked origins</h2>"
+            "<p>Newest first. Copy one of these into "
+            "<code>FRIDAY_CORS_ORIGINS</code>.</p>"
+            f"<ul>{rows}</ul>"
+        )
+    else:
+        # Empty is genuinely ambiguous and the difference decides what
+        # the boss does next, so say which one this is rather than
+        # showing a bare empty list.
+        body = (
+            "<h2>Blocked origins</h2>"
+            "<p class=\"empty\">Nothing has been turned away since the last "
+            "restart. If a page is failing to connect, try it again and "
+            "reload this &mdash; the record lives in memory and empties on "
+            "every deploy.</p>"
+        )
+
+    if payload["configured"]:
+        allowed = "".join(f"<li><code>{esc(o)}</code></li>"
+                          for o in payload["allowed_origins"])
+        current = f"<h2>Currently allowed</h2><ul>{allowed}</ul>"
+    else:
+        current = (
+            "<h2>Currently allowed</h2>"
+            "<p class=\"empty\">Nothing &mdash; <code>FRIDAY_CORS_ORIGINS</code> "
+            "isn't set, so every cross-origin page is blocked.</p>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F.R.I.D.A.Y — CORS</title>
+<style>
+  body {{ background:#000814; color:#caf0f8; margin:0; padding:24px 20px;
+    font-family:-apple-system,'SF Pro Display','Helvetica Neue',sans-serif;
+    line-height:1.5; }}
+  h1 {{ font-size:13px; letter-spacing:5px; color:#48cae4; margin:0 0 24px; }}
+  h2 {{ font-size:12px; letter-spacing:2px; text-transform:uppercase;
+    color:#48cae4; margin:28px 0 8px; font-weight:600; }}
+  p {{ font-size:14px; color:#8fb8c8; margin:0 0 12px; }}
+  ul {{ list-style:none; padding:0; margin:0; }}
+  li {{ background:rgba(0,150,199,0.08); border:1px solid rgba(72,202,228,0.18);
+    border-radius:10px; padding:12px 14px; margin-bottom:8px;
+    display:flex; justify-content:space-between; align-items:center; gap:12px; }}
+  code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:14px;
+    color:#caf0f8; word-break:break-all; user-select:all; }}
+  .meta {{ font-size:11px; color:#5a8296; white-space:nowrap; }}
+  .empty {{ color:#5a8296; }}
+</style></head>
+<body>
+<h1>F.R.I.D.A.Y</h1>
+{body}
+{current}
+</body></html>"""
 
 
 @app.route("/cors-check")
@@ -128,11 +228,20 @@ def cors_check():
     nothing has been rejected *since the last restart*, not that nothing
     ever was -- try the failing page again and reload.
     """
-    return jsonify({
+    payload = {
         "allowed_origins": sorted(_cors.ALLOWED_ORIGINS),
         "configured": bool(_cors.ALLOWED_ORIGINS),
         "blocked": _cors.blocked_origins(),
-    })
+    }
+    # Safari hands application/json to the downloader rather than
+    # rendering it, so on the phone this arrived as a "cors-check.json
+    # (29 bytes) — Save..." prompt instead of something readable. Since
+    # the entire job of this route is "let the boss read one string off
+    # the screen and copy it", serve a page to anything that navigated
+    # here and keep the JSON for anything scripted.
+    if "text/html" not in request.headers.get("Accept", ""):
+        return jsonify(payload)
+    return Response(_render_cors_check_page(payload), mimetype="text/html")
 
 
 @app.route("/login", methods=["GET", "POST"])
