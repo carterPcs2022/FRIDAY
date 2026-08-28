@@ -32,6 +32,9 @@ class SecondBrain:
             f"3. Key concepts\n"
             f"4. One sentence summary\n\n"
             f"Reply as JSON: {{insights, actions, concepts, summary}}",
+            # raw=True: this parses the reply as JSON, so it must skip
+            # think()'s speech pipeline -- see core/friday_brain.py.
+            raw=True,
         )["response"]
 
         try:

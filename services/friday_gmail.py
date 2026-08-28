@@ -489,7 +489,8 @@ class FridayGmail:
               "URGENT - needs action today\nREPLY - needs a reply this week\n"
               "READ - worth reading, no action\nSKIP - probably spam/newsletters\n\n"
               'Reply as JSON: {"urgent": [], "reply": [], "read": [], "skip": []} '
-              "with subject lines."
+              "with subject lines.",
+            raw=True,
         )
 
         try:
