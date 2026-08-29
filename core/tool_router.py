@@ -99,14 +99,74 @@ ENABLED = os.getenv("FRIDAY_TOOL_ROUTER", "").strip().lower() in ("1", "true", "
 
 _SYSTEM = """You route a request to one of an assistant's capabilities.
 
-Reply with JSON only: {"tool": "<name>", "detail": "<the part of the request that is content>"}
+Reply with JSON only: {"tool": "<name>", "detail": "<subject only>"}
 If no capability fits, reply {"tool": null}.
+
+`detail` is the SUBJECT of the action and nothing else. Strip every verb,
+request and politeness word -- they are already carried by the capability
+you picked, and repeating them produces nonsense when the request is
+rebuilt. It is usually two or three words.
+
+  "keep track of my knee physio"        -> {"tool": "habit_log", "detail": "knee physio"}
+  "pencil in dinner with sarah at 7"    -> {"tool": "calendar_add", "detail": "dinner with sarah at 7"}
+  "don't let that wifi password vanish" -> {"tool": "note", "detail": "the wifi password"}
+  "nudge me in twenty minutes"          -> {"tool": "reminder", "detail": "in twenty minutes"}
+  "i should grab dog food"              -> {"tool": "task_add", "detail": "dog food"}
+
+Never echo the whole request back as `detail`.
 
 Rules:
 - Pick a capability ONLY if the request is clearly asking for that thing to be done.
 - A question about a capability is not a request to use it. "Can you read email?" is {"tool": null}.
 - Chat, opinions, greetings and general questions are {"tool": null}.
 - Never guess. {"tool": null} is always a safe answer and is usually right."""
+
+# Leading verbs and politeness the model leaves on `detail` despite being
+# told not to. Stripped because the canonical phrase already supplies the
+# verb, and concatenating both produced, in production:
+#
+#   'keep track of my knee physio' -> 'logged my keep track of my knee physio'
+#
+# which the habit handler then tried to extract a habit name from.
+# Each alternative ends in (?:\s+|\Z) so a detail that is *only* filler
+# ("please") strips to empty rather than surviving for want of a trailing
+# space -- rephrase() then falls back to the bare canonical phrase.
+_DETAIL_PREFIX = re.compile(
+    r"^\s*(?:(?:please|just|kindly"
+    r"|can you|could you|would you|will you"
+    r"|i\s+(?:need|want|should|have)\s+to"
+    r"|keep track of|make sure (?:to|i)"
+    r"|don'?t (?:let me )?forget(?: to| about)?"
+    r"|remember to|remind me to|help me|go ahead and)(?:\s+|\Z))+",
+    re.I,
+)
+
+_LEADING_POSSESSIVE = re.compile(r"^\s*(?:my|the|a|an|that|this)\s+", re.I)
+
+
+def _clean_detail(detail: str, canonical: str, prompt: str) -> str:
+    """Strip what the canonical phrase already says.
+
+    The model is told to return the subject only and mostly does, but
+    "keep track of my knee physio" came back whole and rebuilt as
+    "logged my keep track of my knee physio". A prompt alone can't be
+    relied on for this, so the obvious shapes are removed here too.
+    """
+    detail = (detail or "").strip().strip('"\'')
+    if not detail:
+        return ""
+
+    previous = None
+    while previous != detail:
+        previous = detail
+        detail = _DETAIL_PREFIX.sub("", detail).strip()
+
+    # The canonical phrase ends in a possessive ("logged my", "i took
+    # my"), so a detail that also starts with one stutters.
+    if canonical.rstrip().endswith(("my", "the", "a", "an")):
+        detail = _LEADING_POSSESSIVE.sub("", detail).strip()
+
+    return detail
 
 
 def _catalog() -> str:
@@ -180,5 +240,5 @@ def rephrase(tool: str, detail: str) -> str | None:
         return None
     if not entry.takes_detail:
         return entry.canonical
-    detail = (detail or "").strip()
+    detail = _clean_detail(detail, entry.canonical, "")
     return f"{entry.canonical} {detail}".strip() if detail else entry.canonical

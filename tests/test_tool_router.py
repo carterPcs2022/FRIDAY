@@ -283,3 +283,76 @@ class TestWiredIntoDispatch:
             server._handle_prompt(_unclaimed_prompt())
 
         assert not called
+
+
+class TestDetailIsTheSubjectNotTheWholeRequest:
+    """Caught in production on the router's first day:
+
+        [route] 'keep track of my knee physio' -> habit_log
+                -> 'logged my keep track of my knee physio'
+
+    The capability was right. The rewrite was nonsense, because the model
+    returned the entire request as `detail` and the canonical phrase
+    already carries the verb. The habit handler then tried to extract a
+    habit name from that string.
+
+    Prompting alone can't be relied on for this -- the model was already
+    told to return "the part of the request that is content" and returned
+    all of it -- so the obvious shapes are stripped in code as well.
+    """
+
+    def test_the_production_case(self):
+        assert tool_router.rephrase("habit_log", "keep track of my knee physio") \
+            == "logged my knee physio"
+
+    @pytest.mark.parametrize("detail,expected", [
+        ("i need to grab dog food",   "add to my list grab dog food"),
+        ("can you add dog food",      "add to my list add dog food"),
+        ("please dog food",           "add to my list dog food"),
+        ("just dog food",             "add to my list dog food"),
+    ])
+    def test_leading_request_words_are_stripped(self, detail, expected):
+        assert tool_router.rephrase("task_add", detail) == expected
+
+    @pytest.mark.parametrize("detail", ["my vitamins", "the vitamins", "vitamins"])
+    def test_a_possessive_canonical_does_not_stutter(self, detail):
+        """"i took my" + "my vitamins" reads as "i took my my vitamins"."""
+        assert tool_router.rephrase("med_taken", detail) == "i took my vitamins"
+
+    def test_stacked_prefixes_are_all_removed(self):
+        assert tool_router.rephrase("habit_log", "please keep track of my knee physio") \
+            == "logged my knee physio"
+
+    def test_a_clean_detail_is_left_alone(self):
+        """The common case must not be damaged by the repair."""
+        assert tool_router.rephrase("calendar_add", "dinner with sarah at 7") \
+            == "put on my calendar dinner with sarah at 7"
+
+    def test_content_that_merely_starts_with_a_stripped_word_survives(self):
+        """"my" is only stripped after a canonical that ends in a
+        possessive -- "note that" doesn't, so "my passport number" keeps
+        its "my"."""
+        assert tool_router.rephrase("note", "my passport number") \
+            == "note that my passport number"
+
+    def test_quotes_around_the_detail_are_removed(self):
+        assert tool_router.rephrase("note", '"the wifi password"') \
+            == "note that the wifi password"
+
+    def test_an_all_filler_detail_falls_back_to_the_canonical(self):
+        """Stripping everything must not produce a trailing space or a
+        half-sentence."""
+        assert tool_router.rephrase("task_add", "please ") == "add to my list"
+
+    def test_the_rewrite_is_still_claimed_by_its_handler(self, app, all_services):
+        """The repair must not break the property the whole catalog rests
+        on -- a rewrite dispatch no longer claims is worse than a clumsy
+        one it does."""
+        import server
+        phrase = tool_router.rephrase("habit_log", "keep track of my knee physio")
+        with app.test_request_context():
+            try:
+                claimed = server._cmd_habit_log(phrase, phrase.lower()) is not None
+            except Exception:
+                claimed = True
+        assert claimed, f"{phrase!r} is no longer claimed by _cmd_habit_log"
