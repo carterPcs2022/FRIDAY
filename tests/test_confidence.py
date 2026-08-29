@@ -175,3 +175,41 @@ class TestWiredIntoDispatch:
         day one is real."""
         body = client.post("/command", json={"prompt": "hello there"}).get_json()
         assert "not looked up" not in body["response"].lower()
+
+
+class TestProvenanceCannotCrashARequest:
+    """Confirmed live: a response of None got as far as
+    confidence.remember()'s response[:300] with nothing between it and
+    Flask's default error page -- a bare 500, no JSON body, nothing in
+    the app's own logs pointing at the cause. This is bookkeeping, same
+    category as the action ledger a few lines above it in server.py --
+    it must never be the reason a real request fails.
+    """
+
+    def test_a_none_response_does_not_raise(self):
+        confidence.remember("grounded", "q", None, "email")
+        assert confidence.last()["response"] == ""
+
+    def test_a_none_prompt_does_not_raise(self):
+        confidence.remember("grounded", None, "some answer", "email")
+        assert confidence.last()["prompt"] == ""
+
+    def test_server_side_guard_survives_a_none_response(self, app):
+        """The full path: a handler's JSON payload literally carries
+        "response": None, the exact shape that crashed in production."""
+        import server
+        from flask import jsonify
+        with app.test_request_context():
+            result = jsonify({"response": None, "mode": "email"})
+            server._remember_provenance("check my email", result)  # must not raise
+
+    def test_a_crash_anywhere_in_provenance_tracking_is_swallowed(self, app, monkeypatch):
+        """Not just the one known cause -- nothing in this function may
+        propagate, regardless of what breaks inside it."""
+        import server
+        from flask import jsonify
+        monkeypatch.setattr(confidence, "assess",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        with app.test_request_context():
+            result = jsonify({"response": "hi", "mode": "email"})
+            server._remember_provenance("check my email", result)  # must not raise

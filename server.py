@@ -3179,20 +3179,29 @@ def _remember_provenance(prompt, result):
     Done here rather than in each handler for the same reason the ledger
     is: there are 56 of them, a hand-maintained list would drift, and the
     mode each one tags its response with is already the signal.
+
+    Confirmed live: this used to guard only result.get_json() and run
+    everything after it bare. confidence.remember() does response[:300]
+    with no None check, and a handler whose response happens to be None
+    -- summarize_inbox() has at least one path that could produce that --
+    turned into an uncaught TypeError with nothing between it and Flask's
+    default error page: a bare 500, no JSON body, no log line pointing at
+    the cause. This is bookkeeping, exactly like the ledger a few lines
+    up -- it must never be the reason a real request fails.
     """
     try:
         payload = result.get_json() or {}
+        mode = payload.get("mode", "")
+        if mode == "confidence_query":
+            # Asking how she knows something must not overwrite the
+            # answer being asked about -- otherwise the second "are you
+            # sure?" in a row reports on the first one.
+            return
+        level = payload.get("confidence") or confidence.assess(
+            mode, verified=payload.get("verified", ""))
+        confidence.remember(level, prompt, payload.get("response") or "", mode)
     except Exception:
-        return
-    mode = payload.get("mode", "")
-    if mode == "confidence_query":
-        # Asking how she knows something must not overwrite the answer
-        # being asked about -- otherwise the second "are you sure?" in a
-        # row reports on the first one.
-        return
-    level = payload.get("confidence") or confidence.assess(
-        mode, verified=payload.get("verified", ""))
-    confidence.remember(level, prompt, payload.get("response", ""), mode)
+        logging.warning("[confidence] provenance tracking failed", exc_info=True)
 
 
 def _outcome_mode(result) -> str:
