@@ -13,7 +13,13 @@ import httpx
 from pathlib import Path
 from urllib.parse import urlencode
 
+from db import turso_http_client as turso
+
 SPOTIFY_TOKEN_FILE = Path("memory/friday_spotify_token.json")
+# Mirrored to Turso as well -- see _load_token() for why the local file
+# alone isn't enough on this deploy.
+TOKEN_TABLE = "spotify_token"
+TOKEN_KEY = "oauth"
 # .strip() for the same reason as services/friday_calendar.py's OAuth
 # config: a trailing newline picked up while pasting into a hosting
 # dashboard makes REDIRECT_URI unusable as a Location header, and the
@@ -42,7 +48,25 @@ print(
 
 class FridaySpotify:
 
-    def _load_token_data(self) -> dict:
+    def _load_token(self) -> dict:
+        """Turso first, local JSON as the fallback -- same pattern as
+        services/friday_calendar.py's and services/friday_gmail.py's
+        tokens, and for the same reason: render.yaml mounts no disk, so
+        memory/ is ephemeral. A token kept only on local disk is lost on
+        every redeploy *and* every free-tier idle spin-down, which meant
+        re-running the consent flow every time FRIDAY's container was
+        recycled -- exactly the flow the boss just re-tested live."""
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(TOKEN_TABLE)
+                row = turso.kv_get(TOKEN_TABLE, TOKEN_KEY)
+                if row:
+                    return row
+            except Exception as e:
+                print(f"[Turso] spotify token read failed, falling back to local JSON: {e}")
+        return self._read_local_token()
+
+    def _read_local_token(self) -> dict:
         if SPOTIFY_TOKEN_FILE.exists():
             try:
                 return json.loads(SPOTIFY_TOKEN_FILE.read_text())
@@ -50,13 +74,20 @@ class FridaySpotify:
                 return {}
         return {}
 
-    def _save_token_data(self, data: dict):
+    def _save_token(self, data: dict):
         SPOTIFY_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         SPOTIFY_TOKEN_FILE.write_text(json.dumps(data, indent=2))
 
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(TOKEN_TABLE)
+                turso.kv_set(TOKEN_TABLE, TOKEN_KEY, data)
+            except Exception as e:
+                print(f"[Turso] spotify token write failed, local JSON already has it: {e}")
+
     def _get_token(self) -> str:
         """Returns a valid access token, refreshing it first if expired."""
-        data = self._load_token_data()
+        data = self._load_token()
         if not data.get("access_token"):
             return ""
 
@@ -82,14 +113,14 @@ class FridaySpotify:
             if r.status_code != 200:
                 return ""
             payload = r.json()
-            data = self._load_token_data()
+            data = self._load_token()
             data["access_token"] = payload["access_token"]
             data["expires_at"] = time.time() + payload.get("expires_in", 3600) - 60
             # Spotify doesn't always return a new refresh_token — keep the
             # old one if it didn't.
             if payload.get("refresh_token"):
                 data["refresh_token"] = payload["refresh_token"]
-            self._save_token_data(data)
+            self._save_token(data)
             return data["access_token"]
         except Exception as e:
             print(f"[FRIDAY Spotify] Token refresh failed: {e}")
@@ -115,7 +146,7 @@ class FridaySpotify:
             if r.status_code != 200:
                 return {"error": f"Token exchange failed: {r.text[:200]}"}
             payload = r.json()
-            self._save_token_data({
+            self._save_token({
                 "access_token": payload["access_token"],
                 "refresh_token": payload.get("refresh_token", ""),
                 "expires_at": time.time() + payload.get("expires_in", 3600) - 60,
@@ -124,15 +155,29 @@ class FridaySpotify:
         except Exception as e:
             return {"error": str(e)}
 
-    def _get_devices(self) -> list:
-        token = self._get_token()
-        if not token:
-            return []
+    def _authed_request(self, method: str, url: str, token: str, **kwargs) -> httpx.Response:
+        """Issue a Spotify API call, retrying once with a freshly
+        refreshed token if Spotify itself reports this one as expired.
+        _get_token()'s proactive refresh only catches expiry against our
+        own clock -- a token revoked, or that expires early on Spotify's
+        side, still needs to be caught here or every call downstream
+        reports a confusing, unrelated-looking failure instead of
+        actually recovering."""
+        timeout = kwargs.pop("timeout", 5)
+        r = httpx.request(method, url, headers={"Authorization": f"Bearer {token}"},
+                           timeout=timeout, **kwargs)
+        if r.status_code == 401:
+            data = self._load_token()
+            refreshed = self._refresh_token(data.get("refresh_token", ""))
+            if refreshed and refreshed != token:
+                r = httpx.request(method, url, headers={"Authorization": f"Bearer {refreshed}"},
+                                   timeout=timeout, **kwargs)
+        return r
+
+    def _get_devices(self, token: str) -> list:
         try:
-            r = httpx.get(
-                "https://api.spotify.com/v1/me/player/devices",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=5,
+            r = self._authed_request(
+                "GET", "https://api.spotify.com/v1/me/player/devices", token,
             )
             if r.status_code == 200:
                 return r.json().get("devices", [])
@@ -144,29 +189,33 @@ class FridaySpotify:
         token = self._get_token()
         if not token:
             return {"error": "Spotify not authenticated"}
-        devices = self._get_devices()
+        devices = self._get_devices(token)
         if not devices:
             return {"error": "Open Spotify on your phone first, boss."}
-        device_id = devices[0]["id"]
+        # Prefer whichever device Spotify itself considers active over
+        # blindly taking the first one back -- with more than one device
+        # signed into the account (a phone plus a laptop that happens to
+        # still be in the list), devices[0] has no guarantee of being the
+        # one actually in the boss's hand right now.
+        device_id = next((d["id"] for d in devices if d.get("is_active")), devices[0]["id"])
 
         if not query:
             try:
-                r = httpx.put(
-                    f"https://api.spotify.com/v1/me/player/play?device_id={device_id}",
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=5,
+                r = self._authed_request(
+                    "PUT", f"https://api.spotify.com/v1/me/player/play?device_id={device_id}",
+                    token,
                 )
                 return {"playing": r.status_code in (200, 204)}
             except Exception as e:
                 return {"error": str(e)}
 
         try:
-            r = httpx.get(
-                "https://api.spotify.com/v1/search",
+            r = self._authed_request(
+                "GET", "https://api.spotify.com/v1/search", token,
                 params={"q": query, "type": "track", "limit": 10},
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=5,
             )
+            if r.status_code != 200:
+                return {"error": f"Search failed: {r.status_code}"}
             items = r.json().get("tracks", {}).get("items", [])
             if not items:
                 return {"error": f"Can't find {query}"}
@@ -197,11 +246,9 @@ class FridaySpotify:
             uri = selected["uri"]
             name = selected["name"]
             artist = selected["artists"][0]["name"]
-            r2 = httpx.put(
-                f"https://api.spotify.com/v1/me/player/play?device_id={device_id}",
-                json={"uris": [uri]},
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=5,
+            r2 = self._authed_request(
+                "PUT", f"https://api.spotify.com/v1/me/player/play?device_id={device_id}",
+                token, json={"uris": [uri]},
             )
             if r2.status_code in (200, 204):
                 return {"playing": True, "track": name, "artist": artist}
@@ -214,10 +261,8 @@ class FridaySpotify:
         if not token:
             return {"error": "Not authenticated"}
         try:
-            r = httpx.put(
-                "https://api.spotify.com/v1/me/player/pause",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=5,
+            r = self._authed_request(
+                "PUT", "https://api.spotify.com/v1/me/player/pause", token,
             )
             return {"paused": r.status_code in (200, 204)}
         except Exception as e:
