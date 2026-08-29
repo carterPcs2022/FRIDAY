@@ -112,3 +112,42 @@ class TestVerificationHedgeRegressions:
 
         assert body["response"] == text
         assert "verified" not in body
+
+
+class TestRouterSelectionRegressions:
+    """core/tool_router.py's _SYSTEM prompt, live 2026-08-29.
+
+    "i owe sarah a reply at some point" routed to email_draft. It
+    contains no trigger phrase for anything (checked directly against
+    every *_TRIGGERS list) -- this was purely the selection model
+    reading "reply" and "sarah" as a request to draft one, when the
+    sentence actually describes an obligation, not an instruction.
+
+    Unlike every other regression in this file, this one is NOT
+    deterministically fixed. There is no code path to correct -- the
+    router asked a model to judge intent, and it judged wrong. What
+    changed is the prompt: a rule plus a worked negative example
+    targeting this exact shape (a first-person statement of what the
+    boss owes someone, sharing vocabulary with a capability's
+    description). That reduces the chance of a repeat; it cannot
+    guarantee one the way a code fix can. This test asserts the mitigation
+    is actually present in the prompt sent to the model -- it cannot
+    assert the model won't still get a differently-worded version of the
+    same confusion wrong. That only gets checked by trying it live again.
+    """
+
+    def test_the_obligation_vs_request_guidance_is_in_the_prompt(self):
+        assert "owe" in tool_router._SYSTEM
+        assert "obligation" in tool_router._SYSTEM
+
+    def test_the_exact_live_phrase_matches_no_trigger(self):
+        """Confirms this could only ever have reached email_draft via
+        the router's own judgment, not a trigger collision -- so a
+        prompt fix is the right kind of fix, not a deflection from a
+        code bug that actually exists somewhere else."""
+        import server
+        phrase = "i owe sarah a reply at some point"
+        lists = {k: v for k, v in vars(server).items()
+                 if k.endswith("_TRIGGERS") and isinstance(v, list)}
+        hits = [t for v in lists.values() for t in v if t in phrase]
+        assert not hits, f"phrase actually matches a real trigger: {hits}"

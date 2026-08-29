@@ -118,6 +118,11 @@ Never echo the whole request back as `detail`.
 Rules:
 - Pick a capability ONLY if the request is clearly asking for that thing to be done.
 - A question about a capability is not a request to use it. "Can you read email?" is {"tool": null}.
+- A statement describing the boss's own situation, feelings, or something
+  he still owes someone is not a request, even when it shares words with a
+  capability's description. "I owe Sarah a reply" is talking about an
+  obligation, not asking you to draft one -- {"tool": null}. Contrast with
+  "draft a reply to Sarah", which is an instruction.
 - Chat, opinions, greetings and general questions are {"tool": null}.
 - Never guess. {"tool": null} is always a safe answer and is usually right."""
 

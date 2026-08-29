@@ -80,9 +80,17 @@ def assess(mode: str, response: str = "", used_memory: bool = False,
 
 def remember(level: str, prompt: str, response: str, mode: str):
     """Hold the last answer's provenance so "are you sure?" has something
-    真 to answer from. In-memory and single-slot, like _pending_calendar_add
-    -- one process, one last answer."""
-    _LAST.update(level=level, prompt=prompt[:300],
+    real to answer from. In-memory and single-slot, like
+    _pending_calendar_add -- one process, one last answer.
+
+    response is defensively coerced rather than assumed to be a string --
+    a handler with "response": None in its JSON crashed this with an
+    uncaught TypeError in production, propagating all the way to a bare
+    500 with no body. The caller in server.py now also guards this whole
+    call, so this is belt-and-suspenders, not the only thing standing
+    between a bad payload and a crashed request."""
+    response = response or ""
+    _LAST.update(level=level, prompt=(prompt or "")[:300],
                  response=response[:300], mode=mode)
 
 
