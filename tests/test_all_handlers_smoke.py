@@ -187,14 +187,15 @@ def test_every_dispatch_handler_is_covered_or_explicitly_exempt():
     """Stops this file quietly rotting: a handler added to the dispatch
     chain later has to be given a case here or listed as exempt, rather
     than silently joining the 44 that had no coverage at all."""
-    import re
-    from pathlib import Path
+    from core import dispatch_chain
 
-    src = Path(server.__file__).read_text()
-    order = []
-    for m in re.finditer(r"result = (_cmd_\w+)\(prompt", src):
-        if m.group(1) not in order:
-            order.append(m.group(1))
+    # Read from the registry, not by grepping server.py for
+    # "result = _cmd_...". That regex was the source of truth until the
+    # chain moved into core/dispatch_chain.py, at which point it matched
+    # nothing -- and this test kept passing, because an empty order makes
+    # `missing` empty too. It went vacuous exactly when the code it
+    # guards was being restructured, which is the worst possible moment.
+    order = list(dispatch_chain.PRE_SPLIT) + list(dispatch_chain.MAIN)
 
     covered = {h for h, _ in CASES}
     # Exempt: these need real device/network state or a live security

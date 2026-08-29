@@ -54,14 +54,8 @@ def _dispatch_order():
     """The chain's real order, read off _handle_prompt rather than
     duplicated -- a hand-kept copy would drift and quietly stop
     reflecting what actually runs."""
-    import re
-    from pathlib import Path
-    src = Path(server.__file__).read_text()
-    order = []
-    for m in re.finditer(r"result = (_cmd_\w+)\(prompt", src):
-        if m.group(1) not in order:
-            order.append(m.group(1))
-    return order
+    from core import dispatch_chain
+    return list(dispatch_chain.PRE_SPLIT) + list(dispatch_chain.MAIN)
 
 
 def _service_names():
