@@ -3368,7 +3368,7 @@ def _dispatch(prompt, allow_split=True, allow_route=True):
                 # initiated." with nothing locked. Each was patched where
                 # it surfaced; this catches the class, including the ones
                 # nobody has hit yet.
-                claim = claims_action(clean)
+                claim = claims_action(clean, prompt)
                 if claim:
                     logging.warning(
                         f"[claim] conversational reply asserted an action it "

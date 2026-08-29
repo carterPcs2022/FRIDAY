@@ -88,16 +88,56 @@ _NEGATED = re.compile(
 )
 
 
-def claims_action(text: str) -> str | None:
+# Questions that ask how a capability WORKS rather than asking for it to
+# be used. An answer to one of these describes the mechanism, and
+# describing a mechanism in the first person is indistinguishable, at the
+# sentence level, from claiming to have just done it:
+#
+#   "I'm adding it straight to your calendar"      explanation
+#   "I've set it up so you can just say the date"  explanation
+#
+# Both were flagged, and "how does the calendar thing work" came back as
+# "I didn't actually do anything there, boss" -- a confusing non-answer to
+# a question that asked for one, and a worse failure than the
+# hallucination the guard exists to catch, because it destroys a correct
+# reply.
+#
+# Deliberately narrow. "can you send an email to jane" is a request
+# wearing a question mark and must still be guarded, so it is not here.
+# Only openers that cannot be an instruction qualify.
+_EXPLANATORY = re.compile(
+    r"^\s*(how (do|does|did|would|can) (you|it|that|the)"
+    r"|what happens when"
+    r"|what does .{0,40} do\b"
+    r"|explain\b"
+    r"|tell me about\b"
+    r"|how's .{0,30} work)",
+    re.I,
+)
+
+
+def is_explanatory(prompt: str) -> bool:
+    return bool(prompt) and bool(_EXPLANATORY.search(prompt))
+
+
+def claims_action(text: str, prompt: str = "") -> str | None:
     """Return the matched claim if `text` asserts FRIDAY did something,
     else None.
 
     Negation is checked first and wins outright: "I have not locked
     anything down" and "I couldn't send that" are the honest answers this
-    branch added, and flagging them would be exactly backwards."""
+    branch added, and flagging them would be exactly backwards.
+
+    `prompt` is what was asked. When it asks how something works, a
+    first-person description of the mechanism is an answer rather than a
+    claim about this turn -- see _EXPLANATORY. Passing it is optional so
+    existing callers keep working, but the guard is noticeably blunter
+    without it."""
     if not text:
         return None
     if _NEGATED.search(text):
+        return None
+    if is_explanatory(prompt):
         return None
     for pattern in (_PAST_CLAIM, _PROGRESSIVE_CLAIM,
                     _LEADING_ACTION, _TRAILING_ACTION):
