@@ -80,10 +80,12 @@ class TestNoUncheckedShadowingRemains:
         src = Path(server.__file__).read_text()
         lists = self._trigger_lists(src)
 
-        order = []
-        for m in re.finditer(r"result = (_cmd_\w+)\(prompt", src):
-            if m.group(1) not in order:
-                order.append(m.group(1))
+        # From the registry rather than by grepping for
+        # "result = _cmd_...". That regex stopped matching anything the
+        # moment the chain moved into core/dispatch_chain.py, and an
+        # empty order made this whole test pass while checking nothing.
+        from core import dispatch_chain
+        order = list(dispatch_chain.PRE_SPLIT) + list(dispatch_chain.MAIN)
 
         bodies = {}
         for m in re.finditer(r"^def (_cmd_\w+)\(", src, re.M):

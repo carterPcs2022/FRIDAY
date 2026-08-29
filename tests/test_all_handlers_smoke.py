@@ -36,22 +36,6 @@ import pytest
 import server
 
 
-def _brain():
-    """friday_brain stand-in. think() must return a real dict -- handlers
-    subscript it, and several json.loads the result -- so this returns
-    one object carrying every key any handler looks for."""
-    b = mock.Mock()
-    b.think.return_value = {
-        "response": '{"task": "x", "minutes": 30, "title": "x", "to": "a@b.com", '
-                    '"subject": "s", "body": "b", "start": "2026-09-01", '
-                    '"end": "2026-09-01", "name": "x", "dose": "1", "time": "8am", '
-                    '"content": "c", "text": "t", "translation": "t"}',
-        "model": "test", "provider": "test", "ms": 1, "tier": "fast",
-    }
-    b.classify.return_value = "fast"
-    return b
-
-
 # (handler, phrase) -- every phrase verified against the handler's own
 # trigger list or inline condition in server.py.
 CASES = [
@@ -65,6 +49,7 @@ CASES = [
     ("_cmd_remember_this",     "remember this: the garage code is 4021"),
     ("_cmd_catchup",           "what did i miss"),
     ("_cmd_self_audit",        "what have you done"),
+    ("_cmd_confidence_query",  "are you sure"),
     ("_cmd_probability",       "what are the odds"),
     ("_cmd_priority",          "what should i focus on"),
     ("_cmd_focus",             "focus mode"),
@@ -115,44 +100,9 @@ ONE_ARG = {
 }
 
 
-def _service_names():
-    """Every optional integration core/app_state.py sets to None when its
-    import fails -- i.e. the full set of service singletons the handlers
-    reach for."""
-    import re
-    from pathlib import Path
-    import core.app_state as st
-
-    src = Path(st.__file__).read_text()
-    return set(re.findall(r"^\s*(\w+)\s*=\s*None$", src, re.M))
-
-
-@pytest.fixture
-def all_services(monkeypatch):
-    """Replace *every* service global with a Mock -- not just the ones
-    that happen to be None here.
-
-    Mocking only the None ones was actively dangerous: any integration
-    that imported successfully stayed real and got genuinely exercised.
-    Caught exactly that -- "lockdown now" ran the real suit_lockdown and
-    persisted a locked state to memory/, so the next boot came up
-    LOCKED. A smoke test must not be able to do that.
-
-    It also removes the false-negative side: a handler returning None now
-    means it genuinely declined the phrase, not that an optional service
-    was unconfigured in this environment."""
-    for name in _service_names():
-        monkeypatch.setattr(server, name, mock.Mock(), raising=False)
-
-    monkeypatch.setattr(server, "friday_brain", _brain(), raising=False)
-    # Pending-reply state otherwise leaks between parametrized cases and
-    # lets one handler claim another's phrase.
-    monkeypatch.setattr(server, "_pending_calendar_add", {}, raising=False)
-    monkeypatch.setattr(server, "_pending_compose_send", {}, raising=False)
-
-
 @pytest.mark.parametrize("handler,prompt", CASES, ids=[c[0] for c in CASES])
-def test_handler_claims_its_own_phrasing(app, all_services, handler, prompt):
+def test_handler_claims_its_own_phrasing(app, all_services, extracting_brain,
+                                        handler, prompt):
     """Returning None means "not mine" -- the request continues down the
     chain and, if nothing else claims it, reaches the conversational
     model. That is exactly how FRIDAY ended up denying she could read
@@ -186,14 +136,15 @@ def test_every_dispatch_handler_is_covered_or_explicitly_exempt():
     """Stops this file quietly rotting: a handler added to the dispatch
     chain later has to be given a case here or listed as exempt, rather
     than silently joining the 44 that had no coverage at all."""
-    import re
-    from pathlib import Path
+    from core import dispatch_chain
 
-    src = Path(server.__file__).read_text()
-    order = []
-    for m in re.finditer(r"result = (_cmd_\w+)\(prompt", src):
-        if m.group(1) not in order:
-            order.append(m.group(1))
+    # Read from the registry, not by grepping server.py for
+    # "result = _cmd_...". That regex was the source of truth until the
+    # chain moved into core/dispatch_chain.py, at which point it matched
+    # nothing -- and this test kept passing, because an empty order makes
+    # `missing` empty too. It went vacuous exactly when the code it
+    # guards was being restructured, which is the worst possible moment.
+    order = list(dispatch_chain.PRE_SPLIT) + list(dispatch_chain.MAIN)
 
     covered = {h for h, _ in CASES}
     # Exempt: these need real device/network state or a live security

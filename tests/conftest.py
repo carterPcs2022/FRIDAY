@@ -120,3 +120,81 @@ def _isolate_action_ledger(tmp_path, monkeypatch):
     # Belt and braces: even with the path redirected, a configured Turso
     # would have the suite writing rows to the real database.
     monkeypatch.setattr(action_ledger, "_turso", lambda: None)
+
+
+def service_names():
+    """Every optional integration core/app_state.py sets to None when its
+    import fails -- i.e. the full set of service singletons the handlers
+    reach for. Read from the source so it can't drift from the real list."""
+    import re
+    from pathlib import Path
+    import core.app_state as app_state
+    return set(re.findall(r"^\s*(\w+)\s*=\s*None$",
+                          Path(app_state.__file__).read_text(), re.M))
+
+
+@pytest.fixture
+def all_services(monkeypatch):
+    """Every service mocked, and the always-on handlers neutralised so a
+    prompt actually reaches the chain.
+
+    Mocking the services is the easy half. The half that keeps catching
+    people -- three times in one session -- is that a bare Mock returns a
+    truthy Mock, so the handlers that run on every request claim
+    everything before the chain gets anywhere:
+
+        _cmd_lockdown_locked    suit_lockdown.is_locked() reads as locked
+        _cmd_security_screen    screen_request()["blocked"] reads as blocked
+
+    Both sit at the top of PRE_SPLIT, so either one swallows the prompt
+    and every assertion below becomes vacuous while still passing. That
+    is how a deliberately broken tool-router catalog entry sailed through
+    two separate attempts at a guard.
+
+    Three test files each worked this out independently and fixed it
+    three different ways -- mocking is_locked, mocking screen_request,
+    setting SECURITY_OK False. All correct; none written down. This is
+    the one place it lives now.
+    """
+    from unittest import mock
+    import server
+
+    for name in service_names():
+        monkeypatch.setattr(server, name, mock.Mock(), raising=False)
+
+    # SECURITY_OK is the handler's own condition, so switching it off is
+    # more honest than teaching a Mock to answer "not blocked".
+    monkeypatch.setattr(server, "SECURITY_OK", False, raising=False)
+    monkeypatch.setattr(server, "VOICE_OK", False, raising=False)
+    server.suit_lockdown.is_locked.return_value = False
+
+    # Pending-reply state is real module-level state and leaks between
+    # tests in the same process -- an unfinished "schedule a meeting..."
+    # makes the next test's prompt look like the answer to it.
+    monkeypatch.setattr(server, "_pending_calendar_add", {}, raising=False)
+    monkeypatch.setattr(server, "_pending_compose_send", {}, raising=False)
+    return server
+
+
+@pytest.fixture
+def extracting_brain(monkeypatch):
+    """A brain whose think() returns one object carrying every key any
+    handler looks for. Several json.loads the result, so it has to be
+    real parseable JSON rather than a Mock."""
+    import json
+    from unittest import mock
+    import server
+
+    brain = mock.Mock()
+    brain.think.return_value = {
+        "response": json.dumps({
+            "task": "x", "minutes": 30, "title": "x", "to": "a@b.com",
+            "subject": "s", "body": "b", "start": "2026-09-01",
+            "end": "2026-09-01", "name": "x", "dose": "1", "time": "8am",
+            "content": "c", "text": "t", "translation": "t",
+        }),
+        "model": "test", "provider": "test", "ms": 1, "tier": "fast",
+    }
+    brain.classify.return_value = "fast"
+    monkeypatch.setattr(server, "friday_brain", brain, raising=False)
+    return brain

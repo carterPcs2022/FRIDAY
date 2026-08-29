@@ -54,55 +54,8 @@ def _dispatch_order():
     """The chain's real order, read off _handle_prompt rather than
     duplicated -- a hand-kept copy would drift and quietly stop
     reflecting what actually runs."""
-    import re
-    from pathlib import Path
-    src = Path(server.__file__).read_text()
-    order = []
-    for m in re.finditer(r"result = (_cmd_\w+)\(prompt", src):
-        if m.group(1) not in order:
-            order.append(m.group(1))
-    return order
-
-
-def _service_names():
-    """Every optional integration core/app_state.py sets to None -- the
-    full set of service singletons the handlers reach for."""
-    import re
-    from pathlib import Path
-    import core.app_state as st
-    return set(re.findall(r"^\s*(\w+)\s*=\s*None$", Path(st.__file__).read_text(), re.M))
-
-
-@pytest.fixture
-def all_services(monkeypatch):
-    """Mock *every* service, not just the unconfigured ones. Same reason
-    as tests/test_all_handlers_smoke.py: anything that imported for real
-    would otherwise be genuinely exercised, and "lockdown now" once ran
-    the real suit_lockdown and persisted a locked state."""
-    import json
-    for name in _service_names():
-        monkeypatch.setattr(server, name, mock.Mock(), raising=False)
-    b = mock.Mock()
-    b.think.return_value = {
-        "response": json.dumps({
-            "task": "x", "minutes": 30, "title": "x", "to": "a@b.com",
-            "subject": "s", "body": "b", "start": "2026-09-01",
-            "end": "2026-09-01", "name": "x", "dose": "1", "time": "8am",
-            "content": "c", "text": "t", "translation": "t",
-        }),
-        "model": "test", "provider": "test", "ms": 1, "tier": "fast",
-    }
-    b.classify.return_value = "fast"
-    monkeypatch.setattr(server, "friday_brain", b, raising=False)
-    monkeypatch.setattr(server, "_pending_calendar_add", {}, raising=False)
-    monkeypatch.setattr(server, "_pending_compose_send", {}, raising=False)
-
-    # Mocks return truthy Mocks, so a bare Mock for suit_lockdown means
-    # is_locked() is true and _cmd_lockdown_locked -- the FIRST handler in
-    # the chain -- claims every phrase ever passed in. That silently made
-    # this whole file vacuous: deliberately broken canonical phrases still
-    # "passed", because nothing ever reached handler two.
-    server.suit_lockdown.is_locked.return_value = False
+    from core import dispatch_chain
+    return list(dispatch_chain.PRE_SPLIT) + list(dispatch_chain.MAIN)
 
 
 class TestTheCatalogCannotRot:
@@ -250,22 +203,12 @@ class TestRephrasing:
 
 
 @pytest.fixture
-def chain_falls_through(all_services, monkeypatch):
-    """Every handler declines, so a prompt really does reach the router.
-
-    all_services alone is not enough, and CI proved it: with bare Mocks
-    the two always-on handlers claim everything, because a Mock's return
-    value is truthy. suit_lockdown.is_locked() reads as locked, and
-    friday_security.screen_request()["blocked"] reads as blocked. Both
-    return before the chain ever gets near the router.
-
-    These two tests passed locally and failed in CI for exactly this
-    reason -- which handler swallowed the prompt depended on which
-    optional packages happened to import, so the result was environment
-    luck rather than a property of the code."""
-    server.suit_lockdown.is_locked.return_value = False
-    server.friday_security.screen_request.return_value = {"blocked": False}
-    server.friday_security.client_ip.return_value = "127.0.0.1"
+def chain_falls_through(all_services):
+    """Named for what it guarantees at the call site. all_services already
+    neutralises the always-on handlers -- see its docstring in conftest for
+    why that is the whole trick, and for the two separate attempts at this
+    file's catalog guard that were vacuous without it."""
+    return all_services
 
 
 def _unclaimed_prompt():

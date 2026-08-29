@@ -380,7 +380,11 @@ from core.action_claims import claims_action
 from core import tool_router
 from core import action_ledger
 from core import outcome_verify
+from core import confidence
+from core import dispatch_chain
 import datetime
+import functools
+import inspect
 import logging
 import threading
 from flask import request, Response
@@ -1657,6 +1661,35 @@ SELF_AUDIT_TRIGGERS = [
     "what's failing", "what failed", "how did today go",
     "your track record", "self audit",
 ]
+
+
+CONFIDENCE_TRIGGERS = [
+    "are you sure", "you sure", "how do you know", "how sure are you",
+    "did you look that up", "did you check", "where'd you get that",
+    "where did you get that", "is that right", "how confident",
+]
+
+
+def _cmd_confidence_query(prompt, p_lower):
+    """"Are you sure?" answered from what she actually knows.
+
+    config/friday_personality.py's one rule is that she doesn't pad, so
+    she volunteers no hedges -- an assistant that qualifies every
+    sentence trains you to skim past qualifiers, which costs more than it
+    buys on the day one is real.
+
+    But the distinction is real and worth having on demand: "I read that
+    off your calendar" and "I think that's right" arrive in identical
+    language, and only one of them is checkable. So she keeps the
+    provenance of the last answer and reports it straight when asked.
+    """
+    if not any(t in p_lower for t in CONFIDENCE_TRIGGERS):
+        return None
+
+    response = confidence.explain(confidence.last())
+    _log(prompt, response, "confidence_query")
+    return jsonify({"response": response, "mode": "confidence_query",
+                    "about": confidence.last()})
 
 
 def _cmd_self_audit(prompt, p_lower):
@@ -3015,6 +3048,7 @@ def _handle_prompt(prompt, allow_split=True, allow_route=True):
 
     if outermost:
         result = _verify_outcome(result, entry)
+        _remember_provenance(prompt, result)
     elif entry:
         action_ledger.resolve(entry, "ok", _outcome_mode(result))
     return result
@@ -3069,6 +3103,29 @@ def _verify_outcome(result, entry):
     return jsonify(payload)
 
 
+def _remember_provenance(prompt, result):
+    """Note where the last answer came from, so "are you sure?" has
+    something real to answer from.
+
+    Done here rather than in each handler for the same reason the ledger
+    is: there are 56 of them, a hand-maintained list would drift, and the
+    mode each one tags its response with is already the signal.
+    """
+    try:
+        payload = result.get_json() or {}
+    except Exception:
+        return
+    mode = payload.get("mode", "")
+    if mode == "confidence_query":
+        # Asking how she knows something must not overwrite the answer
+        # being asked about -- otherwise the second "are you sure?" in a
+        # row reports on the first one.
+        return
+    level = payload.get("confidence") or confidence.assess(
+        mode, verified=payload.get("verified", ""))
+    confidence.remember(level, prompt, payload.get("response", ""), mode)
+
+
 def _outcome_mode(result) -> str:
     """The "mode" a handler tagged its own response with -- which is the
     closest thing this codebase has to "which capability answered"."""
@@ -3076,6 +3133,63 @@ def _outcome_mode(result) -> str:
         return (result.get_json() or {}).get("mode", "")
     except Exception:
         return ""
+
+
+_PRE_SPLIT_CHAIN = None
+_MAIN_CHAIN = None
+
+
+def _resolve_chain(names):
+    """Turn the declared order into callables, once, at import.
+
+    Raises on a name that doesn't exist. That is deliberate: a typo or a
+    deleted handler should stop the boot loudly rather than silently drop
+    a capability out of the chain, which is exactly the failure mode
+    nobody notices -- 44 of these handlers went untested for months
+    precisely because nothing complained when they weren't reached.
+    """
+    resolved = []
+    for name in names:
+        fn = globals().get(name)
+        if fn is None:
+            raise RuntimeError(
+                f"dispatch chain names {name!r}, which doesn't exist in server.py"
+            )
+        resolved.append(fn)
+    return resolved
+
+
+@functools.lru_cache(maxsize=None)
+def _takes_p_lower(fn) -> bool:
+    """Whether a handler wants (prompt, p_lower) or just (prompt).
+
+    Read off the signature rather than kept as a hand-maintained list.
+    The tests already carry such a list (ONE_ARG) and it is exactly the
+    kind of thing that drifts -- a handler gaining a parameter would
+    start being called wrongly with no test failing on the list itself.
+    """
+    try:
+        return len(inspect.signature(fn).parameters) > 1
+    except (TypeError, ValueError):
+        return True
+
+
+def _run_chain(chain, prompt, p_lower):
+    """Try each handler in order; the first to return anything wins.
+
+    First-match-wins is the whole semantics of dispatch and the source of
+    every ordering bug on this branch, so it is stated once here rather
+    than re-implemented 59 times.
+    """
+    for fn in chain:
+        result = fn(prompt, p_lower) if _takes_p_lower(fn) else fn(prompt)
+        if result is not None:
+            return result
+    return None
+
+
+_PRE_SPLIT_CHAIN = _resolve_chain(dispatch_chain.PRE_SPLIT)
+_MAIN_CHAIN = _resolve_chain(dispatch_chain.MAIN)
 
 
 def _dispatch(prompt, allow_split=True, allow_route=True):
@@ -3100,308 +3214,20 @@ def _dispatch(prompt, allow_split=True, allow_route=True):
         # used to be the actual bug). Anything else gets the same generic
         # "system locked" reply, so a stolen device can't fish for behavior
         # differences to guess the passphrase. ─────────────────────────────
-        result = _cmd_lockdown_locked(prompt)
+        p_lower = prompt.lower()
+
+        # Safety commands are matched against the whole message, before
+        # it can be broken into segments -- see core/dispatch_chain.py.
+        result = _run_chain(_PRE_SPLIT_CHAIN, prompt, p_lower)
         if result is not None:
             return result
 
-        result = _cmd_lockdown_trigger(prompt)
-        if result is not None:
-            return result
-
-        # ── Mayday — no LLM call, responds immediately ────────────────────────
-        result = _cmd_mayday(prompt)
-        if result is not None:
-            return result
-
-        # After the real safety handlers above -- an exact trigger has
-        # already returned by here, so this only sees near misses.
-        result = _cmd_safety_near_miss(prompt, prompt.lower())
-        if result is not None:
-            return result
-
-        # ── Safe check-in — no LLM call, stands down any pending escalation.
-        # confirm_safe() already speaks its own line via friday_voice.speak()
-        # (same as autonomous_agent._alert()'s convention of speaking
-        # directly rather than through the HTTP response) so this doesn't
-        # also generate a second, redundant audio_file for the HUD to play. ─
-        result = _cmd_safe_checkin(prompt)
-        if result is not None:
-            return result
-
-        result = _cmd_security_screen(prompt)
-        if result is not None:
-            return result
-
-        # Several requests in one message. Deliberately placed after the
-        # safety gates above -- those judge the whole message, and a
-        # splitter running first could hand them fragments that read
-        # differently than the original.
         if allow_split:
             segments = _split_commands(prompt)
             if len(segments) > 1:
                 return _run_segments(segments)
 
-        # Learn from every request up front (not gated behind any one
-        # response branch) so it applies regardless of which handler below
-        # ends up serving it.
-        result = _cmd_learn_voice_mode(prompt)
-        if result is not None:
-            return result
-
-        # Dark mode — zero external connectivity, local-only responses
-        result = _cmd_dark_mode(prompt)
-        if result is not None:
-            return result
-
-        # MCU capabilities — checked before the JARVIS proxy since these are
-        # specifically FRIDAY's own named abilities, not generic chat that
-        # should default to JARVIS when he's reachable.
-        result = _cmd_capabilities(prompt)
-        if result is not None:
-            return result
-
-        # Second-brain / news / relationships / code intents — same tier as
-        # CAPABILITY_MAP above: FRIDAY's own named abilities, checked before
-        # the JARVIS proxy for the same reason.
-        p_lower = prompt.lower()
-
-        result = _cmd_weather(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_news(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_translate(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_code_review(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_remember_this(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # "people brief on " — deliberately avoids the substring "intel on":
-        # CAPABILITY_MAP already has an "intel on" trigger (government_intel(),
-        # checked above this block) that matches as a substring anywhere in
-        # the prompt, so any phrase containing "intel on" — even prefixed —
-        # would still be unreachable.
-        result = _cmd_people_brief(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Caller intelligence ──────────────────────────────────────────────
-        result = _cmd_caller_id(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── FRIDAY initiates a call ───────────────────────────────────────────
-        result = _cmd_call_initiate(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── FRIDAY sends a real text (Twilio) ────────────────────────────────
-        result = _cmd_sms_send(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Catch-up brief ────────────────────────────────────────────────────
-        result = _cmd_self_audit(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_catchup(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Focus / Pomodoro timer ────────────────────────────────────────────
-        result = _cmd_focus(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Habit logging ─────────────────────────────────────────────────────
-        result = _cmd_habit_log(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Journal ───────────────────────────────────────────────────────────
-        result = _cmd_journal(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Probability assessment ────────────────────────────────────────────
-        result = _cmd_probability(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Recognizance ─────────────────────────────────────────────────────
-        result = _cmd_recon(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── System doctor ────────────────────────────────────────────────────
-        result = _cmd_diagnostics(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Self-repair: diagnose/fix/sandbox-test/confirm her own bugs ────────
-        result = _cmd_self_repair(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Cross-check with JARVIS ────────────────────────────────────────────
-        result = _cmd_cross_check(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Combat / normal mode ──────────────────────────────────────────────
-        result = _cmd_combat_mode(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_normal_mode(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Priority focus ────────────────────────────────────────────────────
-        result = _cmd_priority(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Travel intel ──────────────────────────────────────────────────────
-        result = _cmd_travel(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Spotify direct control ────────────────────────────────────────────
-        result = _cmd_spotify_stop(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_spotify_play(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Calendar: create an event ─────────────────────────────────────────
-        result = _cmd_calendar_add(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Goals ─────────────────────────────────────────────────────────────
-        result = _cmd_goal_report(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_goal_add(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # Left out of the source spec's command() wiring entirely (the
-        # trigger list was declared but never actually checked) — without
-        # this, "worked on X" would never log progress, which defeats the
-        # whole point of tracking goals automatically.
-        result = _cmd_goal_progress(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Email: draft / triage (checked before EMAIL_TRIGGERS — that
-        # list's bare "inbox"/"what emails" are substrings of these
-        # phrases and would otherwise always win first) ────────────────────
-        result = _cmd_email_draft(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Email: send the pending draft ("send it") ───────────────────────
-        result = _cmd_email_send(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Email: compose and send directly, no draft step ─────────────────
-        result = _cmd_email_compose_send(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_email_triage(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Email ─────────────────────────────────────────────────────────────
-        result = _cmd_email_summary(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Note that ─────────────────────────────────────────────────────────
-        result = _cmd_note(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Create a file (checked before recall — "open the file" etc.
-        # never mentions "create", so there's no overlap either way) ────────
-        result = _cmd_create_file(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_file_recall(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Reminders ─────────────────────────────────────────────────────────
-        result = _cmd_reminder(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Task list ─────────────────────────────────────────────────────────
-        result = _cmd_task_show(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_task_add(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Medicine tracker ─────────────────────────────────────────────────
-        result = _cmd_med_schedule(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_med_taken(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_med_skip(prompt, p_lower)
-        if result is not None:
-            return result
-
-        result = _cmd_med_add(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Smart home via HomeKit (Shortcuts run on the Mac Bridge) ──────────
-        result = _cmd_homekit(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Open a Mac app via Mac Bridge ──────────────────────────────────────
-        result = _cmd_mac_app(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Home Assistant — status ─────────────────────────────────────────
-        result = _cmd_ha_status(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # ── Home Assistant — generic turn on/off <device> ───────────────────
-        result = _cmd_ha_toggle(prompt, p_lower)
-        if result is not None:
-            return result
-
-        # Proxy to JARVIS if online and not in coverage mode
-        result = _cmd_jarvis_proxy(prompt, p_lower)
+        result = _run_chain(_MAIN_CHAIN, prompt, p_lower)
         if result is not None:
             return result
 
@@ -3498,10 +3324,16 @@ def _dispatch(prompt, allow_split=True, allow_route=True):
                 # truncates context to its first 500 chars, so this
                 # query-specific, already-ranked signal needs to survive
                 # that cut ahead of the more generic context above.
+                # Whether anything came back decides how this answer is
+                # labelled: something the boss told her is a different
+                # kind of claim from something the model knows, even
+                # though both arrive in the same voice.
+                used_memory = False
                 try:
                     from core.memory_hub import recall as recall_memory
                     hits = recall_memory(prompt, limit=5)
                     if hits:
+                        used_memory = True
                         memory_context = "; ".join(h["text"] for h in hits)
                         context = "\n".join(filter(None, [memory_context, context]))
                 except Exception as e:
@@ -3546,15 +3378,24 @@ def _dispatch(prompt, allow_split=True, allow_route=True):
                              "a way to handle that one yet. Tell me another way and "
                              "I'll have a proper go at it.")
 
+                # This path has no service behind it -- it is the model
+                # answering from training, presented in exactly the same
+                # voice as a weather report. The level rides along for the
+                # HUD; the spoken note is added only for questions with a
+                # checkable answer, because hedging everything would break
+                # the voice and train the boss to skim past qualifiers.
+                mode = "friday-coverage" if COVERAGE_MODE else "friday"
+                level = confidence.assess(mode, clean, used_memory=used_memory)
+
                 save_turn(prompt, clean)
-                _log(prompt, clean, "friday-coverage" if COVERAGE_MODE else "friday")
+                _log(prompt, clean, mode)
 
                 audio_file = friday_speak(clean, mode=friday_brain.voice_mode) if VOICE_OK else None
 
                 return jsonify({
                     "response": clean, "mode": "friday", "model": result.get("model", ""),
                     "ms": result.get("ms", 0), "emotion": emotion_data.get("emotion", "neutral"),
-                    "covering": COVERAGE_MODE,
+                    "covering": COVERAGE_MODE, "confidence": level,
                     "has_audio": bool(audio_file), "audio_file": audio_file,
                 })
             except Exception as e:
