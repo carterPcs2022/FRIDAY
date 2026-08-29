@@ -243,10 +243,44 @@ class FridayCalendar:
                 timeout=8,
             )
             if r.status_code in (200, 201):
-                return {"ok": True, "event": r.json().get("htmlLink", "")}
+                body = r.json() or {}
+                # The event id was discarded and only htmlLink kept. The
+                # id is what lets core/outcome_verify.py read the event
+                # back and confirm it exists, rather than trusting a 200.
+                return {"ok": True, "event": body.get("htmlLink", ""),
+                        "event_id": body.get("id", "")}
             return {"error": f"Failed to create event: {r.status_code}"}
         except Exception as e:
             return {"error": str(e)}
+
+    def event_exists(self, event_id: str) -> dict:
+        """Read an event back by id. Same three states as
+        FridayGmail.message_exists, for the same reason."""
+        if not event_id:
+            return {"state": "unknown", "detail": "no event id was returned"}
+        token = self._get_access_token()
+        if not token:
+            return {"state": "unknown", "detail": "calendar not connected"}
+        try:
+            r = httpx.get(
+                f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=8,
+            )
+        except Exception as e:
+            return {"state": "unknown", "detail": f"couldn't reach Calendar: {e}"}
+
+        if r.status_code == 404:
+            return {"state": "contradicted", "detail": "no such event on the calendar"}
+        if r.status_code != 200:
+            return {"state": "unknown", "detail": f"Calendar returned {r.status_code}"}
+        try:
+            status = (r.json() or {}).get("status", "")
+        except Exception:
+            return {"state": "unknown", "detail": "unreadable Calendar response"}
+        if status == "cancelled":
+            return {"state": "contradicted", "detail": "the event is cancelled"}
+        return {"state": "confirmed", "detail": event_id}
 
 
 friday_calendar = FridayCalendar()

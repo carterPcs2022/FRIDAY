@@ -64,6 +64,7 @@ CASES = [
     ("_cmd_translate",         "translate hello to spanish"),
     ("_cmd_remember_this",     "remember this: the garage code is 4021"),
     ("_cmd_catchup",           "what did i miss"),
+    ("_cmd_self_audit",        "what have you done"),
     ("_cmd_probability",       "what are the odds"),
     ("_cmd_priority",          "what should i focus on"),
     ("_cmd_focus",             "focus mode"),

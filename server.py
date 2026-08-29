@@ -378,6 +378,8 @@ import re
 import json
 from core.action_claims import claims_action
 from core import tool_router
+from core import action_ledger
+from core import outcome_verify
 import datetime
 import logging
 import threading
@@ -1649,6 +1651,56 @@ def _cmd_sms_send(prompt, p_lower):
         return jsonify({"response": response, "mode": "sms_send", **result})
 
 
+SELF_AUDIT_TRIGGERS = [
+    "what have you done", "what did you do", "what have you been doing",
+    "did that work", "did it work", "anything fail", "anything failing",
+    "what's failing", "what failed", "how did today go",
+    "your track record", "self audit",
+]
+
+
+def _cmd_self_audit(prompt, p_lower):
+    """FRIDAY reading her own action ledger back.
+
+    Without this the ledger is write-only: it would record everything and
+    answer nothing, and a question like "did that email actually send"
+    would still reach the conversational model, which has no idea and
+    would improvise -- the exact failure the ledger exists to end.
+
+    Reports counts and names what is failing, rather than reading rows
+    aloud. "email_send failed 3 times" is the sentence worth saying; a
+    transcript of twelve entries is not.
+    """
+    if not any(t in p_lower for t in SELF_AUDIT_TRIGGERS):
+        return None
+
+    summary = action_ledger.summary(hours=24)
+    counts = summary["counts"]
+    failing = summary["failing_capabilities"]
+    done = counts.get("ok", 0)
+    bad = counts.get("failed", 0) + counts.get("abandoned", 0)
+
+    if not done and not bad:
+        response = "Nothing on the books for the last day, boss."
+    elif not bad:
+        response = f"{done} action{'s' if done != 1 else ''} in the last day, all clean."
+    else:
+        worst = ", ".join(f"{cap} ({n}x)" for cap, n in
+                          sorted(failing.items(), key=lambda kv: -kv[1])[:3])
+        response = (f"{done} went through, {bad} didn't. "
+                    f"Trouble spots: {worst}." if worst else
+                    f"{done} went through, {bad} didn't.")
+        # Abandoned means started and never finished -- worth naming
+        # separately, because it reads as a timeout rather than a refusal.
+        if counts.get("abandoned"):
+            response += (f" {counts['abandoned']} of those started and never "
+                         f"finished, which usually means a timeout.")
+
+    _log(prompt, response, "self_audit")
+    return jsonify({"response": response, "mode": "self_audit",
+                    "summary": summary})
+
+
 def _cmd_catchup(prompt, p_lower):
     if any(t in p_lower for t in CATCHUP_TRIGGERS) and friday_brain:
         import concurrent.futures
@@ -2107,6 +2159,13 @@ def _json_from_model(text: str):
 def _cmd_calendar_add(prompt, p_lower):
     global _pending_calendar_add
 
+    # Function-scoped because several paths below return without ever
+    # calling create_event -- an incomplete extraction that asks a
+    # follow-up, or a reply that still doesn't parse. The response
+    # carries event_id either way, so verification gets a definite
+    # "nothing to check" rather than a crash.
+    created = {}
+
     if _pending_calendar_add and time.time() > _pending_calendar_add.get("expires", 0):
         _pending_calendar_add = {}
 
@@ -2220,7 +2279,11 @@ def _cmd_calendar_add(prompt, p_lower):
         _pending_calendar_add = {}
 
     _log(prompt, response, "calendar")
-    return jsonify({"response": response, "mode": "calendar"})
+    # event_id rides along so core/outcome_verify.py can read the event
+    # back and confirm it exists, rather than trusting that create_event
+    # returning ok means Google actually stored anything.
+    return jsonify({"response": response, "mode": "calendar",
+                    "event_id": (created or {}).get("event_id", "")})
 
 
 def _cmd_goal_report(prompt, p_lower):
@@ -2909,7 +2972,113 @@ def command():
     return _handle_prompt(prompt)
 
 
+_ledger_depth = threading.local()
+
+
 def _handle_prompt(prompt, allow_split=True, allow_route=True):
+    """Records the request in the action ledger, then dispatches it.
+
+    Only the outermost call is recorded. _dispatch re-enters itself for
+    multi-command segments and for the tool router's rephrasing, and one
+    ledger entry per user request is the granularity that answers "what
+    did you do today" -- one per internal hop would bury it.
+
+    The entry is opened before the work and closed after, never in one
+    write. An entry that never closes is the most informative row in the
+    file: it means she started something and never finished, which is
+    exactly what a timeout, a crash, or a gunicorn worker killed at 30
+    seconds looks like. recent() reports those as "abandoned" rather than
+    quietly dropping them.
+
+    Nothing here may take a request down -- the ledger is bookkeeping,
+    not a dependency -- so a failure to record is swallowed and dispatch
+    proceeds regardless.
+    """
+    outermost = not getattr(_ledger_depth, "active", False)
+    entry = None
+    if outermost:
+        _ledger_depth.active = True
+        try:
+            entry = action_ledger.record(prompt, capability="", mode="")
+        except Exception:
+            logging.warning("[ledger] record failed", exc_info=True)
+
+    try:
+        result = _dispatch(prompt, allow_split, allow_route)
+    except Exception as e:
+        if entry:
+            action_ledger.resolve(entry, "failed", repr(e))
+        raise
+    finally:
+        if outermost:
+            _ledger_depth.active = False
+
+    if outermost:
+        result = _verify_outcome(result, entry)
+    elif entry:
+        action_ledger.resolve(entry, "ok", _outcome_mode(result))
+    return result
+
+
+def _verify_outcome(result, entry):
+    """Check that an action the handler reported actually happened, and
+    correct the reply if it didn't.
+
+    A handler returning is not the same fact as the thing having
+    happened, and until now only the first was ever checked -- which is
+    exactly how "sending an email, boss" survived a send that timed out
+    inside a library call.
+
+    Only runs at the outermost level and only for the few modes with a
+    verifier, so it costs a round trip on the actions that are expensive
+    to get wrong, and nothing at all on the rest.
+    """
+    mode = _outcome_mode(result)
+    if not outcome_verify.is_verifiable(mode):
+        if entry:
+            action_ledger.resolve(entry, "ok", mode)
+        return result
+
+    try:
+        payload = result.get_json() or {}
+    except Exception:
+        if entry:
+            action_ledger.resolve(entry, "ok", mode)
+        return result
+
+    check = outcome_verify.verify(mode, payload)
+    state = check["state"]
+
+    if entry:
+        # "unknown" is recorded as ok, not failed. She did the work and
+        # the service accepted it; all that's missing is confirmation,
+        # and logging that as a failure would fill the ledger with
+        # phantom breakage every time the network hiccuped.
+        action_ledger.resolve(
+            entry, "failed" if state == "contradicted" else "ok",
+            f"{mode}: {state}" + (f" ({check['detail']})" if check["detail"] else ""),
+        )
+
+    if state == "confirmed":
+        return result
+
+    logging.warning("[verify] %s came back %s: %s", mode, state, check["detail"])
+    amended = outcome_verify.amend(payload.get("response", ""), mode, check)
+    payload["response"] = amended
+    payload["verified"] = state
+    return jsonify(payload)
+
+
+def _outcome_mode(result) -> str:
+    """The "mode" a handler tagged its own response with -- which is the
+    closest thing this codebase has to "which capability answered"."""
+    try:
+        return (result.get_json() or {}).get("mode", "")
+    except Exception:
+        return ""
+
+
+def _dispatch(prompt, allow_split=True, allow_route=True):
     """The whole dispatch chain for one request.
 
     Split out of command() so a message carrying several requests can run
@@ -3041,6 +3210,10 @@ def _handle_prompt(prompt, allow_split=True, allow_route=True):
             return result
 
         # ── Catch-up brief ────────────────────────────────────────────────────
+        result = _cmd_self_audit(prompt, p_lower)
+        if result is not None:
+            return result
+
         result = _cmd_catchup(prompt, p_lower)
         if result is not None:
             return result
