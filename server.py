@@ -1761,12 +1761,45 @@ def _cmd_self_audit(prompt, p_lower):
                     "summary": summary})
 
 
+# Named and patchable rather than a bare literal in the as_completed()
+# call, specifically so a test can shrink it to milliseconds instead of
+# actually waiting 15 real seconds for the timeout this exists to test.
+CATCHUP_TIMEOUT = 15
+
+
 def _cmd_catchup(prompt, p_lower):
     if any(t in p_lower for t in CATCHUP_TRIGGERS) and friday_brain:
         import concurrent.futures
 
+        # Confirmed live, with a traceback: "with ThreadPoolExecutor(...) as
+        # executor:" made the 15s timeout below a lie. as_completed(timeout=15)
+        # only bounds how long this waits for a result -- it does not touch
+        # the thread itself. When the `with` block exits, __exit__ calls
+        # shutdown(wait=True), which blocks until every submitted thread has
+        # actually finished, timeout already fired or not. One of the three
+        # calls hung past 15s; as_completed correctly gave up; exiting the
+        # `with` block sat there anyway, joined on the still-running thread,
+        # until gunicorn's own 30s hard worker timeout SIGKILLed the entire
+        # process. This is a single-worker deployment, so that took down
+        # every other in-flight request with it -- which is why two
+        # unrelated requests 502'd seconds later: not because they were
+        # slow, but because the whole server was mid-crash-and-reboot when
+        # they landed. Same lesson as smtplib's timeout being per-call
+        # rather than per-operation: a timeout on *waiting* for a result is
+        # not a timeout on the operation producing it.
+        #
+        # shutdown(wait=False) returns as soon as as_completed's own
+        # timeout fires, rather than re-blocking on the same hang. The
+        # abandoned thread keeps running in the background and is simply
+        # never joined -- a bounded, contained cost, and a strictly better
+        # failure than taking the whole process down with it. The real fix
+        # is a per-call timeout inside whichever of get_unread /
+        # morning_brief / who_needs_attention is slow; the log line ("1 of
+        # 3 futures unfinished") doesn't say which, so that's a follow-up,
+        # not guessed at here.
         catchup_data = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        try:
             futures = {}
             if friday_gmail:
                 futures[executor.submit(friday_gmail.get_unread, 10)] = "emails"
@@ -1777,12 +1810,24 @@ def _cmd_catchup(prompt, p_lower):
 
             catchup_data["tasks"] = len([t for t in get_tasks() if not t.get("done")])
 
-            for f in concurrent.futures.as_completed(futures, timeout=15):
-                key = futures[f]
-                try:
-                    catchup_data[key] = f.result()
-                except Exception:
-                    pass
+            try:
+                for f in concurrent.futures.as_completed(futures, timeout=CATCHUP_TIMEOUT):
+                    key = futures[f]
+                    try:
+                        catchup_data[key] = f.result()
+                    except Exception:
+                        pass
+            except concurrent.futures.TimeoutError:
+                # as_completed's own timeout, not caught anywhere before --
+                # it aborted the whole function, discarding results from
+                # whichever sources DID answer in time and falling all the
+                # way through to _dispatch's generic "I'm here, boss" catch.
+                # A slow news fetch has nothing to do with whether the boss
+                # can be told about his email and tasks; keep whatever
+                # catchup_data already has and build the brief from that.
+                pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         emails = catchup_data.get("emails", [])
         news = catchup_data.get("news", "")
