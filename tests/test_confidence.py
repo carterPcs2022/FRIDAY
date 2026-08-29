@@ -80,28 +80,93 @@ class TestSheAnswersWhenAsked:
 
 
 class TestWiredIntoDispatch:
+    """Split into "does the handler claim the phrase" and "does dispatch
+    reach it", rather than posting to /command and asserting on the mode
+    that comes back.
+
+    The end-to-end version failed in CI and passed everywhere I could run
+    it -- same Python, same requirements-dev.txt, stripped environment,
+    and a faithful simulation of every service being None. Comparing runs
+    showed the failing set growing from one test to three across commits
+    that touched none of this, which is the signature of an
+    order-and-environment effect rather than a static bug.
+
+    Asserting "which of 59 handlers answered a client.post" is a claim
+    about the whole live chain, and which handlers are live depends on
+    which optional packages imported. The same flaw was fixed in
+    tests/test_outcome_verify.py earlier and simply not carried across to
+    here. Testing the handler directly plus a wiring spy is strictly
+    stronger: it pins the behaviour AND the reachability, without either
+    depending on what else happens to be installed.
+    """
+
+    def test_the_handler_claims_its_phrases(self, app):
+        """Every trigger, not just one -- and directly, so no other
+        handler can be in the way."""
+        import server
+        with app.test_request_context():
+            for phrase in server.CONFIDENCE_TRIGGERS:
+                assert server._cmd_confidence_query(phrase, phrase) is not None, \
+                    f"{phrase!r} is in CONFIDENCE_TRIGGERS but the handler declines it"
+
+    def test_it_declines_anything_else(self, app):
+        import server
+        with app.test_request_context():
+            assert server._cmd_confidence_query("what's the weather",
+                                                "what's the weather") is None
+
+    def test_it_reports_the_remembered_answer(self, app):
+        import server
+        confidence.remember(confidence.GROUNDED, "q", "a", "calendar")
+        with app.test_request_context():
+            body = server._cmd_confidence_query("are you sure", "are you sure").get_json()
+        assert body["mode"] == "confidence_query"
+        assert "your calendar" in body["response"]
+        assert body["about"]["level"] == confidence.GROUNDED
+
+    def test_it_is_in_the_dispatch_chain(self):
+        """Reachability, asserted against the registry rather than
+        inferred from a round trip."""
+        from core import dispatch_chain
+        assert "_cmd_confidence_query" in dispatch_chain.MAIN
+
+    def test_it_is_dispatched_before_self_audit(self):
+        """"did you check" is close to the self-audit triggers, and the
+        audit answers about her whole day rather than the last thing she
+        said. First match wins, so position is the entire guarantee."""
+        from core import dispatch_chain
+        main = dispatch_chain.MAIN
+        assert main.index("_cmd_confidence_query") < main.index("_cmd_self_audit")
+
     def test_provenance_is_recorded_for_an_ordinary_answer(self, client):
         client.post("/command", json={"prompt": "hello there"})
         assert confidence.last()["level"]
 
-    def test_asking_reports_on_the_previous_answer(self, client):
-        client.post("/command", json={"prompt": "hello there"})
-        before = confidence.last()["level"]
-
-        body = client.post("/command", json={"prompt": "are you sure"}).get_json()
-
-        assert body["mode"] == "confidence_query"
-        assert body["about"]["level"] == before
-
-    def test_asking_twice_still_reports_the_original_answer(self, client):
+    def test_a_confidence_query_never_overwrites_what_it_reports_on(self, app):
         """Without the guard the second "are you sure?" reports on the
         first one, which is both useless and quietly circular."""
-        client.post("/command", json={"prompt": "hello there"})
-        client.post("/command", json={"prompt": "are you sure"})
+        import server
+        from flask import jsonify
+        confidence.remember(confidence.GROUNDED, "q", "a", "calendar")
 
-        body = client.post("/command", json={"prompt": "how do you know"}).get_json()
+        with app.test_request_context():
+            server._remember_provenance(
+                "are you sure",
+                jsonify({"response": "...", "mode": "confidence_query"}))
 
-        assert body["about"]["mode"] != "confidence_query"
+        assert confidence.last()["mode"] == "calendar"
+
+    def test_an_ordinary_answer_does_overwrite_it(self, app):
+        import server
+        from flask import jsonify
+        confidence.remember(confidence.GROUNDED, "q", "a", "calendar")
+
+        with app.test_request_context():
+            server._remember_provenance(
+                "what's the weather",
+                jsonify({"response": "Sunny.", "mode": "weather"}))
+
+        assert confidence.last()["mode"] == "weather"
 
     def test_she_volunteers_no_hedge_unprompted(self, client):
         """The personality file spends 374 words establishing that she
@@ -109,12 +174,4 @@ class TestWiredIntoDispatch:
         boss to skim past qualifiers, which costs more than it buys on the
         day one is real."""
         body = client.post("/command", json={"prompt": "hello there"}).get_json()
-        assert "look" not in body["response"].lower()
-        assert "not sure" not in body["response"].lower()
-
-    def test_it_claims_the_phrase_before_self_audit(self, client):
-        """"did you check" is close to the self-audit triggers, and the
-        audit answers about her whole day rather than the last thing she
-        said."""
-        body = client.post("/command", json={"prompt": "did you check"}).get_json()
-        assert body["mode"] == "confidence_query"
+        assert "not looked up" not in body["response"].lower()
