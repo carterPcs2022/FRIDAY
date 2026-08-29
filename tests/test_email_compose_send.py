@@ -8,6 +8,15 @@ ever calling send_email(). Confirmed happening for real (a live /hud
 screenshot showed exactly this: a generic-sounding "On it, boss..."
 reply that never matched send_email()'s actual success template) before
 this fix.
+
+_cmd_calendar_add had the identical shape of a second bug: a pending
+follow-up swallowing the very next message even when it had nothing to
+do with the question being asked. Calendar's fix requires a date/time
+signal in the reply; that doesn't transfer here since a genuine email
+reply can legitimately be almost any text. What does transfer is
+checking whether the message matches some OTHER handler's own trigger
+phrase -- see _looks_like_someone_elses_request and
+TestUnrelatedRequestsDuringPending below.
 """
 from unittest import mock
 
@@ -176,3 +185,103 @@ class TestPendingReply:
 
         assert result is not None
         fake_gmail.send_email.assert_not_called()
+
+
+class TestUnrelatedRequestsDuringPending:
+    """The same live incident shape as _cmd_calendar_add's: a request for
+    a completely different capability arriving while a compose-send
+    follow-up is pending must not be claimed by the email handler at
+    all -- silently folding it into "who's it going to" is worse than
+    any mechanical follow-up message could be."""
+
+    def test_a_task_request_is_not_swallowed_by_pending_state(self, app):
+        server._pending_compose_send = {
+            "context": "send an email to my brother", "expires": __import__("time").time() + 300,
+        }
+        fake_brain = mock.Mock()
+
+        with app.test_request_context(), mock.patch("server.friday_brain", fake_brain):
+            prompt = "don't forget to call the dentist"
+            result = server._cmd_email_compose_send(prompt, prompt.lower())
+
+        assert result is None
+        assert server._pending_compose_send == {}
+        fake_brain.think.assert_not_called()
+
+    def test_a_calendar_request_is_not_swallowed_by_pending_state(self, app):
+        server._pending_compose_send = {
+            "context": "send an email to my brother", "expires": __import__("time").time() + 300,
+        }
+        fake_brain = mock.Mock()
+
+        with app.test_request_context(), mock.patch("server.friday_brain", fake_brain):
+            prompt = "put on my calendar lunch at noon"
+            result = server._cmd_email_compose_send(prompt, prompt.lower())
+
+        assert result is None
+        assert server._pending_compose_send == {}
+        fake_brain.think.assert_not_called()
+
+    def test_a_genuine_reply_that_happens_to_share_no_other_trigger_still_completes(self, app):
+        """The guard must not cost compose-send its actual pending-reply
+        behaviour -- a plain answer to "who's it going to" matches no
+        other handler's trigger phrases and must still go through."""
+        server._pending_compose_send = {
+            "context": "send an email to my brother", "expires": __import__("time").time() + 300,
+        }
+        fake_brain = mock.Mock()
+        fake_brain.think.return_value = _think(
+            '{"to": "jane@x.com", "subject": "", "body": "running late", "attachment": null}'
+        )
+        fake_gmail = mock.Mock()
+        fake_gmail.extract_address.side_effect = lambda s: s if "@" in (s or "") else ""
+        fake_gmail.send_email.return_value = {"ok": True, "to": "jane@x.com"}
+
+        with app.test_request_context(), \
+             mock.patch("server.friday_brain", fake_brain), \
+             mock.patch("server.friday_gmail", fake_gmail):
+            prompt = "jane@x.com, tell her I'm running late"
+            result = server._cmd_email_compose_send(prompt, prompt.lower())
+
+        assert result is not None
+        assert "Sent, boss" in result.get_json()["response"]
+
+    def test_cancelling_still_wins_even_though_cancel_is_not_someone_elses_request(self, app):
+        """Sanity check on the is_cancel-or-not-shadowed condition:
+        cancelling must still cancel, not fall through as "unrelated"."""
+        server._pending_compose_send = {
+            "context": "send an email to my brother", "expires": __import__("time").time() + 300,
+        }
+        fake_brain = mock.Mock()
+
+        with app.test_request_context(), mock.patch("server.friday_brain", fake_brain):
+            prompt = "cancel that"
+            result = server._cmd_email_compose_send(prompt, prompt.lower())
+
+        assert result is not None
+        assert "scrapped" in result.get_json()["response"].lower()
+        assert server._pending_compose_send == {}
+        fake_brain.think.assert_not_called()
+
+
+class TestLooksLikeSomeoneElsesRequest:
+    """server._looks_like_someone_elses_request -- the guard that decides
+    whether a message pending on a compose-send follow-up actually
+    belongs to some other handler instead."""
+
+    def test_recognises_other_handlers_triggers(self):
+        assert server._looks_like_someone_elses_request("don't forget to call the dentist")
+        assert server._looks_like_someone_elses_request("put on my calendar lunch")
+        assert server._looks_like_someone_elses_request("play some ac/dc")
+
+    def test_does_not_fire_on_a_plausible_email_reply(self):
+        assert not server._looks_like_someone_elses_request("jane@x.com, tell her i'm running late")
+        assert not server._looks_like_someone_elses_request("my brother, running late")
+
+    def test_ignores_its_own_triggers_and_cancel(self):
+        """COMPOSE_SEND_TRIGGERS and CANCEL_TRIGGERS are excluded on
+        purpose -- is_new_request and is_cancel already handle those
+        cases, and treating them as "someone else's request" here would
+        wrongly block a re-issued compose-send or a cancel."""
+        assert not server._looks_like_someone_elses_request("send an email to jane")
+        assert not server._looks_like_someone_elses_request("never mind")

@@ -957,6 +957,33 @@ _pending_compose_send: dict = {}
 COMPOSE_SEND_PENDING_WINDOW = 300  # seconds -- long enough for a natural pause replying to "who's it going to", short enough not to hijack an unrelated later message indefinitely
 CANCEL_TRIGGERS = ["never mind", "nevermind", "cancel that", "forget it", "cancel it"]
 
+# _cmd_calendar_add had the identical shape of this bug, confirmed live:
+# a pending follow-up swallowed the very next message even though it had
+# nothing to do with the question being asked, because is_pending_reply
+# was "anything, as long as it doesn't independently trigger a NEW
+# request" -- true for nearly any text. Calendar's fix requires a
+# date/time signal, which doesn't transfer here: an email reply can
+# legitimately be almost any text -- a name, an address, a message body.
+# There is no content shape to check for.
+#
+# What DOES transfer: whether the message matches some OTHER handler's
+# own trigger phrase. That's a real, specific signal that this text was
+# clearly meant for a different capability, independent of what shape a
+# genuine reply happens to take. Doesn't catch every unrelated message
+# (plenty of ordinary text matches no trigger at all -- the exact
+# calendar incident was invisible to this same check), but it closes off
+# a real, common class: "remind me to call the dentist" or "what's the
+# weather" arriving mid-compose-flow, which would otherwise be read as
+# the recipient or body of an email that was never asked for.
+def _looks_like_someone_elses_request(p_lower: str) -> bool:
+    for name, value in globals().items():
+        if name in ("COMPOSE_SEND_TRIGGERS", "CANCEL_TRIGGERS"):
+            continue
+        if name.endswith("_TRIGGERS") and isinstance(value, list):
+            if any(t in p_lower for t in value):
+                return True
+    return False
+
 # "inbox"/"what emails" (EMAIL_TRIGGERS) are substrings of "triage my
 # inbox"/"organize my inbox"/"what emails need attention" — this list
 # must be checked BEFORE EMAIL_TRIGGERS in command() or the narrower
@@ -2512,13 +2539,21 @@ def _cmd_email_compose_send(prompt, p_lower):
         _pending_compose_send = {}
 
     is_new_request = any(t in p_lower for t in COMPOSE_SEND_TRIGGERS)
-    is_pending_reply = bool(_pending_compose_send) and not is_new_request
+    is_cancel = any(t in p_lower for t in CANCEL_TRIGGERS)
+    is_pending_reply = (bool(_pending_compose_send) and not is_new_request
+                        and (is_cancel or not _looks_like_someone_elses_request(p_lower)))
 
-    if is_pending_reply and any(t in p_lower for t in CANCEL_TRIGGERS):
+    if is_pending_reply and is_cancel:
         _pending_compose_send = {}
         response = "Scrapped it, boss."
         _log(prompt, response, "email_compose_send")
         return jsonify({"response": response, "mode": "email_compose_send"})
+
+    if bool(_pending_compose_send) and not is_new_request and not is_pending_reply:
+        # Clearly meant for something else -- the boss has moved on.
+        # Clear the pending state now rather than let it sit for up to
+        # five more minutes waiting to swallow whatever comes next.
+        _pending_compose_send = {}
 
     if not (is_new_request or is_pending_reply) or not friday_gmail or not friday_brain:
         return
