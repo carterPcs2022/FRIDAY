@@ -380,6 +380,7 @@ from core.action_claims import claims_action
 from core import tool_router
 from core import action_ledger
 from core import outcome_verify
+from core import confidence
 import datetime
 import logging
 import threading
@@ -1657,6 +1658,35 @@ SELF_AUDIT_TRIGGERS = [
     "what's failing", "what failed", "how did today go",
     "your track record", "self audit",
 ]
+
+
+CONFIDENCE_TRIGGERS = [
+    "are you sure", "you sure", "how do you know", "how sure are you",
+    "did you look that up", "did you check", "where'd you get that",
+    "where did you get that", "is that right", "how confident",
+]
+
+
+def _cmd_confidence_query(prompt, p_lower):
+    """"Are you sure?" answered from what she actually knows.
+
+    config/friday_personality.py's one rule is that she doesn't pad, so
+    she volunteers no hedges -- an assistant that qualifies every
+    sentence trains you to skim past qualifiers, which costs more than it
+    buys on the day one is real.
+
+    But the distinction is real and worth having on demand: "I read that
+    off your calendar" and "I think that's right" arrive in identical
+    language, and only one of them is checkable. So she keeps the
+    provenance of the last answer and reports it straight when asked.
+    """
+    if not any(t in p_lower for t in CONFIDENCE_TRIGGERS):
+        return None
+
+    response = confidence.explain(confidence.last())
+    _log(prompt, response, "confidence_query")
+    return jsonify({"response": response, "mode": "confidence_query",
+                    "about": confidence.last()})
 
 
 def _cmd_self_audit(prompt, p_lower):
@@ -3015,6 +3045,7 @@ def _handle_prompt(prompt, allow_split=True, allow_route=True):
 
     if outermost:
         result = _verify_outcome(result, entry)
+        _remember_provenance(prompt, result)
     elif entry:
         action_ledger.resolve(entry, "ok", _outcome_mode(result))
     return result
@@ -3067,6 +3098,29 @@ def _verify_outcome(result, entry):
     payload["response"] = amended
     payload["verified"] = state
     return jsonify(payload)
+
+
+def _remember_provenance(prompt, result):
+    """Note where the last answer came from, so "are you sure?" has
+    something real to answer from.
+
+    Done here rather than in each handler for the same reason the ledger
+    is: there are 56 of them, a hand-maintained list would drift, and the
+    mode each one tags its response with is already the signal.
+    """
+    try:
+        payload = result.get_json() or {}
+    except Exception:
+        return
+    mode = payload.get("mode", "")
+    if mode == "confidence_query":
+        # Asking how she knows something must not overwrite the answer
+        # being asked about -- otherwise the second "are you sure?" in a
+        # row reports on the first one.
+        return
+    level = payload.get("confidence") or confidence.assess(
+        mode, verified=payload.get("verified", ""))
+    confidence.remember(level, prompt, payload.get("response", ""), mode)
 
 
 def _outcome_mode(result) -> str:
@@ -3210,6 +3264,10 @@ def _dispatch(prompt, allow_split=True, allow_route=True):
             return result
 
         # ── Catch-up brief ────────────────────────────────────────────────────
+        result = _cmd_confidence_query(prompt, p_lower)
+        if result is not None:
+            return result
+
         result = _cmd_self_audit(prompt, p_lower)
         if result is not None:
             return result
@@ -3498,10 +3556,16 @@ def _dispatch(prompt, allow_split=True, allow_route=True):
                 # truncates context to its first 500 chars, so this
                 # query-specific, already-ranked signal needs to survive
                 # that cut ahead of the more generic context above.
+                # Whether anything came back decides how this answer is
+                # labelled: something the boss told her is a different
+                # kind of claim from something the model knows, even
+                # though both arrive in the same voice.
+                used_memory = False
                 try:
                     from core.memory_hub import recall as recall_memory
                     hits = recall_memory(prompt, limit=5)
                     if hits:
+                        used_memory = True
                         memory_context = "; ".join(h["text"] for h in hits)
                         context = "\n".join(filter(None, [memory_context, context]))
                 except Exception as e:
@@ -3546,15 +3610,24 @@ def _dispatch(prompt, allow_split=True, allow_route=True):
                              "a way to handle that one yet. Tell me another way and "
                              "I'll have a proper go at it.")
 
+                # This path has no service behind it -- it is the model
+                # answering from training, presented in exactly the same
+                # voice as a weather report. The level rides along for the
+                # HUD; the spoken note is added only for questions with a
+                # checkable answer, because hedging everything would break
+                # the voice and train the boss to skim past qualifiers.
+                mode = "friday-coverage" if COVERAGE_MODE else "friday"
+                level = confidence.assess(mode, clean, used_memory=used_memory)
+
                 save_turn(prompt, clean)
-                _log(prompt, clean, "friday-coverage" if COVERAGE_MODE else "friday")
+                _log(prompt, clean, mode)
 
                 audio_file = friday_speak(clean, mode=friday_brain.voice_mode) if VOICE_OK else None
 
                 return jsonify({
                     "response": clean, "mode": "friday", "model": result.get("model", ""),
                     "ms": result.get("ms", 0), "emotion": emotion_data.get("emotion", "neutral"),
-                    "covering": COVERAGE_MODE,
+                    "covering": COVERAGE_MODE, "confidence": level,
                     "has_audio": bool(audio_file), "audio_file": audio_file,
                 })
             except Exception as e:
