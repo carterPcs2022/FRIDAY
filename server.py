@@ -888,6 +888,33 @@ CALENDAR_ADD_TRIGGERS = [
 _pending_calendar_add: dict = {}
 CALENDAR_ADD_PENDING_WINDOW = 300  # seconds
 
+# Confirmed live: a pending calendar follow-up swallowed the very next
+# message even though it had nothing to do with scheduling -- "the wifi
+# password is now bluesky, don't let that vanish" got read as a second
+# attempt to answer "when is this?", failed to parse a date out of it
+# (correctly -- there isn't one), and the note was silently never saved.
+# Nothing told the boss it had been dropped.
+#
+# A five-minute window is long enough that an unrelated request is a
+# real possibility, not an edge case. This is the cheap, honest guard:
+# require the reply to actually contain something date/time-shaped
+# before treating it as an answer. Generous on purpose -- a false
+# positive here just costs a "still wasn't sure" re-ask, which is the
+# existing, already-handled outcome. A false negative silently eats a
+# request and says nothing, which is the actual bug.
+_DATE_REPLY_SIGNAL = re.compile(
+    r"\d"
+    r"|\b(mon|tues?|wed(nes)?|thur?s?|fri|sat(ur)?|sun)(day)?\b"
+    r"|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b"
+    r"|\b(today|tonight|tomorrow|noon|midnight|morning|afternoon|evening|"
+    r"next week|this week|am|pm)\b",
+    re.I,
+)
+
+
+def _looks_like_a_date_reply(p_lower: str) -> bool:
+    return bool(_DATE_REPLY_SIGNAL.search(p_lower))
+
 DRAFT_TRIGGERS = [
     "draft a reply", "reply to",
     "write a reply", "respond to",
@@ -2203,13 +2230,25 @@ def _cmd_calendar_add(prompt, p_lower):
         _pending_calendar_add = {}
 
     is_new_request = any(t in p_lower for t in CALENDAR_ADD_TRIGGERS)
-    is_pending_reply = bool(_pending_calendar_add) and not is_new_request
+    is_cancel = any(t in p_lower for t in CANCEL_TRIGGERS)
+    # A cancellation counts as a reply regardless of shape ("never mind"
+    # has no date in it), so it's checked independently rather than
+    # folded into the date-signal test below.
+    is_pending_reply = (bool(_pending_calendar_add) and not is_new_request
+                        and (is_cancel or _looks_like_a_date_reply(p_lower)))
 
-    if is_pending_reply and any(t in p_lower for t in CANCEL_TRIGGERS):
+    if is_pending_reply and is_cancel:
         _pending_calendar_add = {}
         response = "Scrapped it, boss."
         _log(prompt, response, "calendar")
         return jsonify({"response": response, "mode": "calendar"})
+
+    if bool(_pending_calendar_add) and not is_new_request and not is_pending_reply:
+        # Doesn't look like an answer to the question actually pending --
+        # the boss has moved on. Clear it now rather than let it sit for
+        # up to five more minutes waiting to swallow whatever comes next;
+        # this message falls through to the rest of dispatch untouched.
+        _pending_calendar_add = {}
 
     if not (is_new_request or is_pending_reply) or not friday_brain:
         return
@@ -2708,9 +2747,25 @@ def _cmd_task_show(prompt, p_lower):
 
 
 def _cmd_task_add(prompt, p_lower):
-    if any(t in p_lower for t in TASK_ADD_TRIGGERS) and friday_brain:
+    matched = next((t for t in TASK_ADD_TRIGGERS if t in p_lower), None)
+    if matched and friday_brain:
+        # Confirmed live: the tool router rewrites an unmatched request
+        # into "<trigger phrase> <content>" -- e.g. "add to my list dog
+        # food" -- and handing that whole string to extraction let the
+        # model echo the trigger phrase straight back as part of "the
+        # task": "Added to your list, boss: add to my list dog food".
+        # The extraction prompt already asked for "just the task, no
+        # extra text" and that wasn't enough to stop a small model from
+        # including words that were sitting right there in its input.
+        #
+        # Stripping the matched trigger before extraction removes the
+        # possibility structurally: the phrase isn't in what the model
+        # sees, so it can't hand it back. Case-insensitive, and only the
+        # first occurrence -- someone genuinely writing "add to my list
+        # to add to my list of chores" keeps their own words intact.
+        stripped = re.sub(re.escape(matched), "", prompt, count=1, flags=re.I).strip()
         result = friday_brain.think(
-            f"Extract task from: {prompt}\n"
+            f"Extract task from: {stripped}\n"
             f"Reply with just the task. No extra text."
         )["response"]
         task = result.strip()

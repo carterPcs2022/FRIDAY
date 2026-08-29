@@ -9,6 +9,8 @@ through to the plain conversational model, which can describe
 import time as time_module
 from unittest import mock
 
+import pytest
+
 import server
 
 
@@ -107,24 +109,55 @@ class TestPendingReply:
         assert "schedule a meeting with Jane" in sent_prompt
         assert "3pm tomorrow" in sent_prompt
 
-    def test_second_miss_gives_up_instead_of_looping(self, app):
+    def test_a_reply_with_no_date_signal_falls_through_and_clears_state(self, app):
+        """Was: a second date-free reply got swallowed as a "miss" and
+        answered with a mechanical "try the full request again?" -- which
+        is also how a message with NOTHING to do with the pending
+        question got swallowed live: "the wifi password is now bluesky,
+        don't let that vanish" came back "Still wasn't sure what to
+        schedule, boss" and the note was never saved.
+
+        Requiring a date/time signal before treating a message as a
+        pending reply fixes both at once. A genuinely vague-but-related
+        reply like this one now falls through instead of being answered
+        by the calendar handler -- it still reaches the boss as a normal
+        answer further down the chain, just not from here. The give-up
+        behaviour survives; it happens by clearing the state and getting
+        out of the way, rather than by claiming the message and saying
+        so mechanically."""
         server._pending_calendar_add = {
             "context": "schedule a meeting", "expires": time_module.time() + 300,
         }
         fake_brain = mock.Mock()
-        fake_brain.think.return_value = _think('{"title": "", "start": "", "end": ""}')
-        fake_cal = mock.Mock()
-        fake_cal.is_connected.return_value = True
 
-        with app.test_request_context(), \
-             mock.patch("server.friday_brain", fake_brain), \
-             mock.patch("server.friday_calendar", fake_cal):
+        with app.test_request_context(), mock.patch("server.friday_brain", fake_brain):
             prompt = "I'm not sure yet"
             result = server._cmd_calendar_add(prompt, prompt.lower())
 
-        assert result is not None
-        assert "try the full request again" in result.get_json()["response"].lower()
+        assert result is None
         assert server._pending_calendar_add == {}
+        # No date signal to extract from, so the model must never have
+        # been asked -- this is a structural decline, not a failed parse.
+        fake_brain.think.assert_not_called()
+
+    def test_an_unrelated_request_is_not_swallowed_by_pending_state(self, app):
+        """The exact live incident, reproduced directly against the
+        handler. A note-taking request arriving while a calendar
+        follow-up is pending must not be claimed by the calendar handler
+        at all -- silently dropping it is worse than any mechanical
+        follow-up message could be."""
+        server._pending_calendar_add = {
+            "context": "schedule a meeting", "expires": time_module.time() + 300,
+        }
+        fake_brain = mock.Mock()
+
+        with app.test_request_context(), mock.patch("server.friday_brain", fake_brain):
+            prompt = "the wifi password is now bluesky, don't let that vanish"
+            result = server._cmd_calendar_add(prompt, prompt.lower())
+
+        assert result is None
+        assert server._pending_calendar_add == {}
+        fake_brain.think.assert_not_called()
 
     def test_cancel_trigger_clears_pending_without_calling_the_model(self, app):
         server._pending_calendar_add = {
@@ -315,3 +348,24 @@ class TestJsonFromModel:
         import pytest
         with pytest.raises(Exception):
             server._json_from_model("no json here at all")
+
+
+class TestDateReplySignal:
+    """server._looks_like_a_date_reply -- the guard that decides whether
+    a message pending on a calendar follow-up is plausibly answering it."""
+
+    @pytest.mark.parametrize("text", [
+        "3pm tomorrow", "next tuesday at noon", "september 1st",
+        "9/1 at 3", "tonight", "this week sometime", "8am",
+    ])
+    def test_recognises_date_and_time_language(self, text):
+        assert server._looks_like_a_date_reply(text.lower())
+
+    @pytest.mark.parametrize("text", [
+        "the wifi password is now bluesky, don't let that vanish",
+        "you're doing great by the way",
+        "i owe sarah a reply at some point",
+        "not sure yet",
+    ])
+    def test_does_not_fire_on_unrelated_text(self, text):
+        assert not server._looks_like_a_date_reply(text.lower())
