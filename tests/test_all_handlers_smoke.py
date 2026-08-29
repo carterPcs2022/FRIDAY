@@ -36,22 +36,6 @@ import pytest
 import server
 
 
-def _brain():
-    """friday_brain stand-in. think() must return a real dict -- handlers
-    subscript it, and several json.loads the result -- so this returns
-    one object carrying every key any handler looks for."""
-    b = mock.Mock()
-    b.think.return_value = {
-        "response": '{"task": "x", "minutes": 30, "title": "x", "to": "a@b.com", '
-                    '"subject": "s", "body": "b", "start": "2026-09-01", '
-                    '"end": "2026-09-01", "name": "x", "dose": "1", "time": "8am", '
-                    '"content": "c", "text": "t", "translation": "t"}',
-        "model": "test", "provider": "test", "ms": 1, "tier": "fast",
-    }
-    b.classify.return_value = "fast"
-    return b
-
-
 # (handler, phrase) -- every phrase verified against the handler's own
 # trigger list or inline condition in server.py.
 CASES = [
@@ -116,44 +100,9 @@ ONE_ARG = {
 }
 
 
-def _service_names():
-    """Every optional integration core/app_state.py sets to None when its
-    import fails -- i.e. the full set of service singletons the handlers
-    reach for."""
-    import re
-    from pathlib import Path
-    import core.app_state as st
-
-    src = Path(st.__file__).read_text()
-    return set(re.findall(r"^\s*(\w+)\s*=\s*None$", src, re.M))
-
-
-@pytest.fixture
-def all_services(monkeypatch):
-    """Replace *every* service global with a Mock -- not just the ones
-    that happen to be None here.
-
-    Mocking only the None ones was actively dangerous: any integration
-    that imported successfully stayed real and got genuinely exercised.
-    Caught exactly that -- "lockdown now" ran the real suit_lockdown and
-    persisted a locked state to memory/, so the next boot came up
-    LOCKED. A smoke test must not be able to do that.
-
-    It also removes the false-negative side: a handler returning None now
-    means it genuinely declined the phrase, not that an optional service
-    was unconfigured in this environment."""
-    for name in _service_names():
-        monkeypatch.setattr(server, name, mock.Mock(), raising=False)
-
-    monkeypatch.setattr(server, "friday_brain", _brain(), raising=False)
-    # Pending-reply state otherwise leaks between parametrized cases and
-    # lets one handler claim another's phrase.
-    monkeypatch.setattr(server, "_pending_calendar_add", {}, raising=False)
-    monkeypatch.setattr(server, "_pending_compose_send", {}, raising=False)
-
-
 @pytest.mark.parametrize("handler,prompt", CASES, ids=[c[0] for c in CASES])
-def test_handler_claims_its_own_phrasing(app, all_services, handler, prompt):
+def test_handler_claims_its_own_phrasing(app, all_services, extracting_brain,
+                                        handler, prompt):
     """Returning None means "not mine" -- the request continues down the
     chain and, if nothing else claims it, reaches the conversational
     model. That is exactly how FRIDAY ended up denying she could read
