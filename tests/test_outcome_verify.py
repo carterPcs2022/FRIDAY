@@ -62,16 +62,16 @@ class TestVerifyNeverRaises:
     never turn a working send into an error."""
 
     def test_a_crashing_verifier_yields_unknown(self):
-        verify.register("boom", "did that", mock.Mock(side_effect=RuntimeError("x")))
+        verify.register("boom", "did that", "id", mock.Mock(side_effect=RuntimeError("x")))
         assert verify.verify("boom", {})["state"] == "unknown"
 
     def test_a_verifier_returning_nonsense_yields_unknown(self):
         """Guessing which way it meant would be worse than saying so."""
-        verify.register("weird", "did that", lambda p: {"state": "probably?"})
+        verify.register("weird", "did that", "id", lambda p: {"state": "probably?"})
         assert verify.verify("weird", {})["state"] == "unknown"
 
     def test_a_verifier_returning_none_yields_unknown(self):
-        verify.register("none", "did that", lambda p: None)
+        verify.register("none", "did that", "id", lambda p: None)
         assert verify.verify("none", {})["state"] == "unknown"
 
     def test_an_unregistered_mode_is_not_verifiable(self):
@@ -186,14 +186,23 @@ class TestWiredIntoDispatch:
     the environment, not the code.
     """
 
-    def _response(self, app, mode="email_send", text="Sent.", **extra):
+    def _response(self, app, mode="email_send", text="Sent.", message_id="abc123", **extra):
         from flask import jsonify
+        # message_id defaults to present: these tests simulate a
+        # handler that DID succeed and is then contradicted or
+        # unconfirmed by the read-back check itself, which is the
+        # scenario applies() must let through. Pass message_id="" (or
+        # use _response_without_id below) for the "nothing to verify"
+        # tests instead.
+        payload = {"response": text, "mode": mode, **extra}
+        if message_id:
+            payload["message_id"] = message_id
         with app.test_request_context():
-            return jsonify({"response": text, "mode": mode, **extra})
+            return jsonify(payload)
 
     def _verifier(self, monkeypatch, state, detail=""):
         monkeypatch.setattr(verify, "_VERIFIERS", dict(verify._VERIFIERS))
-        verify.register("email_send", "sent that email",
+        verify.register("email_send", "sent that email", "message_id",
                         lambda p: {"state": state, "detail": detail})
 
     def test_a_contradicted_send_is_retracted_in_the_reply(
@@ -294,3 +303,100 @@ class TestWiredIntoDispatch:
         client.post("/command", json={"prompt": "weather and email"})
 
         assert len(seen) == 1
+
+
+class TestNoIdMeansNothingToVerify:
+    """Confirmed live: "pencil in dinner with sarah thursday at 7" hit a
+    Google 400, and the reply came back "Failed to create event: 400 I
+    couldn't confirm it went through, though -- worth checking." -- a
+    confusing hedge bolted onto a sentence that had already said it
+    failed.
+
+    The mode ("calendar", "email_send", "email_compose_send") is reused
+    across every outcome a handler can report -- not just success. A
+    parse failure, "scrapped it", a pending reply the boss never
+    answered, or the remote API rejecting the request all share the same
+    mode as a real send, and none of them produce an id. Only the id
+    tells verification whether there is anything to check.
+    """
+
+    def _verifier(self, monkeypatch, state="unknown", detail="network down"):
+        monkeypatch.setattr(verify, "_VERIFIERS", dict(verify._VERIFIERS))
+        verify.register("calendar", "added that to your calendar", "event_id",
+                        lambda p: {"state": state, "detail": detail})
+
+    def test_a_response_with_no_id_is_left_completely_alone(self, app, monkeypatch):
+        """The exact production shape: create_event failed, the handler's
+        own response already says so, and no event_id was ever produced."""
+        import server
+        self._verifier(monkeypatch)
+        response = self._response_no_id(app, mode="calendar",
+                                        text="Failed to create event: 400")
+
+        with app.test_request_context():
+            body = server._verify_outcome(response, None).get_json()
+
+        assert body["response"] == "Failed to create event: 400"
+        assert "verified" not in body
+        assert "confirm" not in body["response"].lower()
+
+    def test_the_verifier_is_never_even_called(self, app, monkeypatch):
+        """Not just "the text is unchanged" -- applies() must skip the
+        round trip entirely rather than call the verifier and discard
+        the result, which would cost a network call for nothing."""
+        import server
+        called = []
+        monkeypatch.setattr(verify, "_VERIFIERS", dict(verify._VERIFIERS))
+        verify.register("calendar", "added that to your calendar", "event_id",
+                        lambda p: called.append(1) or {"state": "unknown"})
+        response = self._response_no_id(app, mode="calendar", text="Scrapped it, boss.")
+
+        with app.test_request_context():
+            server._verify_outcome(response, None)
+
+        assert not called
+
+    def test_a_genuine_success_is_still_verified(self, app, monkeypatch):
+        """The gate must not swallow the real case -- an id present means
+        applies() says yes and verification proceeds as before."""
+        import server
+        self._verifier(monkeypatch, "contradicted", "no such event")
+        response = self._response_no_id(app, mode="calendar",
+                                        text='Added "Dinner" to your calendar, boss.',
+                                        event_id="evt_123")
+
+        with app.test_request_context():
+            body = server._verify_outcome(response, None).get_json()
+
+        assert "Correction" in body["response"]
+
+    def test_the_ledger_still_resolves_ok_when_nothing_applies(self, app, monkeypatch):
+        import server
+        from core import action_ledger
+        self._verifier(monkeypatch)
+        entry = action_ledger.record("schedule something", "")
+        response = self._response_no_id(app, mode="calendar", text="Failed to create event: 400")
+
+        with app.test_request_context():
+            server._verify_outcome(response, entry)
+
+        assert action_ledger.recent()[0]["status"] == "ok"
+
+    def _response_no_id(self, app, mode, text, **extra):
+        from flask import jsonify
+        with app.test_request_context():
+            return jsonify({"response": text, "mode": mode, **extra})
+
+
+class TestAppliesDirectly:
+    def test_true_when_the_id_is_present(self):
+        assert verify.applies("calendar", {"event_id": "evt_1"})
+
+    def test_false_when_the_id_is_missing(self):
+        assert not verify.applies("calendar", {})
+
+    def test_false_when_the_id_is_empty_string(self):
+        assert not verify.applies("calendar", {"event_id": ""})
+
+    def test_false_for_an_unregistered_mode(self):
+        assert not verify.applies("weather", {"event_id": "evt_1"})
