@@ -3080,6 +3080,20 @@ def _verify_outcome(result, entry):
             action_ledger.resolve(entry, "ok", mode)
         return result
 
+    # The mode is reused across every outcome a handler can report, not
+    # just success -- a parse failure, "scrapped it", a pending reply
+    # that never got answered, the remote API rejecting the request. Only
+    # a genuine success produces the id applies() checks for. Every other
+    # path already has a complete, correct response of its own; without
+    # this gate, verify() ran anyway, found nothing to check, came back
+    # "unknown", and appended "I couldn't confirm it went through,
+    # though -- worth checking" onto a reply that had already said
+    # "Failed to create event: 400" in the same breath. Confirmed live.
+    if not outcome_verify.applies(mode, payload):
+        if entry:
+            action_ledger.resolve(entry, "ok", mode)
+        return result
+
     check = outcome_verify.verify(mode, payload)
     state = check["state"]
 

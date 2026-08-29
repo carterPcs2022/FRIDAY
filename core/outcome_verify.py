@@ -36,7 +36,8 @@ an error. A verifier that raises, times out, or returns nonsense yields
 """
 import logging
 
-# mode -> (what to call it in a message, verifier)
+# mode -> (what to call it in a message, the payload key that names the
+# artifact this action produced, verifier)
 #
 # Deliberately short. Every entry costs a network round trip on the
 # request path, so this covers the actions that are expensive to get
@@ -45,20 +46,50 @@ import logging
 _VERIFIERS = {}
 
 
-def register(mode: str, label: str, fn):
-    _VERIFIERS[mode] = (label, fn)
+def register(mode: str, label: str, id_key: str, fn):
+    _VERIFIERS[mode] = (label, id_key, fn)
 
 
 def is_verifiable(mode: str) -> bool:
     return mode in _VERIFIERS
 
 
+def applies(mode: str, payload: dict) -> bool:
+    """Whether there is anything to check.
+
+    A mode is reused across every outcome a handler can report -- success,
+    a parse failure, "scrapped it", the boss never finishing a pending
+    reply, the remote API rejecting the request. Only the success path
+    produces an id. On every other path, `verify()` used to be called
+    anyway, find no id, come back "unknown", and append "I couldn't
+    confirm it went through, though -- worth checking" onto a response
+    that had already said "Failed to create event: 400" or "Couldn't
+    send that, boss -- ..." in the same breath. Confirmed live: this
+    covers every non-success branch of _cmd_calendar_add, _cmd_email_send
+    and _cmd_email_compose_send, not just one.
+
+    The handler's own response is already the complete, correct answer
+    for those paths. Nothing here should touch it."""
+    entry = _VERIFIERS.get(mode)
+    if not entry:
+        return False
+    _, id_key, _ = entry
+    return bool(payload.get(id_key))
+
+
 def verify(mode: str, payload: dict) -> dict:
-    """Returns {"state", "detail", "label"}. Never raises."""
+    """Returns {"state", "detail", "label"}. Never raises.
+
+    Callers on the real dispatch path check applies() first and skip this
+    entirely when it would return False -- see its docstring. Kept
+    callable on an empty payload regardless, since tests exercise it
+    directly and a verifier being asked to check nothing should still
+    behave (message_exists("")/event_exists("") already answer "unknown"
+    on their own for exactly that input)."""
     entry = _VERIFIERS.get(mode)
     if not entry:
         return {"state": "unknown", "detail": "nothing registered", "label": ""}
-    label, fn = entry
+    label, _id_key, fn = entry
     try:
         result = fn(payload) or {}
     except Exception as e:
@@ -113,6 +144,6 @@ def _calendar_add(payload: dict) -> dict:
 # responses with -- tests/test_outcome_verify.py asserts these still
 # exist in server.py, so a renamed mode can't silently switch
 # verification off.
-register("email_send", "sent that email", _gmail_send)
-register("email_compose_send", "sent that email", _gmail_send)
-register("calendar", "added that to your calendar", _calendar_add)
+register("email_send", "sent that email", "message_id", _gmail_send)
+register("email_compose_send", "sent that email", "message_id", _gmail_send)
+register("calendar", "added that to your calendar", "event_id", _calendar_add)
