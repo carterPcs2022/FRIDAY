@@ -174,20 +174,22 @@ class TestTheSendCapturesAnId:
 
 
 class TestWiredIntoDispatch:
-    """The unit tests above all pass with the wiring deleted, so this is
-    where the feature is actually proved."""
+    """Split deliberately into "does _verify_outcome do the right thing"
+    and "does dispatch call it".
 
-    @pytest.fixture
-    def sending(self, monkeypatch):
-        """A handler that reports a successful send, with the verifier
-        under the test's control."""
-        import server
-        gmail = mock.Mock()
-        gmail.send_is_connected.return_value = True
-        gmail.send_draft.return_value = {"ok": True, "to": "jane@example.com",
-                                         "message_id": "abc"}
-        monkeypatch.setattr(server, "friday_gmail", gmail, raising=False)
-        return gmail
+    The first version of this drove everything through /command and
+    asserted on the resulting mode. It passed locally and failed in CI,
+    because friday_brain doesn't import there -- the email handler never
+    engaged, the request fell through to emergency(), and the assertions
+    were about a path that never ran. Which handler answers depends on
+    which optional packages installed, so a test shaped that way measures
+    the environment, not the code.
+    """
+
+    def _response(self, app, mode="email_send", text="Sent.", **extra):
+        from flask import jsonify
+        with app.test_request_context():
+            return jsonify({"response": text, "mode": mode, **extra})
 
     def _verifier(self, monkeypatch, state, detail=""):
         monkeypatch.setattr(verify, "_VERIFIERS", dict(verify._VERIFIERS))
@@ -195,53 +197,100 @@ class TestWiredIntoDispatch:
                         lambda p: {"state": state, "detail": detail})
 
     def test_a_contradicted_send_is_retracted_in_the_reply(
-            self, app, client, sending, monkeypatch):
+            self, app, monkeypatch):
         """The whole point. She said it went; it didn't; the boss must be
         told before he assumes it did."""
+        import server
         self._verifier(monkeypatch, "contradicted", "no such message")
 
-        body = client.post("/command", json={"prompt": "send it"}).get_json()
+        with app.test_request_context():
+            out = server._verify_outcome(self._response(app), None)
 
-        assert body["mode"] == "email_send"
+        body = out.get_json()
         assert "Correction" in body["response"]
         assert body["verified"] == "contradicted"
 
     def test_an_unconfirmable_send_is_flagged_not_retracted(
-            self, app, client, sending, monkeypatch):
+            self, app, monkeypatch):
+        import server
         self._verifier(monkeypatch, "unknown", "network down")
 
-        body = client.post("/command", json={"prompt": "send it"}).get_json()
+        with app.test_request_context():
+            body = server._verify_outcome(self._response(app), None).get_json()
 
-        assert body["mode"] == "email_send"
+        assert body["response"].startswith("Sent.")
         assert "couldn't confirm" in body["response"].lower()
 
-    def test_an_unverifiable_mode_is_left_completely_alone(self, app, client):
-        """Verification costs a round trip, so it must not run for the
-        modes with no verifier -- which is nearly all of them."""
-        body = client.post("/command", json={"prompt": "hello there"}).get_json()
+    def test_a_confirmed_send_is_left_exactly_alone(self, app, monkeypatch):
+        import server
+        self._verifier(monkeypatch, "confirmed")
+
+        with app.test_request_context():
+            body = server._verify_outcome(self._response(app), None).get_json()
+
+        assert body["response"] == "Sent."
         assert "verified" not in body
 
+    def test_an_unverifiable_mode_is_left_completely_alone(self, app):
+        """Verification costs a round trip, so it must not run for the
+        modes with no verifier -- which is nearly all of them."""
+        import server
+        with app.test_request_context():
+            body = server._verify_outcome(
+                self._response(app, mode="weather", text="Sunny."), None).get_json()
+
+        assert body["response"] == "Sunny." and "verified" not in body
+
     def test_a_contradicted_action_is_a_failure_in_the_ledger(
-            self, app, client, sending, monkeypatch):
+            self, app, monkeypatch):
+        import server
         from core import action_ledger
         self._verifier(monkeypatch, "contradicted", "no such message")
+        entry = action_ledger.record("send it", "")
 
-        client.post("/command", json={"prompt": "send it"})
+        with app.test_request_context():
+            server._verify_outcome(self._response(app), entry)
 
-        entry = action_ledger.recent()[0]
-        assert entry["detail"].startswith("email_send")
-        assert entry["status"] == "failed"
+        assert action_ledger.recent()[0]["status"] == "failed"
 
     def test_an_unconfirmable_action_is_not_recorded_as_a_failure(
-            self, app, client, sending, monkeypatch):
+            self, app, monkeypatch):
         """She did the work and the service accepted it; only the
         confirmation is missing. Logging that as failure would fill the
         ledger with phantom breakage every time the network hiccuped."""
+        import server
         from core import action_ledger
         self._verifier(monkeypatch, "unknown", "network down")
+        entry = action_ledger.record("send it", "")
 
-        client.post("/command", json={"prompt": "send it"})
+        with app.test_request_context():
+            server._verify_outcome(self._response(app), entry)
 
-        entry = action_ledger.recent()[0]
-        assert entry["detail"].startswith("email_send")
-        assert entry["status"] == "ok"
+        assert action_ledger.recent()[0]["status"] == "ok"
+
+    def test_dispatch_actually_calls_verification(self, app, client, monkeypatch):
+        """The tests above all pass with the call site deleted -- this is
+        the one that proves the feature is reachable at all."""
+        import server
+        seen = []
+        real = server._verify_outcome
+        monkeypatch.setattr(server, "_verify_outcome",
+                            lambda r, e: (seen.append(1), real(r, e))[1])
+
+        client.post("/command", json={"prompt": "hello there"})
+
+        assert seen, "_handle_prompt never called _verify_outcome"
+
+    def test_verification_runs_once_per_request_not_per_hop(
+            self, app, client, monkeypatch):
+        import server
+        seen = []
+        real = server._verify_outcome
+        monkeypatch.setattr(server, "_verify_outcome",
+                            lambda r, e: (seen.append(1), real(r, e))[1])
+        monkeypatch.setattr(server, "_split_commands",
+                            lambda p: ["what's the weather", "check my email"])
+
+        client.post("/command", json={"prompt": "weather and email"})
+
+        assert len(seen) == 1
