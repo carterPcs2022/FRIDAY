@@ -16,6 +16,24 @@ search results instead of crashing.
 import os
 from datetime import datetime
 
+# Every friday_brain.think() call below is pure LLM improv over an
+# MCU-style prompt with zero real sensor/threat/medical data behind it
+# (see the module docstring) -- but the prompts themselves ask for a
+# "Clinical tone" / "Alert tone" / "Lives depend on this" and nothing
+# ever told the model it was allowed to say "no real data." Confirmed
+# live: "run a critical scan" invented a fully specific, alarming fake
+# medical emergency (SpO2 84%, lactate 4.2, septic shock risk, recommend
+# ICU transfer) with nothing behind it at all. Appended to every prompt
+# in this file that produces a "scan"/"detection"/"analysis"-shaped
+# reply, same discipline _cmd_probability and cross_check's
+# _NO_HALLUCINATION_CONSTRAINT already apply elsewhere.
+_NO_FABRICATION = (
+    " You have no real sensors, medical instruments, or threat data behind "
+    "you here -- this is FRIDAY's own reasoning, nothing else. Keep the "
+    "in-character tone, but do not invent specific numbers, vitals, "
+    "coordinates, or readings as if a real instrument produced them."
+)
+
 
 class FridayMCUCapabilities:
 
@@ -26,7 +44,7 @@ class FridayMCUCapabilities:
         result = friday_brain.think(
             f"Physics/consequence analysis:\n{situation}\n\n"
             f"Calculate risk, collateral damage, safe parameters, "
-            f"recommended approach. Be precise. Lives depend on this."
+            f"recommended approach. Be precise." + _NO_FABRICATION
         )
         return {"analysis": result.get("response", "")}
 
@@ -34,7 +52,7 @@ class FridayMCUCapabilities:
         from core.friday_brain import friday_brain
         result = friday_brain.think(
             f"Emergency evacuation:\nSituation: {situation}\nLocation: {location}\n\n"
-            f"Immediate actions, routes, contacts, timeline. Fast. Decisive."
+            f"Immediate actions, routes, contacts, timeline. Fast, decisive." + _NO_FABRICATION
         )
         return {"plan": result.get("response", "")}
 
@@ -45,7 +63,7 @@ class FridayMCUCapabilities:
         result = friday_brain.think(
             f"Fighting pattern analysis: {target}\nInfo: {info}\n\n"
             f"Primary strategy, key weaknesses, exploitable patterns, "
-            f"counter-approach. FRIDAY style. Fast."
+            f"counter-approach. FRIDAY style. Fast." + _NO_FABRICATION
         )
         return {"analysis": result.get("response", "")}
 
@@ -84,7 +102,7 @@ class FridayMCUCapabilities:
             + ("\nSearch results:\n" + "\n".join(
                 f"- {r.get('title', '')}: {r.get('snippet', '')[:100]}" for r in results[:3]
             ) if results else "")
-            + "\n\nBrief. FRIDAY style."
+            + "\n\nBrief. FRIDAY style." + _NO_FABRICATION
         )
         return {"query": query, "brief": analysis.get("response", "")}
 
@@ -101,7 +119,7 @@ class FridayMCUCapabilities:
             + ("\nResults:\n" + "\n".join(
                 f"- {r.get('title', '')}: {r.get('snippet', '')[:100]}" for r in results[:5]
             ) if results else "")
-            + "\nKey developments. Brief."
+            + "\nKey developments. Brief." + _NO_FABRICATION
         )
         return {"topic": topic, "brief": analysis.get("response", "")}
 
@@ -121,7 +139,7 @@ class FridayMCUCapabilities:
         from core.friday_brain import friday_brain
         result = friday_brain.think(
             f"Disaster scan — {location or 'current area'}.\n"
-            f"Identify: threat type, civilian risk, immediate actions needed. Scanning mode."
+            f"Identify: threat type, civilian risk, immediate actions needed. Scanning mode." + _NO_FABRICATION
         )
         return {"scan": result.get("response", "")}
 
@@ -140,7 +158,7 @@ class FridayMCUCapabilities:
         from core.friday_brain import friday_brain
         result = friday_brain.think(
             f"Object detection:\nSensor data: {sensor_data or 'anomaly detected'}\n\n"
-            f"Identify, classify threat level, recommend action. Alert tone."
+            f"Identify, classify threat level, recommend action. Alert tone." + _NO_FABRICATION
         )
         return {"detection": result.get("response", "")}
 
@@ -172,7 +190,7 @@ class FridayMCUCapabilities:
         from core.friday_brain import friday_brain
         result = friday_brain.think(
             f"Critical scan of {subject or 'current situation'}.\n"
-            f"Assess severity, immediate risks, recommended interventions. Clinical tone."
+            f"Assess severity, immediate risks, recommended interventions. Clinical tone." + _NO_FABRICATION
         )
         try:
             from services.friday_voice import speak
@@ -241,7 +259,19 @@ CAPABILITY_MAP = {
     "analyze fighting": (lambda q: friday_caps.analyze_fighting_pattern(q), "analysis"),
     "fighting pattern": (lambda q: friday_caps.analyze_fighting_pattern(q), "analysis"),
     "contusion": (lambda q: friday_caps.contusion_check(q), "checked"),
-    "emergency contact": (lambda q: friday_caps.emergency_contact(q), "contacted"),
+    # Was the bare phrase "emergency contact" -- unlike every other key
+    # here, that's ordinary English that shows up in mundane, unrelated
+    # requests ("who's my emergency contact", "update my emergency
+    # contact info"), and unlike the rest of this map, this one call has
+    # a real side effect: a genuine critical Pushover alert plus a
+    # spoken "Emergency services contacted" line, with no confirmation
+    # gate (see core/capability_registry.py's metadata for this key --
+    # simulated=False, requires_confirmation=False, on purpose, it's
+    # meant to be a real panic-button). A false trigger off an innocuous
+    # sentence means a false "emergency services contacted" claim landing
+    # as a real phone alert. Narrowed to a phrase nobody types by
+    # accident while still being one a real invocation would use.
+    "emergency contact protocol": (lambda q: friday_caps.emergency_contact(q), "contacted"),
     "intel on": (lambda q: friday_caps.government_intel(q), "brief"),
     "scan for": (lambda q: friday_caps.disaster_scan(q), "scan"),
     "atmospheric": (lambda q: friday_caps.atmospheric_detection(q), "detection"),

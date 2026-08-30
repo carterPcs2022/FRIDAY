@@ -147,7 +147,7 @@ _CHAT_CAPABILITY_META: dict[str, tuple] = {
     "analyze fighting": ("Fighting-pattern analysis via FRIDAY's reasoning", False, False, _brain_available),
     "fighting pattern": ("Fighting-pattern analysis via FRIDAY's reasoning", False, False, _brain_available),
     "contusion": ("Logs a contusion check and speaks the area — no medical system behind it", False, False, None),
-    "emergency contact": ("Speaks an emergency-contacted line and sends a critical Pushover alert", False, False, None),
+    "emergency contact protocol": ("Speaks an emergency-contacted line and sends a critical Pushover alert", False, False, None),
     "intel on": ("Intelligence brief via FRIDAY's reasoning, plus a web search if available", False, False, _brain_available),
     "scan for": ("Disaster-scan brief via FRIDAY's reasoning", False, False, _brain_available),
     "atmospheric": ("Object-detection brief via FRIDAY's reasoning", False, False, _brain_available),

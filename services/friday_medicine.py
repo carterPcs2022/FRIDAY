@@ -9,7 +9,11 @@ import json, time
 from pathlib import Path
 from datetime import datetime
 
+from db import turso_http_client as turso
+
 MEDICINE_FILE = Path("memory/friday_medicine.json")
+MEDICINE_TABLE = "medicine_state"
+MEDICINE_KEY = "medicine"
 
 class MedicineTracker:
 
@@ -167,6 +171,26 @@ class MedicineTracker:
         return "; ".join(lines)
 
     def _load(self) -> dict:
+        # Turso first, local JSON as the fallback -- same pattern as
+        # services/friday_spotify.py's token persistence and
+        # services/friday_goals.py's goal state. Confirmed live: a
+        # medicine added mid-session ("add medicine vitamin d every
+        # morning", then logged as taken) was completely gone --
+        # "No medicines currently tracked, boss." -- after the process
+        # restarted (no redeploy involved). MEDICINE_FILE alone doesn't
+        # survive that; every other tracker with real state already
+        # mirrors to Turso for exactly this reason.
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(MEDICINE_TABLE)
+                row = turso.kv_get(MEDICINE_TABLE, MEDICINE_KEY)
+                if row:
+                    return row
+            except Exception as e:
+                print(f"[Turso] medicine read failed, falling back to local JSON: {e}")
+        return self._read_local()
+
+    def _read_local(self) -> dict:
         if MEDICINE_FILE.exists():
             with open(MEDICINE_FILE) as f:
                 try: return json.load(f)
@@ -177,6 +201,13 @@ class MedicineTracker:
         MEDICINE_FILE.parent.mkdir(exist_ok=True)
         with open(MEDICINE_FILE, "w") as f:
             json.dump(data, f, indent=2)
+
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(MEDICINE_TABLE)
+                turso.kv_set(MEDICINE_TABLE, MEDICINE_KEY, data)
+            except Exception as e:
+                print(f"[Turso] medicine write failed, local JSON already has it: {e}")
 
 
 medicine_tracker = MedicineTracker()

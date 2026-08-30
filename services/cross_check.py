@@ -102,6 +102,20 @@ class CrossCheck:
             return f"(Couldn't reach JARVIS: {e})"
 
     def _judge(self, question: str, friday_answer: str, jarvis_answer: str) -> dict:
+        # _ask_jarvis()'s four failure paths (no token, non-200, timeout/
+        # network error, empty body) all come back as a parenthesized
+        # placeholder, never a real answer. Handing one to the model here
+        # anyway used to get it judged like a genuine opinion -- confirmed
+        # live: "(JARVIS returned 503)" was scored "AGREE Both advise
+        # obtaining an independent specialist's opinion," inventing an
+        # opinion JARVIS never gave. There is nothing to compare against,
+        # so say that instead of asking the model to judge a non-answer.
+        if jarvis_answer.strip().startswith("("):
+            return {
+                "aligned": None,
+                "note": "Couldn't compare — JARVIS didn't give a real answer to check against.",
+            }
+
         from core.friday_brain import friday_brain
 
         result = friday_brain.think(

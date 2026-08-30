@@ -6,7 +6,11 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta
 
+from db import turso_http_client as turso
+
 GOALS_FILE = Path("memory/friday_goals.json")
+GOALS_TABLE = "goals_state"
+GOALS_KEY = "goals"
 
 
 class GoalTracker:
@@ -154,6 +158,26 @@ class GoalTracker:
         return ""
 
     def _load(self) -> dict:
+        # Turso first, local JSON as the fallback -- same pattern as
+        # services/friday_spotify.py's token persistence, and it matters
+        # here for the same reason: render.yaml mounts no disk, so a goal
+        # kept only in the local file is lost on every redeploy and every
+        # container restart. Confirmed live: a goal added mid-session
+        # (no redeploy involved, just the process restarting) was gone
+        # the next time GoalTracker was constructed -- init_default_goals()
+        # then re-seeded the three starting goals because get_active_goals()
+        # came back empty, silently discarding it rather than erroring.
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(GOALS_TABLE)
+                row = turso.kv_get(GOALS_TABLE, GOALS_KEY)
+                if row:
+                    return row
+            except Exception as e:
+                print(f"[Turso] goals read failed, falling back to local JSON: {e}")
+        return self._read_local()
+
+    def _read_local(self) -> dict:
         if GOALS_FILE.exists():
             try:
                 return json.loads(GOALS_FILE.read_text())
@@ -164,6 +188,13 @@ class GoalTracker:
     def _save(self):
         GOALS_FILE.parent.mkdir(parents=True, exist_ok=True)
         GOALS_FILE.write_text(json.dumps(self._goals, indent=2))
+
+        if turso.is_configured():
+            try:
+                turso.ensure_kv_table(GOALS_TABLE)
+                turso.kv_set(GOALS_TABLE, GOALS_KEY, self._goals)
+            except Exception as e:
+                print(f"[Turso] goals write failed, local JSON already has it: {e}")
 
 
 goals = GoalTracker()

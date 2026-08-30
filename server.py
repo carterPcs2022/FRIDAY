@@ -2170,7 +2170,16 @@ def _cmd_cross_check(prompt, p_lower):
         result = cross_check.ask_both(question)
         friday_side = result["friday"][:150]
         jarvis_side = result["jarvis"][:150]
-        if result["agreement"]["aligned"]:
+        aligned = result["agreement"]["aligned"]
+        if aligned is None:
+            # JARVIS didn't give a real answer (unreachable, errored, no
+            # token) -- cross_check.py's _judge() no longer scores that
+            # against FRIDAY's answer, so this must not say "we agree" or
+            # "we don't agree" either; both claim a comparison that never
+            # happened. Confirmed live: a JARVIS 503 got reported as "We're
+            # aligned, boss," inventing an opinion JARVIS never gave.
+            response = f"Couldn't reach JARVIS for a real comparison, boss. Me: \"{friday_side}\""
+        elif aligned:
             response = (
                 f"We're aligned, boss. Me: \"{friday_side}\" "
                 f"JARVIS: \"{jarvis_side}\""
