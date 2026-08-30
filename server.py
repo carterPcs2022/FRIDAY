@@ -2485,11 +2485,22 @@ def _match_named_goal(prompt: str, active: list) -> dict | None:
                 return word[: -len(suf)]
         return word
 
+    def _overlaps(a: str, b: str) -> bool:
+        # Prefix match rather than exact equality -- stripping "-ing" off
+        # a doubled final consonant is a real English spelling rule this
+        # naive stemmer doesn't implement ("running" -> "runn", not
+        # "run"), and exact-equality matching missed a goal named "run a
+        # 5k" against "how am i doing on running" entirely because of it.
+        # A stem that's a prefix of the other, both at least 3 chars,
+        # catches that without needing a real doubling rule.
+        shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+        return len(shorter) >= 3 and longer.startswith(shorter)
+
     prompt_stems = {_stem(w) for w in _words(prompt)}
     best, best_score = None, 0
     for g in active:
         name_stems = {_stem(w) for w in _words(g.get("name", ""))}
-        score = len(prompt_stems & name_stems)
+        score = sum(1 for p in prompt_stems for n in name_stems if _overlaps(p, n))
         if score > best_score:
             best_score, best = score, g
     return best
