@@ -94,6 +94,21 @@ class TestGoalReportAnswersTheNamedGoal:
     def test_no_match_when_nothing_overlaps(self, app):
         assert server._match_named_goal("goal report", self.ACTIVE) is None
 
+    def test_matches_running_to_a_run_goal_despite_the_doubled_consonant(self, app):
+        """"running" naively stemmed by stripping "-ing" leaves "runn",
+        not "run" -- English doubles the final consonant before "-ing"
+        and the stemmer doesn't undo that. Confirmed live: a goal named
+        "run a 5k" wasn't matched by "how am i doing on running" at all
+        until _match_named_goal compared stems by prefix instead of exact
+        equality."""
+        active = self.ACTIVE + [{"name": "run a 5k", "sessions": 0, "last_worked": None}]
+        assert server._match_named_goal("how am i doing on running", active) \
+            == active[-1]
+        # The doubled-consonant fix must not make matching so loose that
+        # the original, unrelated-word case starts colliding.
+        assert server._match_named_goal("how am i doing on reading", active) \
+            == self.ACTIVE[1]
+
     def test_named_goal_gets_its_own_focused_question_not_the_full_dump(self, app):
         p = "how am i doing on reading"
         fake_goals = mock.Mock()
