@@ -274,9 +274,10 @@ except Exception as e:
     logging.warning(f"Journal failed: {e}")
 
 try:
-    from services.friday_calendar import friday_calendar
+    from services.friday_calendar import friday_calendar, friday_google_calendar
 except Exception as e:
     friday_calendar = None
+    friday_google_calendar = None
     logging.warning(f"Calendar failed: {e}")
 
 try:
@@ -715,6 +716,7 @@ __all__ = [
     "finance",
     "friday_brain",
     "friday_calendar",
+    "friday_google_calendar",
     "friday_caps",
     "friday_code",
     "friday_contacts",

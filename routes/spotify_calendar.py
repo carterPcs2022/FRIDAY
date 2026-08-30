@@ -7,6 +7,7 @@ from flask import Blueprint, request, jsonify, redirect
 
 from core.app_state import (
     friday_calendar,
+    friday_google_calendar,
     friday_spotify,
 )
 
@@ -33,21 +34,25 @@ def spotify_callback():
     return jsonify(result), 400
 
 
+# The /auth + /callback endpoints are the Google OAuth flow specifically,
+# so they target the Google instance regardless of which backend is
+# active. Apple needs no browser flow -- it's configured with an
+# app-specific password via env vars (see services/friday_apple_calendar.py).
 @spotify_calendar_bp.route("/friday/calendar/auth")
 def calendar_auth():
-    if not friday_calendar or not friday_calendar.is_configured():
-        return "Calendar not configured", 500
-    return redirect(friday_calendar.auth_url())
+    if not friday_google_calendar or not friday_google_calendar.is_configured():
+        return "Google Calendar not configured", 500
+    return redirect(friday_google_calendar.auth_url())
 
 
 @spotify_calendar_bp.route("/friday/calendar/callback")
 def calendar_callback():
-    if not friday_calendar:
-        return "Calendar not configured", 500
+    if not friday_google_calendar:
+        return "Google Calendar not configured", 500
     code = request.args.get("code", "")
     if not code:
         return jsonify({"error": request.args.get("error", "No code provided")}), 400
-    result = friday_calendar.exchange_code(code)
+    result = friday_google_calendar.exchange_code(code)
     if result.get("ok"):
         return "Calendar connected. You can close this tab, boss."
     return jsonify(result), 400
