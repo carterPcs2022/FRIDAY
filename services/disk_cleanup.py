@@ -14,6 +14,7 @@ LOGS_DIR = BASE_DIR / "logs"
 
 _HOUR = 3600
 _DAY = 86400
+_MINUTE = 60
 
 
 def _age_seconds(path: Path) -> float:
@@ -27,13 +28,19 @@ def clean() -> dict:
     freed = 0
     removed = []
 
-    # Voice mp3s older than 1 hour — friday_voice.py's own naming
+    # Voice mp3s older than 10 minutes — friday_voice.py's own naming
     # (friday_voice_<epoch_ms>.mp3), matched by prefix so this doesn't
-    # sweep up anything else that might land in static/.
+    # sweep up anything else that might land in static/. Was 1 hour, cut
+    # down alongside core/autonomous_agent.py's sweep interval (12h -> 10m):
+    # these files count against the container's memory cgroup on Render's
+    # free plan, and a burst of spoken replies filled enough of it to get
+    # the process OOM-killed mid-request before an hour-old file was ever
+    # eligible to be swept. 10 minutes is well past how long a client
+    # takes to fetch a clip after the response that named it.
     try:
         for path in STATIC_DIR.glob("friday_voice_*.mp3"):
             try:
-                if _age_seconds(path) > _HOUR:
+                if _age_seconds(path) > 10 * _MINUTE:
                     size = path.stat().st_size
                     path.unlink()
                     freed += size
