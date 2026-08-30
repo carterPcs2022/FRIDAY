@@ -41,7 +41,16 @@ class SecondBrain:
             clean = re.sub(r"```json|```", "", extraction).strip()
             data = json.loads(clean)
         except Exception:
-            data = {"summary": extraction[:200], "insights": []}
+            # extraction is supposed to be JSON (raw=True) -- when it
+            # fails to parse, that's broken JSON syntax (usually a
+            # max_tokens cutoff mid-object), not readable prose. Using it
+            # as the summary anyway leaked exactly that live: "Stored:
+            # {\"insights\":[\"User has an anniversary on June
+            # 3rd\",\"User explicitly requests the system" -- a raw,
+            # truncated JSON fragment surfaced as if it were a clean
+            # summary. No summary is honest here; _cmd_remember_this
+            # already reads an empty one as "Stored, boss."
+            data = {"summary": "", "insights": []}
 
         entry_id = hashlib.md5(content[:100].encode()).hexdigest()[:12]
         entry = {

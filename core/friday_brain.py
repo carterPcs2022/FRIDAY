@@ -521,7 +521,13 @@ class FridayBrain:
     def _clean(self, text: str) -> str:
         """Clean response for voice output."""
         if not text:
-            return "Give me a second, boss."
+            # Was "Give me a second, boss." -- which reads as "I'm still
+            # working on it, ask again shortly." Nothing is in flight:
+            # the provider already returned, with an empty completion,
+            # and there is no retry underway. Confirmed live on
+            # _cmd_travel: an empty completion produced this line with no
+            # travel brief ever following it. Say what actually happened.
+            return "Didn't get anything back there, boss — try that again?"
         text = re.sub(r'```[\s\S]*?```', '', text)
         text = re.sub(r'`[^`]+`', '', text)
         text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
