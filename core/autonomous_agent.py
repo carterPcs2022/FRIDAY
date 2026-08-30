@@ -44,7 +44,17 @@ class AutonomousAgent:
             ("goal_nudge", self._goal_nudge, 86400),
             ("calibration_check", self._calibration_check, 86400),
             ("mac_bridge_check", self._mac_bridge_check, 1800),
-            ("disk_cleanup", self._disk_cleanup, 43200),
+            # Was every 12h -- on Render's free 512MB plan, voice mp3s
+            # (services/friday_voice.py, one per spoken reply) plus
+            # everything else in the container's writable layer count
+            # against that same memory cgroup, so 12h of unswept files
+            # under real usage is enough to OOM-kill the single worker
+            # before this ever runs. Confirmed live: a ~30-request test
+            # burst pushed memory from 456MB to 527MB in under 2 minutes
+            # (Render's own metrics) and the process was killed and
+            # restarted mid-request. Runs every 10 minutes now instead --
+            # see services/disk_cleanup.py's matching TTL cut.
+            ("disk_cleanup", self._disk_cleanup, 600),
             ("medicine_check", self._medicine_check, 300),
             ("memory_backup", self._memory_backup, 86400),
             ("system_health_check", self._system_health_check, 3600),

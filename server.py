@@ -1176,7 +1176,7 @@ RECON_TRIGGERS = [
 # existing normal-mode behavior for anyone who says it outside an
 # emergency context.
 SAFE_TRIGGERS = [
-    "i'm safe", "i am safe", "all clear",
+    "i'm safe", "im safe", "i am safe", "all clear",
     "confirm safe", "safe now", "false alarm",
 ]
 
@@ -1626,6 +1626,20 @@ def _cmd_caller_id(prompt, p_lower):
 
 
 def _cmd_call_initiate(prompt, p_lower):
+    # "remind me to call the dentist tomorrow at 3" contains CALL_TRIGGERS'
+    # "call " as a substring of an ordinary reminder request, and this
+    # handler is checked well before _cmd_reminder in the dispatch chain.
+    # Unlike _SPOTIFY_SHADOWED_TRIGGERS/_REMINDER_SHADOWED_TRIGGERS (one
+    # trigger *list phrase* containing another), this is the boss's own
+    # sentence containing both -- REMINDER_TRIGGERS' "remind me" doesn't
+    # appear inside any CALL_TRIGGERS phrase, so the computed-list trick
+    # those two use doesn't catch it. A false match here isn't just an odd
+    # reply: it returns action:"call" and claims "Calling ... now, boss"
+    # for a request that was never asking to place a call, and the
+    # reminder itself never gets set. Confirmed live. Defer whenever the
+    # prompt also reads as a reminder.
+    if any(t in p_lower for t in REMINDER_TRIGGERS):
+        return None
     if any(t in p_lower for t in CALL_TRIGGERS):
         import re
         match = re.search(
@@ -1766,6 +1780,7 @@ def _cmd_self_audit(prompt, p_lower):
     failing = summary["failing_capabilities"]
     done = counts.get("ok", 0)
     bad = counts.get("failed", 0) + counts.get("abandoned", 0)
+    pending = counts.get("pending", 0)
 
     if not done and not bad:
         response = "Nothing on the books for the last day, boss."
@@ -1782,6 +1797,14 @@ def _cmd_self_audit(prompt, p_lower):
         if counts.get("abandoned"):
             response += (f" {counts['abandoned']} of those started and never "
                          f"finished, which usually means a timeout.")
+
+    # Every branch above talks as if the ledger only has done/bad rows --
+    # confirmed live: "17 actions in the last day, all clean" while
+    # summary.counts.pending was 1. A pending action isn't "failed" or
+    # "abandoned" either, so it never showed up in any branch's math.
+    # Named once here regardless of which branch produced the response.
+    if pending:
+        response += f" {pending} still in flight."
 
     _log(prompt, response, "self_audit")
     return jsonify({"response": response, "mode": "self_audit",
@@ -2240,8 +2263,14 @@ def _cmd_travel(prompt, p_lower):
 
 def _cmd_spotify_stop(prompt, p_lower):
     if any(t in p_lower for t in SPOTIFY_STOP_TRIGGERS) and friday_spotify:
-        friday_spotify.pause()
-        response = "Pausing, boss."
+        # Used to say "Pausing, boss." unconditionally, whatever pause()
+        # actually returned -- so right after play() honestly reported
+        # "Spotify not authenticated" (nothing playing), "pause" still
+        # confidently claimed to have paused it. Confirmed live. pause()
+        # already reports {"paused": bool} or {"error": ...}; only the
+        # caller wasn't looking at it.
+        result = friday_spotify.pause()
+        response = "Pausing, boss." if result.get("paused") else result.get("error", "Nothing to pause, boss.")
         _log(prompt, response, "spotify")
         return jsonify({"response": response, "mode": "spotify"})
 
@@ -2430,21 +2459,65 @@ def _cmd_calendar_add(prompt, p_lower):
                     "event_id": (created or {}).get("event_id", "")})
 
 
+def _match_named_goal(prompt: str, active: list) -> dict | None:
+    """Finds the single active goal a prompt like "how am i doing on
+    reading" is asking about, by word-stem overlap against each goal's
+    name -- a bare substring check misses "reading" vs a goal named "Read
+    12 books this year" in both directions, and the two words need to
+    match despite the suffix."""
+    import re as rex
+
+    def _words(text: str) -> set[str]:
+        return set(rex.findall(r"[a-z]+", text.lower()))
+
+    def _stem(word: str) -> str:
+        for suf in ("ing", "ed", "es", "s"):
+            if word.endswith(suf) and len(word) > len(suf) + 2:
+                return word[: -len(suf)]
+        return word
+
+    prompt_stems = {_stem(w) for w in _words(prompt)}
+    best, best_score = None, 0
+    for g in active:
+        name_stems = {_stem(w) for w in _words(g.get("name", ""))}
+        score = len(prompt_stems & name_stems)
+        if score > best_score:
+            best_score, best = score, g
+    return best
+
+
 def _cmd_goal_report(prompt, p_lower):
     if any(t in p_lower for t in GOAL_REPORT_TRIGGERS) and goals:
         active = goals.get_active_goals()
         if not active:
             response = "No goals tracked yet, boss. Tell me your goals and I'll track them."
         elif friday_brain:
-            result = friday_brain.think(
-                f"Quick goal status for {len(active)} active goals:\n"
-                + "\n".join(
-                    f"- {g['name']}: {g.get('sessions', 0)} sessions, "
-                    f"last worked {(g.get('last_worked') or 'never')[:10]}"
-                    for g in active
+            # Asking about one goal by name used to still get every active
+            # goal dumped into one "under 40 words" summary -- confirmed
+            # live: asked "how am i doing on reading" right after adding a
+            # reading goal, got back unrelated goals with the model
+            # running out of its word budget and cutting off mid-word on
+            # the last one. Answering the named goal alone, with its own
+            # budget, avoids both: it's on-topic and it doesn't have to
+            # squeeze N goals into one reply.
+            target = _match_named_goal(prompt, active)
+            if target:
+                result = friday_brain.think(
+                    f"Goal status for '{target['name']}': "
+                    f"{target.get('sessions', 0)} sessions, "
+                    f"last worked {(target.get('last_worked') or 'never')[:10]}.\n\n"
+                    f"Brief status, boss. Under 30 words. FRIDAY style."
                 )
-                + "\n\nBrief status. Under 40 words. FRIDAY style."
-            )
+            else:
+                result = friday_brain.think(
+                    f"Quick goal status for {len(active)} active goals:\n"
+                    + "\n".join(
+                        f"- {g['name']}: {g.get('sessions', 0)} sessions, "
+                        f"last worked {(g.get('last_worked') or 'never')[:10]}"
+                        for g in active
+                    )
+                    + f"\n\nBrief status for each. Under {max(40, 20 * len(active))} words. FRIDAY style."
+                )
             response = result["response"]
         else:
             response = f"{len(active)} active goals, boss."
@@ -2639,10 +2712,13 @@ def _cmd_email_triage(prompt, p_lower):
         summary = triage.get("summary", "")
         cats = triage.get("categories", {})
         urgent = cats.get("urgent", [])
-        response = (
-            f"Inbox triage complete, boss. {summary}.\n"
-            f"Urgent: {', '.join(urgent[:2]) if urgent else 'none'}."
-        )
+        response = "Inbox triage complete, boss."
+        # An empty summary (nothing to triage) used to still get spliced
+        # in unconditionally, producing "...complete, boss. .\nUrgent:
+        # none." -- confirmed live on an empty inbox.
+        if summary:
+            response += f" {summary}."
+        response += f"\nUrgent: {', '.join(urgent[:2]) if urgent else 'none'}."
         _log(prompt, response, "email_triage")
         return jsonify({"response": response, "triage": triage, "mode": "email_triage"})
 

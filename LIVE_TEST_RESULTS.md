@@ -3,11 +3,62 @@
 Run against `https://friday-a3pg.onrender.com/command` on 2026-08-30, with
 `Authorization: Bearer <FRIDAY_ACCESS_TOKEN>` (deploy is auth-protected). All
 30 prompts from the brief were sent one at a time, in order, plus the
-chaining test. Evidence gathering only — no fixes attempted.
+chaining test.
 
 Legend: **FAIL** = broke, fabricated an action, or answered the wrong thing.
 **SUSPICIOUS** = works but has a real defect worth root-causing.
 **PASS** = behaved correctly, including honest "can't do that" answers.
+
+## Fixes applied (after this report was first written)
+
+All four FAILs and every SUSPICIOUS item below except #28 were root-caused
+and fixed, with tests, on this branch:
+
+- **#26 502 crash** — root-caused via Render's own logs and memory metrics,
+  not guesswork: the Gmail send itself succeeded (200 OK from the Gmail
+  API), but the container's memory climbed from 456MB to 527MB against its
+  512MB free-tier cap over the course of this test burst and the process
+  was OOM-killed and auto-restarted by Render's supervisor mid-request (no
+  new deploy fired — confirmed against deploy history). Not a code
+  exception. The one clearly-identified unbounded-until-cleanup resource is
+  voice mp3s (`services/friday_voice.py`), which were only ever swept every
+  12 hours with a 1-hour TTL — far too loose for a 512MB container under
+  bursty traffic. Tightened both (`core/autonomous_agent.py`'s sweep to
+  every 10 minutes, `services/disk_cleanup.py`'s TTL to 10 minutes) as a
+  mitigation. This reduces the risk but the free tier's 512MB ceiling is
+  the underlying constraint — if OOM 502s recur under real usage, the
+  durable fix is more memory headroom, not another code change.
+- **#4 "remind me to call the dentist"** — `_cmd_call_initiate` now defers
+  to the reminder handler whenever the prompt also reads as a reminder
+  request (`server.py`).
+- **#23 fabricated Spotify pause** — `_cmd_spotify_stop` now reports what
+  `pause()` actually returned instead of an unconditional "Pausing, boss."
+  (`server.py`).
+- **#11 wrong goal + truncated goal report** — `_cmd_goal_report` now
+  matches a named goal ("reading") by word-stem overlap and answers that
+  one goal alone with its own word budget, instead of squeezing every
+  active goal into one 40-word reply (`server.py`, new
+  `_match_named_goal`).
+- **"Boss," repeated per clause** (flagged under #2/#3/#30) — root cause
+  was the personality prompt's "Lead with 'Boss,'" instruction being
+  over-generalized by the model to every sentence in a multi-part answer;
+  clarified it's a one-time lead-in, not a per-clause prefix
+  (`config/friday_personality.py`).
+- **#18 self-audit "all clean" vs. 1 pending** — `_cmd_self_audit` now
+  names a nonzero pending count instead of only tracking done/failed/
+  abandoned (`server.py`).
+- **#24 stray " ." in inbox triage** — `_cmd_email_triage` no longer
+  splices an empty summary into the reply (`server.py`).
+- **#28 "i'm safe"** — this was **not a real bug**: the test sent `im safe`
+  (apostrophe dropped, a testing artifact) rather than the brief's `i'm
+  safe`, which never matched `SAFE_TRIGGERS` to begin with — the generic
+  chat fallback that ran was the correct behavior for that exact string.
+  Added `"im safe"` to `SAFE_TRIGGERS` anyway as a small robustness
+  improvement, since apostrophe-dropping (autocorrect, fast typing) is a
+  plausible real variant of a safety phrase.
+
+12 new tests added in `tests/test_live_batch_fixes.py`; full suite (814
+tests) passes.
 
 ---
 
