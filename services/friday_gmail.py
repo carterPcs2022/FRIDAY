@@ -102,8 +102,19 @@ class FridayGmail:
         # process, one pending draft at a time is all this needs.
         self._last_draft = {}
 
+    # Almost certainly the "1 of 3 futures unfinished" hang that crashed
+    # a worker via _cmd_catchup (see server.py's CATCHUP_TIMEOUT):
+    # IMAP4_SSL had no timeout at all, so a connect that hangs -- exactly
+    # what this module's own module docstring documents raw SMTP doing on
+    # this host's outbound network, on a different port but the same
+    # non-HTTPS-blocked-or-throttled shape -- blocked forever instead of
+    # failing fast. Every other call catchup makes is bounded somewhere
+    # (search's per-provider timeout, Groq's httpx.Timeout); this was the
+    # one genuinely unbounded one.
+    CONNECT_TIMEOUT = 10  # seconds
+
     def connect(self):
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=self.CONNECT_TIMEOUT)
         mail.login(GMAIL_USER, GMAIL_PASS)
         return mail
 

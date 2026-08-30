@@ -265,6 +265,24 @@ class FridayBrain:
         # may invent plausible-sounding events.
         if any(t in q for t in ["my calendar", "on my schedule", "any meetings",
                                 "any events", "what's on my agenda"]):
+            # "is my calendar even connected" matches "my calendar" above
+            # and used to fall straight into the today's-events branch --
+            # answering a yes/no connectivity question with a guess at
+            # what's on the calendar, which only implies "yes, connected"
+            # rather than saying so, and gives no distinguishable answer
+            # at all when it's connected but empty for the day. "connect"
+            # is checked first and narrowly, on purpose: a genuine
+            # calendar_add phrasing like "set up a meeting on my
+            # calendar" must still fall through to the events branch
+            # below, not get read as asking about connectivity.
+            if any(t in q for t in ["connect", "hooked up"]):
+                try:
+                    from services.friday_calendar import friday_calendar
+                    if friday_calendar.is_connected():
+                        return "Yes, boss — your calendar's connected."
+                except Exception:
+                    pass
+                return "Your calendar isn't connected yet, boss."
             try:
                 from services.friday_calendar import friday_calendar
                 if friday_calendar.is_connected():
