@@ -283,4 +283,34 @@ class FridayCalendar:
         return {"state": "confirmed", "detail": event_id}
 
 
-friday_calendar = FridayCalendar()
+# The Google backend is always instantiated -- the OAuth routes
+# (routes/spotify_calendar.py) reference it explicitly, since the
+# redirect/callback flow is Google-specific.
+friday_google_calendar = FridayCalendar()
+
+
+def _select_backend():
+    """Pick the active calendar backend. FRIDAY_CALENDAR_BACKEND forces it
+    ("apple"/"google"); the default "auto" prefers Apple when it's
+    configured, since that's the calendar the boss actually uses, and
+    falls back to Google otherwise. Every consumer imports `friday_calendar`
+    (this name) from here or via core/app_state, so selecting once here is
+    all it takes -- no call site changes."""
+    pref = os.getenv("FRIDAY_CALENDAR_BACKEND", "auto").strip().lower()
+    try:
+        from services.friday_apple_calendar import friday_apple_calendar
+    except Exception as e:
+        print(f"[FRIDAY Calendar] Apple backend unavailable: {e}")
+        friday_apple_calendar = None
+
+    if pref == "google":
+        return friday_google_calendar
+    if pref == "apple":
+        return friday_apple_calendar or friday_google_calendar
+    # auto
+    if friday_apple_calendar and friday_apple_calendar.is_configured():
+        return friday_apple_calendar
+    return friday_google_calendar
+
+
+friday_calendar = _select_backend()
