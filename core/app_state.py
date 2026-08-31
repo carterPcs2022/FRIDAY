@@ -651,12 +651,20 @@ def get_weather_brief(location: str = "") -> str:
 
 
 def overall_status() -> str:
+    # Lowercase, matching CORE_STATUS's own convention just above ("online"/
+    # "degraded") -- this used to return "ONLINE" while static/js/hud.js's
+    # pollState() checked `d.status === 'online'` (lowercase), a
+    # case-sensitive comparison that could never match. Confirmed live via
+    # a HUD screenshot: a fully healthy system (0 threats, normal CPU/RAM,
+    # friday_brain up) still showed a red "DEGRADED" pill, every time,
+    # because the string this function actually returns never equals the
+    # one thing the client checks for.
     if not friday_brain:
-        return "EMERGENCY"
+        return "emergency"
     brain_status = friday_brain.status()
     if not brain_status.get("groq") and not brain_status.get("anthropic"):
-        return "NO-LLM"
-    return "ONLINE"
+        return "no-llm"
+    return "online"
 
 
 __all__ = [
