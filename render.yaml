@@ -3,5 +3,23 @@ services:
     name: friday
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT
+    # --worker-class gthread --threads 4 (--workers stays 1): gunicorn's
+    # sync default handles exactly one request at a time across the
+    # whole process, so a slow /command call (an LLM round trip plus TTS
+    # generation, easily several seconds) blocks every other request
+    # behind it -- including the HUD's own ~1s /friday/hud/poll loop and
+    # the /friday/voice/audio fetch that plays a reply's audio. That's
+    # the mechanism behind "text appears, voice takes ~30s to speak" --
+    # confirmed as the live symptom, and reproducible from the
+    # architecture alone (single sync worker, constant HUD polling,
+    # request-serializing static/js/hud.js). Threads share one process's
+    # memory instead of forking a second full worker, which matters on
+    # the free tier's 512MB cap (see the OOM findings in
+    # LIVE_TEST_RESULTS.md/_2.md) -- this fixes the queuing without
+    # raising the memory ceiling. server.py's two pending-followup
+    # handlers (_cmd_calendar_add, _cmd_email_compose_send) now hold a
+    # lock across their whole read-decide-write sequence specifically
+    # because this change makes them reachable concurrently for the
+    # first time.
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --worker-class gthread --workers 1 --threads 4
     healthCheckPath: /health

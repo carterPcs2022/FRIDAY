@@ -887,6 +887,10 @@ CALENDAR_ADD_TRIGGERS = [
 # event in prose without ever calling create_event().
 _pending_calendar_add: dict = {}
 CALENDAR_ADD_PENDING_WINDOW = 300  # seconds
+# Guards the whole check-decide-call-write sequence in _cmd_calendar_add --
+# see that function's wrapper for why this exists now that gunicorn runs
+# with multiple threads (render.yaml).
+_calendar_add_lock = threading.Lock()
 
 # Confirmed live: a pending calendar follow-up swallowed the very next
 # message even though it had nothing to do with scheduling -- "the wifi
@@ -955,6 +959,10 @@ COMPOSE_SEND_TRIGGERS = [
 # instead of becoming a fabricated confirmation.
 _pending_compose_send: dict = {}
 COMPOSE_SEND_PENDING_WINDOW = 300  # seconds -- long enough for a natural pause replying to "who's it going to", short enough not to hijack an unrelated later message indefinitely
+# Guards the whole check-decide-call-write sequence in
+# _cmd_email_compose_send -- see that function's wrapper for why this
+# exists now that gunicorn runs with multiple threads (render.yaml).
+_compose_send_lock = threading.Lock()
 CANCEL_TRIGGERS = ["never mind", "nevermind", "cancel that", "forget it", "cancel it"]
 
 # _cmd_calendar_add had the identical shape of this bug, confirmed live:
@@ -2327,6 +2335,20 @@ def _json_from_model(text: str):
 
 
 def _cmd_calendar_add(prompt, p_lower):
+    # Serializes the whole handler: without this, two overlapping
+    # calendar-add-shaped requests on a threaded worker could each read
+    # _pending_calendar_add as empty, both run the (multi-second)
+    # extraction call below, and the second write clobbers the first --
+    # a genuinely new race that didn't exist under gunicorn's old
+    # single-threaded default (render.yaml's startCommand now adds
+    # --threads so /friday/voice/audio and /friday/hud/poll don't queue
+    # for tens of seconds behind a slow /command call). Same fix applied
+    # to _cmd_email_compose_send, for the same reason.
+    with _calendar_add_lock:
+        return _calendar_add_impl(prompt, p_lower)
+
+
+def _calendar_add_impl(prompt, p_lower):
     global _pending_calendar_add
 
     # Function-scoped because several paths below return without ever
@@ -2626,6 +2648,13 @@ def _cmd_email_send(prompt, p_lower):
 
 
 def _cmd_email_compose_send(prompt, p_lower):
+    # Serializes the whole handler -- see _cmd_calendar_add's wrapper for
+    # why this exists.
+    with _compose_send_lock:
+        return _email_compose_send_impl(prompt, p_lower)
+
+
+def _email_compose_send_impl(prompt, p_lower):
     global _pending_compose_send
 
     if _pending_compose_send and time.time() > _pending_compose_send.get("expires", 0):
