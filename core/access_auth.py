@@ -5,10 +5,9 @@ bills, decisions, second_brain, calendar, relationships, finances — all
 of it) had zero authentication. Anyone who found the Render URL could
 talk to FRIDAY and pull personal data with no credential at all;
 friday_security.py's rate-limiting and injection screening stop abuse
-patterns, not identity. This closes that gap with a single shared-secret
-check in front of everything except routes that structurally can't carry
-one (Twilio webhooks — Twilio can't send a bearer token) or are
-deliberately open by design (suit_lockdown's trigger, meant to work from
+patterns, not identity. This closes that gap with a shared-secret check
+in front of everything except deliberately open routes and Twilio
+callbacks, which are separately authenticated with Twilio request signatures. (suit_lockdown's trigger, meant to work from
 a device that's never touched this account before).
 
 Cookie-based rather than requiring every one of ~150 routes' fetch()
@@ -32,8 +31,8 @@ import os
 ACCESS_TOKEN = os.environ.get("FRIDAY_ACCESS_TOKEN", "")
 SESSION_COOKIE = "friday_auth"
 
-# Paths reachable with no session or token — either they can't carry one
-# (webhooks) or are deliberately open by design (lockdown, health checks
+# Paths reachable with no session or token — either they use their own
+# verified signature (Twilio callbacks) or are deliberately open by design (lockdown, health checks
 # for uptime monitors, the status JSON at "/" which carries no personal
 # data, and /login itself).
 EXEMPT_PATHS = {
