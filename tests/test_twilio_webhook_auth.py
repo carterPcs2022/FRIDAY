@@ -23,9 +23,11 @@ def test_valid_twilio_signature_is_accepted(monkeypatch):
     monkeypatch.setenv("PUBLIC_URL", public_url)
 
     app = Flask(__name__)
-    with app.test_request_context(path, method="POST", data=params):
-        signature = _signature(url, params, token)
-        request.headers.environ["HTTP_X_TWILIO_SIGNATURE"] = signature
+    signature = _signature(url, params, token)
+    with app.test_request_context(
+        path, method="POST", data=params,
+        headers={"X-Twilio-Signature": signature},
+    ):
         assert access_auth.validate_twilio_webhook(request) is True
 
 
@@ -41,8 +43,10 @@ def test_invalid_signature_is_rejected(monkeypatch):
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
     monkeypatch.setenv("PUBLIC_URL", "https://friday.example.com")
     app = Flask(__name__)
-    with app.test_request_context("/friday/phone/respond", method="POST"):
-        request.headers.environ["HTTP_X_TWILIO_SIGNATURE"] = "not-a-valid-signature"
+    with app.test_request_context(
+        "/friday/phone/respond", method="POST",
+        headers={"X-Twilio-Signature": "not-a-valid-signature"},
+    ):
         assert access_auth.validate_twilio_webhook(request) is False
 
 
@@ -50,8 +54,10 @@ def test_missing_twilio_configuration_fails_closed(monkeypatch):
     monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("PUBLIC_URL", "https://friday.example.com")
     app = Flask(__name__)
-    with app.test_request_context("/friday/phone/transcribed", method="POST"):
-        request.headers.environ["HTTP_X_TWILIO_SIGNATURE"] = "anything"
+    with app.test_request_context(
+        "/friday/phone/transcribed", method="POST",
+        headers={"X-Twilio-Signature": "anything"},
+    ):
         assert access_auth.validate_twilio_webhook(request) is False
 
 
@@ -59,8 +65,10 @@ def test_non_https_public_url_is_rejected(monkeypatch):
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
     monkeypatch.setenv("PUBLIC_URL", "http://friday.example.com")
     app = Flask(__name__)
-    with app.test_request_context("/friday/phone/call", method="POST"):
-        request.headers.environ["HTTP_X_TWILIO_SIGNATURE"] = "anything"
+    with app.test_request_context(
+        "/friday/phone/call", method="POST",
+        headers={"X-Twilio-Signature": "anything"},
+    ):
         assert access_auth.validate_twilio_webhook(request) is False
 
 
@@ -72,9 +80,10 @@ def test_query_string_is_included_in_signed_url(monkeypatch):
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", token)
     monkeypatch.setenv("PUBLIC_URL", public_url)
     app = Flask(__name__)
-    with app.test_request_context(path, method="POST"):
-        signature = _signature(public_url + path, params, token)
-        request.headers.environ["HTTP_X_TWILIO_SIGNATURE"] = signature
+    signature = _signature(public_url + path, params, token)
+    with app.test_request_context(
+        path, method="POST", headers={"X-Twilio-Signature": signature},
+    ):
         assert access_auth.validate_twilio_webhook(request) is True
 
 
