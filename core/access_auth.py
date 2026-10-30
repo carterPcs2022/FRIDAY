@@ -39,8 +39,6 @@ SESSION_COOKIE = "friday_auth"
 EXEMPT_PATHS = {
     "/", "/health", "/login",
     "/friday/lockdown",
-    "/friday/phone/call", "/friday/phone/respond",
-    "/friday/phone/transcribed", "/friday/phone/sms",
 }
 
 
@@ -76,3 +74,49 @@ def has_valid_session(cookie_value: str) -> bool:
     if not ACCESS_TOKEN:
         return False
     return hmac.compare_digest(cookie_value or "", _session_value())
+
+
+# Twilio callbacks authenticate with X-Twilio-Signature, not FRIDAY's
+# browser/API bearer token. PUBLIC_URL is the canonical external origin;
+# never build the signed URL from an untrusted Host/forwarded-host header.
+TWILIO_WEBHOOK_PATHS = {
+    "/friday/phone/call",
+    "/friday/phone/respond",
+    "/friday/phone/transcribed",
+    "/friday/phone/sms",
+}
+
+
+def is_twilio_webhook(path: str) -> bool:
+    return path in TWILIO_WEBHOOK_PATHS
+
+
+def validate_twilio_webhook(request) -> bool:
+    """Validate a Twilio callback before any handler processes it.
+
+    Missing secrets/configuration, malformed URLs, absent signatures, and
+    validator errors all fail closed. Query strings are part of Twilio's
+    signed callback URL and are therefore included in validation.
+    """
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not auth_token or not public_url or not signature:
+        return False
+
+    from urllib.parse import urlsplit
+    parsed = urlsplit(public_url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+        return False
+
+    try:
+        from twilio.request_validator import RequestValidator
+        query = request.query_string.decode("ascii")
+        signed_url = f"{public_url}{request.path}"
+        if query:
+            signed_url += f"?{query}"
+        return RequestValidator(auth_token).validate(
+            signed_url, request.form.to_dict(flat=True), signature
+        )
+    except Exception:
+        return False
