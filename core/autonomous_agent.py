@@ -58,6 +58,7 @@ class AutonomousAgent:
             ("medicine_check", self._medicine_check, 300),
             ("memory_backup", self._memory_backup, 86400),
             ("system_health_check", self._system_health_check, 3600),
+            ("memory_alarm", self._memory_alarm, 120),
         ]
 
         for name, fn, interval in monitors:
@@ -667,6 +668,51 @@ class AutonomousAgent:
                 self._alert(f"System health check found an issue: {', '.join(failing)}, boss.", priority="high")
         except Exception as e:
             print(f"[Autonomous:system_health_check] {e}")
+
+    # ── Memory alarm ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _memory_used_mb() -> float:
+        """Container memory in MB. Render's OOM killer counts the whole
+        container (cgroup), not just this process, so read the cgroup first
+        and fall back to this process's RSS."""
+        for path in ("/sys/fs/cgroup/memory.current",
+                     "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+            try:
+                return int(Path(path).read_text().strip()) / 1024 / 1024
+            except Exception:
+                continue
+        try:
+            import psutil
+            return psutil.Process().memory_info().rss / 1024 / 1024
+        except Exception:
+            return 0.0
+
+    def _memory_alarm(self):
+        """Warn BEFORE the 512MB OOM kill instead of dying silently. Tries a
+        garbage collect + disk cleanup first; alerts at most once an hour."""
+        try:
+            limit_mb = float(os.getenv("FRIDAY_MEM_ALARM_MB", "400"))
+            used = self._memory_used_mb()
+            if used < limit_mb:
+                return
+            try:
+                import gc
+                gc.collect()
+                from services import disk_cleanup
+                disk_cleanup.clean()
+            except Exception:
+                pass
+            used = self._memory_used_mb()
+            if used < limit_mb:
+                return
+            now = time.time()
+            if now - getattr(self, "_last_mem_alarm", 0) < 3600:
+                return
+            self._last_mem_alarm = now
+            self._alert(f"Memory's at {used:.0f}MB, boss — close to the 512MB limit. "
+                        f"I might restart soon.", priority="high")
+        except Exception as e:
+            print(f"[Autonomous:memory_alarm] {e}")
 
     # ── Alert dispatcher ─────────────────────────────────────────────────────
     def _alert(self, message: str, priority: str = "normal", title: str = "FRIDAY"):

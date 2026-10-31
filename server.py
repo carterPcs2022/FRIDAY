@@ -1292,7 +1292,11 @@ def _veronica_startup():
 
 def _veronica_monitor_loop():
     while True:
-        time.sleep(300)
+        # Was every 5 min. monitor() spawns a `python -m py_compile`
+        # subprocess per watched component, which spikes memory on Render's
+        # 512MB free plan (FRIDAY was repeatedly OOM-killed). Hourly is
+        # plenty to catch a corrupted file.
+        time.sleep(3600)
         try:
             veronica.monitor()
         except Exception as e:
