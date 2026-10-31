@@ -72,9 +72,9 @@ _GROQ_CLIENT = httpx.Client(
 MODELS = {
     "fast": "openai/gpt-oss-20b",
     "smart": "openai/gpt-oss-120b",
-    "nuanced": "claude-haiku-4-5-20251001",
-    "deep": "claude-sonnet-5",
-    "maximum": "claude-opus-4-8",
+    "nuanced": "claude-haiku-5-5",
+    "deep": "claude-sonnet-5-5",
+    "maximum": "claude-opus-5-5",
 }
 
 MAXIMUM_TRIGGERS = [
