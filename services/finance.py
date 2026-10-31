@@ -14,11 +14,12 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    YFINANCE_AVAILABLE = False
+# yfinance drags in pandas + numpy (~100-150MB resident). It used to be
+# imported here at module load, which on Render's 512MB free plan was a big
+# part of why FRIDAY got OOM-killed on repeat. Only check that it's
+# installed (no import cost) and import it lazily inside get_stock_price.
+import importlib.util
+YFINANCE_AVAILABLE = importlib.util.find_spec("yfinance") is not None
 
 try:
     import requests as _requests
@@ -37,6 +38,7 @@ class FinanceIntelligence:
 
         if YFINANCE_AVAILABLE:
             try:
+                import yfinance as yf  # lazy: see note at top of file
                 ticker = yf.Ticker(symbol)
                 info = ticker.fast_info
                 price = getattr(info, "last_price", None)
