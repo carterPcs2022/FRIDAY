@@ -15,7 +15,7 @@ import os
 import base64
 
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-VISION_MODEL = "claude-sonnet-5"
+VISION_MODEL = "claude-sonnet-5-5"
 
 FRIDAY_VISION_STYLE = (
     "You are FRIDAY, Tony Stark's AI. Describe what you see directly and "
