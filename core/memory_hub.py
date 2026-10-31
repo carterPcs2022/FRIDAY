@@ -39,6 +39,15 @@ from datetime import datetime
 _WORD_RE = re.compile(r"[a-z0-9']+")
 
 
+# Filler words that used to count as "matches" (every message shares "the",
+# "my", "is" with some stored text), drowning out the words that matter.
+_STOPWORDS = frozenset(
+    "a an the and or but if so of to in on at by for with from as is are was were be "
+    "been am do does did have has had i me my mine we our you your it its this that "
+    "these those what who how when where why can could should would will just not no "
+    "yes about up out into than then them they he she his her there here".split())
+
+
 def _words(text: str) -> set:
     return set(_WORD_RE.findall((text or "").lower()))
 
@@ -48,7 +57,7 @@ def overlap_score(query_words: set, text: str) -> int:
     same approach core/friday_memory.py's own recall() and
     services/wisdom.py already use, just shared here so results from
     different stores are directly comparable."""
-    return len(query_words & _words(text))
+    return len((query_words & _words(text)) - _STOPWORDS)
 
 
 def _facts_and_notes(q_words: set, limit: int) -> list:

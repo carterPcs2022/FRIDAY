@@ -66,7 +66,7 @@ def get_facts(n: int = 10) -> list[str]:
         rows = None
         try:
             turso.ensure_list_table(FACTS_TABLE)
-            rows = turso.list_all(FACTS_TABLE)
+            rows = turso.list_tail(FACTS_TABLE, n)
         except Exception as e:
             print(f"[Turso] facts read failed, falling back to local JSON: {e}")
         if rows:
@@ -106,7 +106,9 @@ def save_turn(user: str, friday: str):
     if turso.is_configured():
         try:
             turso.ensure_list_table(CONVO_TABLE)
-            turso.list_insert(CONVO_TABLE, turn)
+            row_id = turso.list_insert(CONVO_TABLE, turn)
+            if isinstance(row_id, int) and row_id % 100 == 0:
+                turso.list_trim(CONVO_TABLE, 2000)  # keep Turso bounded like the local file
         except Exception as e:
             print(f"[Turso] conversation write failed, local JSON already has it: {e}")
 
@@ -116,7 +118,7 @@ def get_recent_turns(n: int = 5) -> list[dict]:
         rows = None
         try:
             turso.ensure_list_table(CONVO_TABLE)
-            rows = turso.list_all(CONVO_TABLE)
+            rows = turso.list_tail(CONVO_TABLE, n)
         except Exception as e:
             print(f"[Turso] conversations read failed, falling back to local JSON: {e}")
         if rows:

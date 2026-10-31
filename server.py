@@ -3646,6 +3646,11 @@ def _dispatch(prompt, allow_split=True, allow_route=True):
                 level = confidence.assess(mode, clean, used_memory=used_memory)
 
                 save_turn(prompt, clean)
+                try:
+                    from core.fact_extractor import maybe_extract_async
+                    maybe_extract_async(prompt)  # learn durable facts in the background
+                except Exception:
+                    pass
                 _log(prompt, clean, mode)
 
                 audio_file = friday_speak(clean, mode=friday_brain.voice_mode) if VOICE_OK else None

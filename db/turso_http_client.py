@@ -208,6 +208,29 @@ def list_all(table: str) -> list[dict]:
     return out
 
 
+def list_tail(table: str, n: int) -> list[dict]:
+    """The newest n rows, oldest-first. list_all() reads the whole table;
+    callers that only want the last few should use this so a long history
+    never gets downloaded on every message."""
+    n = max(1, int(n))
+    result = _execute(
+        f"SELECT id, data FROM (SELECT id, data FROM {table} ORDER BY id DESC LIMIT ?) "
+        f"ORDER BY id", [n])
+    out = []
+    for row_id, data in result["rows"]:
+        record = json.loads(data)
+        record.setdefault("id", row_id)
+        out.append(record)
+    return out
+
+
+def list_trim(table: str, keep: int):
+    """Delete all but the newest `keep` rows."""
+    keep = max(1, int(keep))
+    _execute(
+        f"DELETE FROM {table} WHERE id <= (SELECT MAX(id) FROM {table}) - ?", [keep])
+
+
 def list_update(table: str, row_id: int, data: dict):
     _execute(
         f"UPDATE {table} SET data = ?, updated_at = ? WHERE id = ?",
