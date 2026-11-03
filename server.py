@@ -1588,6 +1588,17 @@ def _cmd_remember_this(prompt, p_lower):
         return jsonify({"response": response, "mode": "brain"})
 
 
+def _cmd_facts(prompt, p_lower):
+    """"what do you know about me" / "forget fact 3" -- see and delete what
+    FRIDAY has auto-learned (core/fact_commands.py)."""
+    from core.fact_commands import handle as facts_handle
+    response = facts_handle(prompt)
+    if response is None:
+        return None
+    _log(prompt, response, "brain")
+    return jsonify({"response": response, "mode": "brain"})
+
+
 def _cmd_people_brief(prompt, p_lower):
     if "people brief on " in p_lower and relationships:
         name = p_lower.split("people brief on ")[-1].strip()

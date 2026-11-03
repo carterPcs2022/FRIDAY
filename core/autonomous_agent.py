@@ -59,6 +59,7 @@ class AutonomousAgent:
             ("memory_backup", self._memory_backup, 86400),
             ("system_health_check", self._system_health_check, 3600),
             ("memory_alarm", self._memory_alarm, 120),
+            ("brain_health_alarm", self._brain_health_alarm, 600),
         ]
 
         for name, fn, interval in monitors:
@@ -713,6 +714,27 @@ class AutonomousAgent:
                         f"I might restart soon.", priority="high")
         except Exception as e:
             print(f"[Autonomous:memory_alarm] {e}")
+
+    def _brain_health_alarm(self):
+        """If Claude calls keep failing (retired model ID, bad key, outage)
+        FRIDAY quietly falls back to a weaker provider and the boss never
+        finds out. After 3 failures in a row, say so -- once per 6 hours."""
+        try:
+            from core import friday_brain as fb
+            if not fb.ANTHROPIC_KEY:
+                return
+            if fb._anthropic_fail_streak < 3 or time.time() - fb._last_anthropic_failure > 1800:
+                return
+            now = time.time()
+            if now - getattr(self, "_last_brain_alarm", 0) < 6 * 3600:
+                return
+            self._last_brain_alarm = now
+            self._alert(f"My Claude brain's failing ({fb._anthropic_fail_streak} calls in a row, "
+                        f"{fb._last_anthropic_error or 'unknown error'}), boss. Could be a retired "
+                        f"model ID, a bad API key, or an outage. Check the Render logs.",
+                        priority="high")
+        except Exception as e:
+            print(f"[Autonomous:brain_health_alarm] {e}")
 
     # ── Alert dispatcher ─────────────────────────────────────────────────────
     def _alert(self, message: str, priority: str = "normal", title: str = "FRIDAY"):

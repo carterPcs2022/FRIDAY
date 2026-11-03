@@ -25,7 +25,7 @@ DISPATCHER_FUNCTIONS = [
     "_cmd_safety_near_miss",
     "_cmd_safe_checkin", "_cmd_security_screen", "_cmd_learn_voice_mode",
     "_cmd_dark_mode", "_cmd_capabilities", "_cmd_weather", "_cmd_news", "_cmd_translate",
-    "_cmd_code_review", "_cmd_remember_this", "_cmd_people_brief",
+    "_cmd_code_review", "_cmd_remember_this", "_cmd_facts", "_cmd_people_brief",
     "_cmd_caller_id", "_cmd_call_initiate", "_cmd_sms_send", "_cmd_catchup",
     "_cmd_self_audit", "_cmd_confidence_query",
     "_cmd_focus", "_cmd_habit_log", "_cmd_journal", "_cmd_probability",

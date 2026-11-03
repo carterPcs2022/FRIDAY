@@ -38,6 +38,7 @@ GOLDEN_MAIN = [
     "_cmd_translate",
     "_cmd_code_review",
     "_cmd_remember_this",
+    "_cmd_facts",
     "_cmd_people_brief",
     "_cmd_caller_id",
     "_cmd_call_initiate",
@@ -94,7 +95,7 @@ class TestTheOrderSurvivedTheRefactor:
         assert dispatch_chain.MAIN == GOLDEN_MAIN
 
     def test_nothing_was_dropped(self):
-        assert len(dispatch_chain.PRE_SPLIT) + len(dispatch_chain.MAIN) == 59
+        assert len(dispatch_chain.PRE_SPLIT) + len(dispatch_chain.MAIN) == 60
 
     def test_no_handler_is_registered_twice(self):
         """A handler in both chains would run against the whole message

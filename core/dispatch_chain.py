@@ -68,6 +68,7 @@ MAIN = [
     "_cmd_translate",
     "_cmd_code_review",
     "_cmd_remember_this",
+    "_cmd_facts",
     "_cmd_people_brief",
     "_cmd_caller_id",
     "_cmd_call_initiate",

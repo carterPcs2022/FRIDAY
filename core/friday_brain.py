@@ -31,6 +31,8 @@ _last_groq_success = 0.0
 _last_groq_failure = 0.0
 _last_anthropic_success = 0.0
 _last_anthropic_failure = 0.0
+_anthropic_fail_streak = 0   # consecutive real failures; reset on success
+_last_anthropic_error = ""  # exception class name only, for the alarm text
 
 
 def is_groq_healthy() -> bool:
@@ -364,6 +366,7 @@ class FridayBrain:
         return None
 
     def _call_anthropic(self, messages: list, system: str, model: str, max_tokens: int = 256) -> dict | None:
+        global _anthropic_fail_streak, _last_anthropic_error
         if not ANTHROPIC_KEY:
             return None
 
@@ -378,11 +381,14 @@ class FridayBrain:
             budget.record_call(r.usage.output_tokens, model)
             global _last_anthropic_success
             _last_anthropic_success = time.time()
+            _anthropic_fail_streak = 0
             return {"content": r.content[0].text, "model": model, "provider": "anthropic"}
         except Exception as e:
             print(f"[FRIDAY] Anthropic error: {e}")
             global _last_anthropic_failure
             _last_anthropic_failure = time.time()
+            _anthropic_fail_streak += 1
+            _last_anthropic_error = type(e).__name__
             return None
 
     # ── Advanced reasoning (opt-in, endpoint-only — not wired into casual

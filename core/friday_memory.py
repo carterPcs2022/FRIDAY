@@ -89,6 +89,26 @@ def get_facts(n: int = 10) -> list[str]:
     return facts[-n:] if isinstance(facts, list) else []
 
 
+def delete_fact(fact: str) -> bool:
+    """Remove a fact everywhere it lives (local JSON + Turso). True if it
+    was found in either place."""
+    removed = False
+    facts = _load(FACTS_FILE)
+    if isinstance(facts, list) and fact in facts:
+        _save(FACTS_FILE, [f for f in facts if f != fact])
+        removed = True
+    if turso.is_configured():
+        try:
+            turso.ensure_list_table(FACTS_TABLE)
+            for row in turso.list_tail(FACTS_TABLE, 1000):
+                if row.get("fact") == fact and "id" in row:
+                    turso.list_delete(FACTS_TABLE, row["id"])
+                    removed = True
+        except Exception as e:
+            print(f"[Turso] fact delete failed: {e}")
+    return removed
+
+
 # ── Conversations ────────────────────────────────────────────────────────────
 
 CONVO_TABLE = "conversations"

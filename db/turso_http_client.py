@@ -224,6 +224,11 @@ def list_tail(table: str, n: int) -> list[dict]:
     return out
 
 
+def list_delete(table: str, row_id: int):
+    """Delete a single row by id."""
+    _execute(f"DELETE FROM {table} WHERE id = ?", [int(row_id)])
+
+
 def list_trim(table: str, keep: int):
     """Delete all but the newest `keep` rows."""
     keep = max(1, int(keep))

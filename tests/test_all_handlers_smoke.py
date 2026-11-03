@@ -47,6 +47,7 @@ CASES = [
     ("_cmd_news",              "give me the news"),
     ("_cmd_translate",         "translate hello to spanish"),
     ("_cmd_remember_this",     "remember this: the garage code is 4021"),
+    ("_cmd_facts",             "what do you know about me"),
     ("_cmd_catchup",           "what did i miss"),
     ("_cmd_self_audit",        "what have you done"),
     ("_cmd_confidence_query",  "are you sure"),
