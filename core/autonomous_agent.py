@@ -692,7 +692,7 @@ class AutonomousAgent:
         """Warn BEFORE the 512MB OOM kill instead of dying silently. Tries a
         garbage collect + disk cleanup first; alerts at most once an hour."""
         try:
-            limit_mb = float(os.getenv("FRIDAY_MEM_ALARM_MB", "400"))
+            limit_mb = float(os.getenv("FRIDAY_MEM_ALARM_MB", "470"))
             used = self._memory_used_mb()
             if used < limit_mb:
                 return
