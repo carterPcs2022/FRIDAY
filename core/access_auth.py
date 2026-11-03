@@ -5,10 +5,9 @@ bills, decisions, second_brain, calendar, relationships, finances — all
 of it) had zero authentication. Anyone who found the Render URL could
 talk to FRIDAY and pull personal data with no credential at all;
 friday_security.py's rate-limiting and injection screening stop abuse
-patterns, not identity. This closes that gap with a single shared-secret
-check in front of everything except routes that structurally can't carry
-one (Twilio webhooks — Twilio can't send a bearer token) or are
-deliberately open by design (suit_lockdown's trigger, meant to work from
+patterns, not identity. This closes that gap with a shared-secret check
+in front of everything except deliberately open routes and Twilio
+callbacks, which are separately authenticated with Twilio request signatures. (suit_lockdown's trigger, meant to work from
 a device that's never touched this account before).
 
 Cookie-based rather than requiring every one of ~150 routes' fetch()
@@ -32,15 +31,13 @@ import os
 ACCESS_TOKEN = os.environ.get("FRIDAY_ACCESS_TOKEN", "")
 SESSION_COOKIE = "friday_auth"
 
-# Paths reachable with no session or token — either they can't carry one
-# (webhooks) or are deliberately open by design (lockdown, health checks
+# Paths reachable with no session or token — either they use their own
+# verified signature (Twilio callbacks) or are deliberately open by design (lockdown, health checks
 # for uptime monitors, the status JSON at "/" which carries no personal
 # data, and /login itself).
 EXEMPT_PATHS = {
     "/", "/health", "/login",
     "/friday/lockdown",
-    "/friday/phone/call", "/friday/phone/respond",
-    "/friday/phone/transcribed", "/friday/phone/sms",
 }
 
 
@@ -76,3 +73,49 @@ def has_valid_session(cookie_value: str) -> bool:
     if not ACCESS_TOKEN:
         return False
     return hmac.compare_digest(cookie_value or "", _session_value())
+
+
+# Twilio callbacks authenticate with X-Twilio-Signature, not FRIDAY's
+# browser/API bearer token. PUBLIC_URL is the canonical external origin;
+# never build the signed URL from an untrusted Host/forwarded-host header.
+TWILIO_WEBHOOK_PATHS = {
+    "/friday/phone/call",
+    "/friday/phone/respond",
+    "/friday/phone/transcribed",
+    "/friday/phone/sms",
+}
+
+
+def is_twilio_webhook(path: str) -> bool:
+    return path in TWILIO_WEBHOOK_PATHS
+
+
+def validate_twilio_webhook(request) -> bool:
+    """Validate a Twilio callback before any handler processes it.
+
+    Missing secrets/configuration, malformed URLs, absent signatures, and
+    validator errors all fail closed. Query strings are part of Twilio's
+    signed callback URL and are therefore included in validation.
+    """
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not auth_token or not public_url or not signature:
+        return False
+
+    from urllib.parse import urlsplit
+    parsed = urlsplit(public_url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+        return False
+
+    try:
+        from twilio.request_validator import RequestValidator
+        query = request.query_string.decode("ascii")
+        signed_url = f"{public_url}{request.path}"
+        if query:
+            signed_url += f"?{query}"
+        return RequestValidator(auth_token).validate(
+            signed_url, request.form.to_dict(flat=True), signature
+        )
+    except Exception:
+        return False

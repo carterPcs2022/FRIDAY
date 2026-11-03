@@ -104,6 +104,14 @@ def _check_access():
                            request.headers.get("Origin", ""),
                            self_origin=_self_origin())
 
+    # Twilio callbacks use Twilio's signature, never the normal
+    # FRIDAY bearer/session credential. Reject them before any handler runs
+    # if signature validation or its required configuration is missing.
+    if access_auth.is_twilio_webhook(request.path):
+        if not access_auth.validate_twilio_webhook(request):
+            return jsonify({"error": "Invalid webhook signature"}), 403
+        return
+
     if not access_auth.is_configured():
         return  # not set up yet — config_validator flags this; don't lock the boss out before he's configured it
     if access_auth.is_exempt(request.path):
