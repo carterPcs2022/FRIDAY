@@ -28,3 +28,10 @@ def budget_status():
 @hud_page_bp.route("/hud")
 def hud():
     return render_template("hud.html")
+
+
+@hud_page_bp.route("/hud/glasses")
+def hud_glasses():
+    """Minimal green HUD sized for a small heads-up lens (smart glasses web view or
+    a phone held like one): clock, status, and the emergency controls."""
+    return render_template("glasses.html")
