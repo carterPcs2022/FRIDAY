@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FRIDAY // glasses</title>
+<style>
+  :root { --bg:#000; --g:#39ff88; --dim:#1f7a45; --red:#ff4d4d; --amber:#ffc34d; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--g);
+              font:600 clamp(18px,5.5vw,30px)/1.25 ui-monospace,Menlo,Consolas,monospace; }
+  body { display:flex; flex-direction:column; padding:env(safe-area-inset-top) 4vw env(safe-area-inset-bottom); }
+  #top { display:flex; justify-content:space-between; padding:2vh 0; color:var(--dim); font-size:.7em; letter-spacing:.15em; }
+  #msg { flex:1; display:flex; align-items:center; text-shadow:0 0 12px rgba(57,255,136,.45); }
+  #warn { color:var(--amber); font-size:.7em; min-height:1.3em; }
+  .row { display:flex; gap:3vw; padding:2vh 0; }
+  button,a.btn { flex:1; text-align:center; text-decoration:none; background:#04140b; color:var(--g); border:2px solid var(--dim);
+                 border-radius:14px; padding:2.4vh 1vw; font:inherit; letter-spacing:.08em; }
+  #sos { border-color:var(--red); color:var(--red); position:relative; overflow:hidden; user-select:none; touch-action:none; }
+  #sos i { position:absolute; left:0; bottom:0; height:6px; width:0; background:var(--red); }
+  a.btn.call { border-color:var(--amber); color:var(--amber); }
+  #over { position:fixed; inset:0; background:#000; display:none; flex-direction:column; padding:env(safe-area-inset-top) 4vw env(safe-area-inset-bottom); }
+  #over.on { display:flex; }
+  #count { font-size:28vw; text-align:center; line-height:1; color:var(--red); }
+  #sum { flex:1; font-size:.85em; overflow:auto; }
+  .drill { color:var(--amber); }
+  #cancel { border-color:var(--g); font-size:1.4em; }
+</style>
+</head>
+<body>
+<div id="top"><span>FRIDAY</span><span id="clock">--:--</span></div>
+<div id="msg"><span id="line">Standing by, boss.</span></div>
+<div id="warn"></div>
+<div class="row"><button id="sos">HOLD FOR SOS<i id="bar"></i></button></div>
+<div class="row"><a class="btn call" href="tel:911">CALL 911</a></div>
+
+<div id="over">
+  <div id="top2" class="drill" style="padding:2vh 0"></div>
+  <div id="count">15</div>
+  <div id="net" style="color:var(--amber);font-size:.8em;min-height:1.3em"></div>
+  <div id="sum"></div>
+  <div class="row"><button id="send">SEND NOW</button><a class="btn call" href="tel:911">CALL 911</a></div>
+  <div class="row"><button id="cancel">CANCEL</button></div>
+</div>
+
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var DRILL = /[?&]drill=1/.test(location.search);
+  var alertId = null, poll = null, holdT = null, holdStart = 0;
+  var HOLD_MS = 1500;
+  var lastFix = null, deadlineLocal = 0, tick = null, failures = 0, wake = null, lastBuzz = -1;
+
+  setInterval(function () { $('clock').textContent = new Date().toTimeString().slice(0, 5); }, 1000);
+  $('clock').textContent = new Date().toTimeString().slice(0, 5);
+  if (DRILL) $('top2').textContent = 'DRILL MODE: nothing will be sent';
+
+  function buzz(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+
+  // Keep the screen on: a display that sleeps mid-countdown can't be cancelled.
+  async function keepAwake() {
+    try {
+      if ('wakeLock' in navigator && !wake) {
+        wake = await navigator.wakeLock.request('screen');
+        wake.addEventListener('release', function () { wake = null; });
+      }
+    } catch (e) {}
+  }
+  keepAwake();
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') keepAwake(); });
+
+  function api(path, body) {
+    return fetch(path, { method: body ? 'POST' : 'GET', credentials: 'same-origin',
+      headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined })
+      .then(function (r) {
+        if (r.status === 401 || r.redirected) throw new Error('Signed out. Open /login first.');
+        return r.json().then(function (j) { if (!r.ok && !j.state) throw new Error(j.error || ('HTTP ' + r.status)); return j; });
+      });
+  }
+  // Tell the truth about readiness up front: an SOS button that reaches nobody is worse than none.
+  api('/api/emergency/status').then(function (s) {
+    if (!s.ready) $('warn').textContent = 'Setup incomplete: ' + (s.issues[0] || 'see /api/emergency/status');
+    else if (s.warnings && s.warnings.length) $('warn').textContent = s.warnings[0];
+  }).catch(function (e) { $('warn').textContent = e.message; });
+
+  // Location is warmed up in the BACKGROUND from page load. Asking for it at the moment of need meant up to
+  // 6 s of nothing after the button was held, plus a permission prompt in the middle of an emergency.
+  function startLocation() {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.watchPosition(
+      function (p) {
+        lastFix = { lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy, at: Date.now() };
+        if (alertId) sendLocation();
+      },
+      function () {}, { enableHighAccuracy: true, maximumAge: 15000, timeout: 20000 });
+  }
+  function fixForAlert() {
+    return lastFix && Date.now() - lastFix.at < 180000 ? { lat: lastFix.lat, lon: lastFix.lon, accuracy: lastFix.accuracy } : {};
+  }
+  function sendLocation() {
+    if (alertId && lastFix) api('/api/emergency/location', { id: alertId, lat: lastFix.lat, lon: lastFix.lon, accuracy: lastFix.accuracy }).catch(function () {});
+  }
+  startLocation();
+
+  // The countdown runs off the LOCAL clock (re-synced by every poll), so a dropped connection can't freeze it.
+  function startTick() {
+    if (tick) return;
+    tick = setInterval(function () {
+      var left = Math.max(0, Math.ceil((deadlineLocal - Date.now()) / 1000));
+      $('count').textContent = left;
+      if (left > 0 && left <= 5 && left !== lastBuzz) { lastBuzz = left; buzz(120); }
+    }, 250);
+  }
+  function stopTick() { if (tick) { clearInterval(tick); tick = null; } lastBuzz = -1; }
+
+  function show(a) {
+    $('over').classList.add('on');
+    var pending = a.state === 'pending';
+    if (pending) { deadlineLocal = Date.now() + a.seconds_left * 1000; failures = 0; $('net').textContent = ''; startTick(); }
+    else { stopTick(); $('count').textContent = ''; }
+    var t = a.summary || (pending ? 'Alerting your contacts when this hits zero. ' : '');
+    $('sum').textContent = t + ' ' + (a.note || '');
+    $('send').style.display = pending ? '' : 'none';
+    $('cancel').textContent = pending ? 'CANCEL' : 'CLOSE';
+    if (!pending && poll) { clearInterval(poll); poll = null; }
+  }
+  async function trigger() {
+    keepAwake(); buzz([200, 80, 200]);
+    try {
+      // Start the countdown IMMEDIATELY with whatever fix we already have; a better one is attached while it runs.
+      var a = await api('/api/emergency/trigger', Object.assign({ reason: 'SOS from glasses HUD', drill: DRILL }, fixForAlert()));
+      alertId = a.id; show(a);
+      if (a.state === 'rate_limited') return;
+      if (!a.location_url) sendLocation();
+      poll = setInterval(function () {
+        api('/api/emergency/alert/' + alertId).then(show).catch(function () {
+          failures++;
+          if (failures >= 3) $('net').textContent = 'CONNECTION LOST. The alert will still send at zero unless you CANCEL. In danger? CALL 911.';
+        });
+      }, 1000);
+    } catch (e) { $('warn').textContent = 'SOS failed: ' + e.message + ' CALL 911 NOW.'; }
+  }
+  $('cancel').addEventListener('click', function () {
+    if ($('cancel').textContent === 'CLOSE') { $('over').classList.remove('on'); alertId = null; stopTick(); return; }
+    api('/api/emergency/cancel', { id: alertId }).then(show).catch(function (e) {
+      // Never imply a cancel worked when it didn't: the countdown may still be running.
+      $('net').textContent = 'CANCEL FAILED: ' + e.message + ' The alert may STILL SEND. Tap CANCEL again.';
+    });
+  });
+  $('send').addEventListener('click', function () {
+    api('/api/emergency/send_now', { id: alertId }).then(show).catch(function (e) { $('net').textContent = 'SEND FAILED: ' + e.message + ' CALL 911.'; });
+  });
+  window.addEventListener('offline', function () { $('warn').textContent = 'You are OFFLINE. Alerts cannot send. CALL 911 if in danger.'; });
+  window.addEventListener('online', function () { $('warn').textContent = ''; });
+
+  // Hold-to-trigger (touch, mouse, or Enter/Space on a gesture ring): a stray tap never starts it.
+  function down() {
+    if (holdT) return; holdStart = Date.now();
+    holdT = setInterval(function () {
+      var p = Math.min(1, (Date.now() - holdStart) / HOLD_MS); $('bar').style.width = (p * 100) + '%';
+      if (p >= 1) { up(); trigger(); }
+    }, 40);
+  }
+  function up() { clearInterval(holdT); holdT = null; $('bar').style.width = '0'; }
+  var sos = $('sos');
+  ['pointerdown'].forEach(function (e) { sos.addEventListener(e, down); });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(function (e) { sos.addEventListener(e, up); });
+  sos.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); down(); } });
+  sos.addEventListener('keyup', up);
+})();
+</script>
+</body>
+</html>

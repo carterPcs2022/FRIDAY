@@ -76,18 +76,30 @@ class FridayMCUCapabilities:
                 pass
         return {"checked": True, "area": area}
 
-    def emergency_contact(self, location: str = "", nature: str = "") -> dict:
-        try:
-            from services.friday_voice import speak
-            speak(f"Emergency services contacted. Dispatching to {location or 'your location'}.")
-        except Exception:
-            pass
-        try:
-            from services.notifications import critical
-            critical("FRIDAY Emergency", f"{nature} at {location}")
-        except Exception:
-            pass
-        return {"contacted": True}
+    def emergency_contact(self, reason: str = "", nature: str = "") -> dict:
+        """Starts the REAL, cancelable emergency flow (services/friday_emergency.py).
+
+        This used to speak "Emergency services contacted. Dispatching to <your
+        whole sentence>" and return contacted=True while only buzzing the user's
+        OWN phone - it reached nobody, which in a real emergency is false
+        reassurance. FRIDAY cannot call 911, and now says so every time."""
+        from services.friday_emergency import emergency, CALL_911_NOTE
+        r = emergency.trigger(reason=reason or nature or "voice-activated emergency protocol", source="voice")
+        state = r.get("state")
+        if state == "pending":
+            n = r.get("seconds_left", 0)
+            msg = (f"Alerting your emergency contacts in {n} seconds, boss. Say 'cancel emergency' to stop it. "
+                   f"{CALL_911_NOTE}")
+        elif state == "rate_limited":
+            msg = r.get("summary", "Too many alerts this hour.") + " " + CALL_911_NOTE
+        else:
+            msg = r.get("summary") or CALL_911_NOTE
+        return {"message": msg, "state": state, "alert_id": r.get("id")}
+
+    def cancel_emergency(self, _query: str = "") -> dict:
+        from services.friday_emergency import emergency
+        r = emergency.cancel()
+        return {"message": r.get("summary", "Done."), "state": r.get("state")}
 
     def government_intel(self, query: str) -> dict:
         from core.friday_brain import friday_brain
@@ -271,7 +283,9 @@ CAPABILITY_MAP = {
     # sentence means a false "emergency services contacted" claim landing
     # as a real phone alert. Narrowed to a phrase nobody types by
     # accident while still being one a real invocation would use.
-    "emergency contact protocol": (lambda q: friday_caps.emergency_contact(q), "contacted"),
+    "emergency contact protocol": (lambda q: friday_caps.emergency_contact(q), "message"),
+    "send emergency alert": (lambda q: friday_caps.emergency_contact(q), "message"),
+    "cancel emergency": (lambda q: friday_caps.cancel_emergency(q), "message"),
     "intel on": (lambda q: friday_caps.government_intel(q), "brief"),
     "scan for": (lambda q: friday_caps.disaster_scan(q), "scan"),
     "atmospheric": (lambda q: friday_caps.atmospheric_detection(q), "detection"),

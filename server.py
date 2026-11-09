@@ -453,6 +453,7 @@ _ensure_memory()
 # ── Blueprints (see routes/*.py) ────────────────────────────────────────────
 from routes.voice_vision import voice_vision_bp
 from routes.phone import phone_bp
+from routes.emergency import emergency_bp
 from routes.orchestration import orchestration_bp
 from routes.security import security_bp
 from routes.health_medicine import health_medicine_bp
@@ -471,6 +472,7 @@ from routes.offline import offline_bp
 
 app.register_blueprint(voice_vision_bp)
 app.register_blueprint(phone_bp)
+app.register_blueprint(emergency_bp)
 app.register_blueprint(orchestration_bp)
 app.register_blueprint(security_bp)
 app.register_blueprint(health_medicine_bp)
@@ -485,6 +487,18 @@ app.register_blueprint(reasoning_bp)
 app.register_blueprint(emcon_scenarios_bp)
 app.register_blueprint(life_admin_bp)
 app.register_blueprint(hud_page_bp)
+
+
+def _recover_emergency_alerts():
+    """An SOS counting down when the server restarted must not silently vanish."""
+    try:
+        from services import friday_emergency
+        friday_emergency.emergency.recover()
+    except Exception:
+        logging.getLogger(__name__).warning("emergency recovery failed", exc_info=True)
+
+
+threading.Thread(target=_recover_emergency_alerts, name="emergency-recover", daemon=True).start()
 app.register_blueprint(offline_bp)
 
 # ── JARVIS monitoring ────────────────────────────────────────────────────────

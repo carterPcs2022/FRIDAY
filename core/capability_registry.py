@@ -137,6 +137,11 @@ def _veronica_available() -> bool:
     return VERONICA_OK
 
 
+def _emergency_available() -> bool:
+    from services.friday_emergency import emergency
+    return emergency.readiness()["ready"]
+
+
 def _pushcut_mom_available() -> bool:
     from services.friday_pushcut import MOM_WEBHOOK_URL
     return bool(MOM_WEBHOOK_URL)
@@ -147,7 +152,9 @@ _CHAT_CAPABILITY_META: dict[str, tuple] = {
     "analyze fighting": ("Fighting-pattern analysis via FRIDAY's reasoning", False, False, _brain_available),
     "fighting pattern": ("Fighting-pattern analysis via FRIDAY's reasoning", False, False, _brain_available),
     "contusion": ("Logs a contusion check and speaks the area — no medical system behind it", False, False, None),
-    "emergency contact protocol": ("Speaks an emergency-contacted line and sends a critical Pushover alert", False, False, None),
+    "emergency contact protocol": ("Starts a cancelable countdown, then texts your emergency contacts your situation (SMS via Twilio). Cannot call 911", False, False, _emergency_available),
+    "send emergency alert": ("Same as 'emergency contact protocol'", False, False, _emergency_available),
+    "cancel emergency": ("Cancels a pending emergency alert before it sends", False, False, None),
     "intel on": ("Intelligence brief via FRIDAY's reasoning, plus a web search if available", False, False, _brain_available),
     "scan for": ("Disaster-scan brief via FRIDAY's reasoning", False, False, _brain_available),
     "atmospheric": ("Object-detection brief via FRIDAY's reasoning", False, False, _brain_available),
